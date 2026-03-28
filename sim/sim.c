@@ -222,6 +222,7 @@ void usage(void)
   fprintf(stderr, " --tape=\n");
   fprintf(stderr, "optionally:\n");
   fprintf(stderr, " --kernel=\n");
+  fprintf(stderr, " --ether=<interface>  (e.g. tap0)\n");
   exit(1);
 }
 
@@ -233,6 +234,7 @@ char *tape_arg;
 
 char *boot_arg;
 char *kernel_arg;
+char *ether_arg;
 
 //#ifdef __APPLE__
 //int SDL_main(int argc, char **argv)
@@ -256,10 +258,11 @@ int main(int argc, char **argv)
       {"tape",   optional_argument, 0,  't' },
       {"kernel", optional_argument, 0,  'k' },
       {"boot",   optional_argument, 0,  'b' },
+      {"ether",  optional_argument, 0,  'e' },
       {0,        0,                 0,  0 }
     };
 
-    c = getopt_long(argc, argv, "d:k:p:t:q", long_options, &option_index);
+    c = getopt_long(argc, argv, "d:e:k:p:t:q", long_options, &option_index);
     if (c == -1)
       break;
 
@@ -291,6 +294,10 @@ int main(int argc, char **argv)
 
     case 'b':
       boot_arg = strdup(optarg);
+      break;
+
+    case 'e':
+      ether_arg = strdup(optarg);
       break;
 
     case 'q':

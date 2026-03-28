@@ -154,6 +154,17 @@ unsigned int scc_rd_data(int ch, int size)
   unsigned int value = 0xffff;
   scc_in_pop(ch, &value);
   if (trace_scc) printf("scc%d: read data %x (%d)\n", ch, value, size);
+
+  /* When FIFO empties, clear RxCharAvail and de-assert Rx interrupt */
+  if (scc_ififo[ch].count <= 0) {
+    scc_rr[ch][0] &= ~RR0_RX_READY;
+    if (scc_int_pending) {
+      int_controller_clear(IRQ_SCC);
+      scc_int_pending = 0;
+      scc_rr[0][2] = scc_rr[1][2] = scc_rr[2][2] = scc_rr[3][2] = 0;
+    }
+  }
+
   return value;
 }
 

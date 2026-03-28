@@ -38,7 +38,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if defined(__unix__)|| defined(__MACH__)
+#if (defined(__unix__) && !defined(__linux__)) || defined(__MACH__)
 #include <net/bpf.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -49,6 +49,17 @@
 #include <unistd.h>
 #include <signal.h>
 #include <sys/time.h>
+#endif
+
+#ifdef __linux__
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/ioctl.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <net/if.h>
+#include <linux/if_tun.h>
+#include <errno.h>
 #endif
 
 #include "sim68k.h"
@@ -69,7 +80,7 @@
 #define BPFINTERFACE "vmnet8"
 
 
-#if defined(__unix__)|| defined(__MACH__)
+#if (defined(__unix__) && !defined(__linux__)) || defined(__MACH__)
 // This is the filter that we use for BPF, if PA is >2 then this filter is used
 struct bpf_insn bpf_ours[] = {
 	// Load first 4 from dest addr
@@ -237,10 +248,10 @@ unsigned char *mebbuffer;
 //  Trace positive means outputting lots of debug information on the lowlevel processing of the emulation, best enabled by using the e3c400_enable_trace function...
 int trace_3c400 = 0;
 
-#if defined(__unix__)|| defined(__MACH__)
+#if (defined(__unix__) && !defined(__linux__)) || defined(__MACH__)
 // File handle for the BPF connection
 int bpf = 0;
-// Counter to hold onto how many frames are waiting in the buffer 
+// Counter to hold onto how many frames are waiting in the buffer
 int bpf_buflen = 0;
 // Struct for BPF header and received packet
 struct bpf_hdr* bpf_buf;
@@ -251,6 +262,15 @@ uint32_t bpfscan = 0;
 clock_t bpfbegin = 0;
 clock_t bpfend = 0;
 double bpfelapsed;
+#elif defined(__linux__)
+// TAP device file descriptor
+int tapfd = -1;
+uint32_t bpfscan = 0;
+#else
+// Stubs for unsupported platforms
+int bpf = 0;
+int bpf_buflen = 0;
+uint32_t bpfscan = 0;
 #endif
 
 // Polynomial used
@@ -429,12 +449,19 @@ void handle_outgoing_packets() {
 		if(trace_3c400)
 			printf("\n");
 		int byteswritten;
-		// Send packet if we have BPF
-		#if defined(__unix__) || defined(__MACH__)
-		if(bpf) {		
+		// Send packet if we have BPF or TAP
+		#if (defined(__unix__) && !defined(__linux__)) || defined(__MACH__)
+		if(bpf) {
 			byteswritten=write(bpf,&mexbuffer[firstbyte],2048-firstbyte);
 			if(trace_3c400)
 				printf("Bytes written to BPF: %d\n",byteswritten);
+		}
+		#endif
+		#ifdef __linux__
+		if(tapfd >= 0) {
+			byteswritten=write(tapfd,&mexbuffer[firstbyte],2048-firstbyte);
+			if(trace_3c400)
+				printf("Bytes written to TAP: %d\n",byteswritten);
 		}
 		#endif
 		// Set tbsw to zero so that other packets can be sent
@@ -644,7 +671,7 @@ void e3c400_init(void) {
 		mebbuffer[p] = 0;
 
 	// Open BPF and bind to the interface
-	#if defined(__unix__) || defined(__MACH__)
+	#if (defined(__unix__) && !defined(__linux__)) || defined(__MACH__)
 	char buf[11] = { 0 };
 	// This should open the next available BPF device
 	for(p=0;p<99;p++) {
@@ -658,8 +685,8 @@ void e3c400_init(void) {
 	if(bpf == -1)
 		// Warn user
 		printf("Can't open BPF interface, check permissions of /dev/bpf*\n");
-	// Associate the BPF with our requested network device (set near the top of this file)
-	const char* interface = BPFINTERFACE;
+	// Associate the BPF with our requested network device
+	const char* interface = (ether_arg != NULL) ? ether_arg : BPFINTERFACE;
 	struct ifreq bindif;
 	strcpy(bindif.ifr_name, interface);
 	// Check whether we were able to bind
@@ -721,6 +748,31 @@ void e3c400_init(void) {
 		printf("Can't disable BPF autofill of src mac-address, BPF disabled\n");
 	}
 	#endif
+
+	#ifdef __linux__
+	// Open TAP device if interface was specified on command line
+	if (ether_arg != NULL) {
+		struct ifreq ifr;
+
+		tapfd = open("/dev/net/tun", O_RDWR | O_NONBLOCK);
+		if (tapfd < 0) {
+			printf("3C400: can't open /dev/net/tun, check permissions\n");
+			tapfd = -1;
+		} else {
+			memset(&ifr, 0, sizeof(ifr));
+			ifr.ifr_flags = IFF_TAP | IFF_NO_PI;
+			strncpy(ifr.ifr_name, ether_arg, IFNAMSIZ - 1);
+
+			if (ioctl(tapfd, TUNSETIFF, &ifr) < 0) {
+				printf("3C400: unable to attach to TAP device %s\n", ether_arg);
+				close(tapfd);
+				tapfd = -1;
+			} else {
+				printf("3C400: attached to TAP device %s\n", ifr.ifr_name);
+			}
+		}
+	}
+	#endif
 }
 
 
@@ -728,6 +780,7 @@ void e3c400_init(void) {
 void e3c400_update(void) {
 	// Temporary loop variable
 	int p=0;
+#if (defined(__unix__) && !defined(__linux__)) || defined(__MACH__)
 	// BPF buffer
 	char *buffer = NULL;
 	char *pointer = NULL;
@@ -738,6 +791,7 @@ void e3c400_update(void) {
 	ssize_t readbytes = 0;
 	// BPF header
 	struct bpf_hdr *bh = NULL;
+#endif
 	// Check the reset bit
 	if(mecsr->csr.reset) {
 		// Reset the Transmit and Receive enable bits
@@ -780,6 +834,7 @@ void e3c400_update(void) {
 	handle_outgoing_packets();
 	// Increment the BGP scan counter by 1 for each update loop
 	bpfscan++;
+#if (defined(__unix__) && !defined(__linux__)) || defined(__MACH__)
 	// If BPF is active and set, there are are packets waiting and the adapter is ready to receive them, and we're on an update round where we take care of the bpf
 	// Despite only running this every 5k runs it still manages to perform at around 10Mbits per second on a modern processor
 	// If you find that the network is very slow, you might consider lowering this number from 5000, maybe by 1000 at a time until you find a compromise
@@ -807,7 +862,7 @@ void e3c400_update(void) {
 
 			// Read from BPF
 			readbytes=read(bpf,buffer,blen);
-	
+
 			// If no bytes are available, exit
 			if(readbytes <= 0)
 				break;
@@ -816,12 +871,12 @@ void e3c400_update(void) {
 				printf("3C400: %ld bytes available to process in receive buffer\n",readbytes);
 
 			// Set up pointer to work with packet(s)
-			pointer=buffer;	
+			pointer=buffer;
 
 			// Process packets if the OS is ready to accept packets and we have data
 			while(readbytes >0 && pointer < (buffer + readbytes)) {
 				// Get the BPF header
-				bh = (struct bpf_hdr *)pointer;		
+				bh = (struct bpf_hdr *)pointer;
 
 				// Find which buffer to use
 				whichbuffer = find_buffer();
@@ -835,7 +890,7 @@ void e3c400_update(void) {
 						// We have to take into account the 2 byte header of meahdr and the FCS
 						meahdr->hdr.firstfree=bh->bh_datalen;
 						// Process the packet
-						handle_incoming_packet();		
+						handle_incoming_packet();
 					} else {
 						// Notify user
 						printf("Packet length exceeds 3C400 ethernet buffer\n");
@@ -850,7 +905,7 @@ void e3c400_update(void) {
 						// We have to take into account the 2 byte header of meahdr and the FCS
 						mebhdr->hdr.firstfree=bh->bh_caplen;
 						// Process the packet
-						handle_incoming_packet();		
+						handle_incoming_packet();
 					} else {
 						// Notify user
 						printf("Packet length exceeds 3C400 ethernet buffer\n");
@@ -867,11 +922,54 @@ void e3c400_update(void) {
 	}
 	if(bpf && buffer)
 		free(buffer);
-	
+#endif
+
+#ifdef __linux__
+	// Read packets from TAP device
+	if (tapfd >= 0 && (mecsr->csr.absw || mecsr->csr.bbsw) && (bpfscan % 5000 == 0)) {
+		unsigned char tapbuf[2048];
+		ssize_t readbytes;
+		unsigned char whichbuffer;
+
+		// Read packets while buffers are available
+		while (mecsr->csr.absw || mecsr->csr.bbsw) {
+			readbytes = read(tapfd, tapbuf, sizeof(tapbuf));
+
+			if (readbytes <= 0)
+				break;
+
+			if (trace_3c400)
+				printf("3C400: %ld bytes read from TAP\n", (long)readbytes);
+
+			whichbuffer = find_buffer();
+			if (whichbuffer == 'A') {
+				if (readbytes < 2046) {
+					memcpy(&meabuffer[0], tapbuf, readbytes);
+					meahdr->hdr.firstfree = readbytes;
+					handle_incoming_packet();
+				} else {
+					printf("Packet length exceeds 3C400 ethernet buffer\n");
+				}
+			} else if (whichbuffer == 'B') {
+				if (readbytes < 2046) {
+					memcpy(&mebbuffer[0], tapbuf, readbytes);
+					mebhdr->hdr.firstfree = readbytes;
+					handle_incoming_packet();
+				} else {
+					printf("Packet length exceeds 3C400 ethernet buffer\n");
+				}
+			} else {
+				printf("No buffers available for received ethernet packet, discarding\n");
+				return;
+			}
+		}
+	}
+#endif
+
 }
-	
+
 // Handle reading bytes from the emulated e3c400
-uint32_t e3c400_read(uint32_t addr, int32_t size) {
+unsigned int e3c400_read(unsigned int addr, int size) {
 	if(trace_3c400)
 		printf("3C400 Read addr: %x, size: %d\n",addr,size);
 
@@ -1085,7 +1183,7 @@ uint32_t e3c400_read(uint32_t addr, int32_t size) {
 }
 
 // Handle writing bytes to the emulated 3c400
-void e3c400_write(uint32_t addr, uint32_t size, uint32_t value) {
+void e3c400_write(unsigned int addr, unsigned int size, unsigned int value) {
 	// Offset is here
 	int offset=0; 
   	// Write values to the e3c400, this is limited to the control and status register as well as the transport buffeer

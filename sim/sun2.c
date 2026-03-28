@@ -197,31 +197,29 @@ void sdl_poll(void)
   while (SDL_PollEvent(&event)) {
     switch (event.type) {
 	    case SDL_WINDOWEVENT:
-	//      sdl_update(ds, 0, 0, screen->w, screen->h);
 	      break;
 
 	    case SDL_KEYDOWN:
+	      if (event.key.repeat)
+	        break; /* suppress SDL auto-repeat */
 	      sun2_sdl_key(event.key.keysym.sym, event.key.keysym.mod, event.key.keysym.scancode, 1);
-	      //sun2_sdl_key(ev->key.keysym.sym, ev->key.keysym.mod, ev->key.keysym.unicode, 1);
 	      break;
 
 	    case SDL_KEYUP:
 	      sun2_sdl_key(event.key.keysym.sym, event.key.keysym.mod, event.key.keysym.scancode, 0);
-	      //sun2_sdl_key(ev->key.keysym.sym, ev->key.keysym.mod, ev->key.keysym.unicode, 0);
 	      break;
+
+	    case SDL_TEXTINPUT:
+	      /* Sun-2 keyboard uses make/break scancodes only, discard */
+	      break;
+
 	    case SDL_QUIT:
-	//      sdl_system_shutdown_request();
 	      break;
 	    case SDL_MOUSEMOTION:
-	//      sdl_send_mouse_event();
 	      break;
 	    case SDL_MOUSEBUTTONDOWN:
 	    case SDL_MOUSEBUTTONUP:
-	    {
-	      /*SDL_MouseButtonEvent *bev = &ev->button;*/
-	//      sdl_send_mouse_event();
-	    }
-	    break;
+	      break;
 	    }
   }
 }
@@ -354,73 +352,51 @@ void sun2_kb_write(int value, int size)
 
 unsigned int map_sdl_to_sun2kb[512];
 
-#define SHIFTED 0x10s
+/* Sun-2 modifier scancodes */
+#define SUN2_SC_LSHIFT  99
+#define SUN2_SC_RSHIFT  111
+#define SUN2_SC_CTRL    76
+#define SUN2_SC_CAPSLOCK 119
 
-//void sun2_sdl_key(int sdl_code, int modifiers, unsigned int unicode, int down)
+static int is_modifier(unsigned int sc)
+{
+  return (sc == SUN2_SC_LSHIFT || sc == SUN2_SC_RSHIFT ||
+          sc == SUN2_SC_CTRL || sc == SUN2_SC_CAPSLOCK);
+}
+
 void sun2_sdl_key(SDL_Keycode sdl_code, uint16_t modifiers, SDL_Scancode scancode, int down)
 {
-  unsigned int mapped, shifted;
+  unsigned int mapped;
 
   if (0) printf("sdl: %u %u %u %d\n", sdl_code, modifiers, scancode, down);
 
-  // If the keycode is over 128 use the scancode instead
-  if(sdl_code >= 255)
-	sdl_code = scancode;
+  /* If the keycode is over 128 use the scancode instead */
+  if (sdl_code >= 255)
+    sdl_code = scancode;
 
-  // This should still work, just with slightly different values
   mapped = map_sdl_to_sun2kb[sdl_code];
-  if (0) printf("sdl: %u %u %u %u %d \n", sdl_code, modifiers, scancode, mapped, down);
-//  shifted = mapped & SHIFTED;
+  if (0) printf("sdl: %u %u %u %u %d\n", sdl_code, modifiers, scancode, mapped, down);
 
   mapped &= 0xff;
-  if (down == 0)
-    mapped |= 0x80;
+  if (mapped == 0)
+    return;
 
-//  if (shifted) {
-//    scc_in_push(3, 0x84);
-//    scc_in_push(3, mapped);
-//    scc_in_push(3, 0x84);
-//    return;
-//  }
-
-#if 0
-  if (sdl_code == SDLK_SLASH && down) {
-    extern unsigned char g_ram[];
-    unsigned char *p = g_ram;
-    printf("0: %02x%02x%02x%02x\n", p[0], p[1], p[2], p[3]); p += 4;
-    printf("4: %02x%02x%02x%02x\n", p[0], p[1], p[2], p[3]); p += 4;
-    printf("8: %02x%02x%02x%02x\n", p[0], p[1], p[2], p[3]); p += 4;
-    printf("c: %02x%02x%02x%02x\n", p[0], p[1], p[2], p[3]);
-  }
-#endif
-
-#if 1
-  if (sdl_code == SDLK_QUOTE && down) {
-    extern int trace_armed;
-    if (trace_armed == 0) {
-      trace_armed = 1;
-      printf("TRACE ARMED!\n");
-    } else {
-      trace_armed = 0;
-      printf("TRACE unarmed!\n");
+  if (is_modifier(mapped)) {
+    /* Modifiers: real keydown/keyup tracking for combos */
+    if (down == 0)
+      mapped |= 0x80;
+    scc_in_push(3, mapped);
+  } else {
+    /* Normal keys: send make+break atomically on keydown, ignore keyup.
+     * The emulated CPU runs fast relative to SDL event timing, so a
+     * separate break code from KEYUP arrives thousands of instructions
+     * too late -- the PROM re-reads stale data. */
+    if (down) {
+      scc_in_push(3, mapped);        /* make code */
+      scc_in_push(3, mapped | 0x80); /* break code */
     }
+    /* ignore keyup for normal keys */
   }
-#endif
-
-#if 0
-  if (sdl_code == SDLK_SEMICOLON && down) {
-    toggle_trace = !toggle_trace;
-    if (toggle_trace) {
-      printf("TRACE ENABLED!\n");
-      enable_trace(1);
-    } else {
-      printf("TRACE DISABLED!\n");
-      enable_trace(0);
-    }
-  }
-#endif
-
-  scc_in_push(3, mapped);
 }
 
 #define m(f,t) map_sdl_to_sun2kb[(f)] = (t);
