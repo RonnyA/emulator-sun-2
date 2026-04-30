@@ -339,7 +339,7 @@ void idprom_setup(unsigned char machine_type)
 unsigned int pgmap[4096];
 unsigned char segmap[4096];
 
-#define PTE_PGTYPE	 0x00c00000
+#define PTE_PGTYPE	 0x01c00000	/* PTE bits [24:22], 3-bit memory type */
 #define PTE_PGTYPE_SHIFT (22)
 #define PTE_PGFRAME	 0x00000fff
 #define PAGE_SIZE_LOG2	 (11)
@@ -356,17 +356,19 @@ enum {
 
 void pgmap_write(unsigned int address, unsigned int value, int size)
 {
-  unsigned int pa, pgtype, index;
+  unsigned int pa, pgtype;
 
   if (trace_mmu_rw)
   printf("mmu: pgmap write %x <- %x (%d)\n", address, value, size);
 
+  /* Sun-2 MMU page-map index: (pmeg << 4) | VA[14:11].  See RetroCore
+     Sun2MMU.cs:262-273 for the canonical decode.  Earlier code applied
+     a rotate-left-by-1 to the pmeg before indexing — bijective, hence
+     functionally invisible since reads went through the same rotate,
+     but it scrambles trace comparison vs the RetroCore reference. */
   unsigned int segindex = (((address >> 15) & 0x1ff) << 3) | context_user_reg;
   unsigned int pmeg = segmap[segindex];
-  unsigned int pgmapindex = (pmeg << 4) | ((address >> 11) & 0xf);
-  segindex = segmap[segindex];
-segindex = ((segindex << 1) & 0xfe) | (segindex & 0x80 ? 0x01 : 0x00);
-  index = (segindex << 4) | ((address >> 11) & 0xf);
+  unsigned int index = (pmeg << 4) | ((address >> 11) & 0xf);
 
   pa = (value & PTE_PGFRAME) << PAGE_SIZE_LOG2;
   pgtype = (value & PTE_PGTYPE) >> PTE_PGTYPE_SHIFT;
@@ -375,21 +377,8 @@ segindex = ((segindex << 1) & 0xfe) | (segindex & 0x80 ? 0x01 : 0x00);
   printf("pgmap: write pgmap[0x%x] <- %x;  address %x pa %x, pgtype %d; pc %x\n",
 	 index, value, address, pa, pgtype, m68k_get_reg(NULL, M68K_REG_PC));
 
-#if 0
-  printf("pgmap[%d:%08x] <- %x size %d index %x pc %x isn_count %lu\n",
-	 0, address, value, size, index, m68k_get_reg(NULL, M68K_REG_PC), g_isn_count);
-#endif
-
   if (trace_mmu_bin) {
     trace_file_pte_set(address, pa, pgtype, (sysen_reg & SUN2_SYSENABLE_EN_BOOTN) ? 1 : 0, value);
-  }
-
-  switch (pgtype) {
-  case PGTYPE_OBMEM:
-  case PGTYPE_OBIO:
-  case PGTYPE_MBMEM:
-  case PGTYPE_MBIO:
-    break;
   }
 
   pgmap[index] = value;
@@ -397,14 +386,11 @@ segindex = ((segindex << 1) & 0xfe) | (segindex & 0x80 ? 0x01 : 0x00);
 
 unsigned int pgmap_read(unsigned int address, int size)
 {
-  unsigned int index, value;
+  unsigned int value;
 
   unsigned int segindex = (((address >> 15) & 0x1ff) << 3) | context_user_reg;
   unsigned int pmeg = segmap[segindex];
-  unsigned int pgmapindex = (pmeg << 4) | ((address >> 11) & 0xf);
-  segindex = segmap[segindex];
-segindex = ((segindex << 1) & 0xfe) | (segindex & 0x80 ? 0x01 : 0x00);
-  index = (segindex << 4) | ((address >> 11) & 0xf);
+  unsigned int index = (pmeg << 4) | ((address >> 11) & 0xf);
 
   value = pgmap[index];
 
@@ -840,7 +826,6 @@ void _check_write(unsigned pa, unsigned b, int size)
     unsigned int segindex, pmeg_number, pgmapindex, pte, mapped_pa;
     segindex = (i << 3) | 3;
     pmeg_number = segmap[segindex];
-    pmeg_number = ((pmeg_number << 1) & 0xfe) | (pmeg_number & 0x80 ? 0x01 : 0x00);
 
     if (pmeg_number == 0)
       continue;
@@ -1139,7 +1124,6 @@ unsigned int cpu_map_address(unsigned int address, unsigned int fc, int m, unsig
 
   segindex = (((address >> 15) & 0x1ff) << 3) | context;
   pmeg_number = segmap[segindex];
-pmeg_number = ((pmeg_number << 1) & 0xfe) | (pmeg_number & 0x80 ? 0x01 : 0x00);
   pageindex = (address >> 11) & 0xf;
   pgmapindex = (pmeg_number << 4) | pageindex;
   pte = pgmap[pgmapindex];
