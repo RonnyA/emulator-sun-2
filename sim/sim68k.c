@@ -300,15 +300,39 @@ unsigned int sysen_reg;
 unsigned char context_user_reg;
 unsigned char context_sys_reg;
 unsigned char diag_reg;
-unsigned char id_prom[32] = {
-#if 0
-  0x01, 0x02, 0x08, 0x00, 0x20, 0x01, 0x75, 0xeb, 0x1e, 0xf8, 0x85, 0x52, 0x00, 0x18, 0x6a, 0xf7,
-#endif
-#if 1
-  0x01, 0x01, 0x08, 0x00, 0x20, 0x01, 0x06, 0xe0, 0x1a, 0xe4, 0x23, 0x3b, 0x00, 0x0d, 0x72, 0x56,
-#endif
-  0xff,0xff,0xff,0xff, 0xff,0xff,0xff,0xff, 0xff,0xff,0xff,0xff, 0xff,0xff,0xff,0xff
-};
+/* IDPROM: byte 0 format, byte 1 machine type, bytes 2..7 ethernet (Sun OUI 08:00:20),
+   bytes 8..11 date, bytes 12..14 serial, byte 15 checksum (XOR of bytes 0..14).
+   Bytes 16..31 are 0xFF padding.  Filled in at startup by idprom_setup() based on
+   the selected --mode= so the checksum is always valid. */
+unsigned char id_prom[32];
+
+void idprom_setup(unsigned char machine_type)
+{
+    /* Stable defaults — preserved across mode switches so MAC/serial don't churn. */
+    id_prom[0]  = 0x01;          /* format */
+    id_prom[1]  = machine_type;  /* machine type — varies by mode */
+    id_prom[2]  = 0x08;          /* Sun OUI 08:00:20 */
+    id_prom[3]  = 0x00;
+    id_prom[4]  = 0x20;
+    id_prom[5]  = 0x01;          /* per-host MAC tail */
+    id_prom[6]  = 0x06;
+    id_prom[7]  = 0xe0;
+    id_prom[8]  = 0x1a;          /* date (4 bytes) */
+    id_prom[9]  = 0xe4;
+    id_prom[10] = 0x23;
+    id_prom[11] = 0x3b;
+    id_prom[12] = 0x00;          /* serial (3 bytes) */
+    id_prom[13] = 0x0d;
+    id_prom[14] = 0x72;
+
+    unsigned char xor_sum = 0;
+    for (int i = 0; i < 15; i++) xor_sum ^= id_prom[i];
+    id_prom[15] = xor_sum;
+
+    for (int i = 16; i < 32; i++) id_prom[i] = 0xff;
+
+    printf("idprom: machine_type=0x%02x checksum=0x%02x\n", machine_type, xor_sum);
+}
 unsigned int pgmap[4096];
 unsigned char segmap[4096];
 

@@ -17,6 +17,23 @@
 #define MAX_ROM 32768       // 32k ROM
 #define MAX_RAM 0xffffff    // 16MB of RAM
 
+/* Sun-2 hardware mode — selected by --mode= on the command line.
+   Drives IDPROM machine type, bwtwo CSR JUMPER_HIRES bit, and SDL window size. */
+typedef struct sun2_mode_s {
+    const char *name;            /* CLI name */
+    unsigned char idprom_machine;/* IDPROM byte 1 */
+    int hires_jumper;            /* CSR bit 8: 0 = 1152x900, 1 = 1024x1024 */
+    int width;                   /* logical framebuffer width */
+    int height;                  /* logical framebuffer height */
+    const char *desc;            /* short description for usage/banner */
+} sun2_mode_t;
+
+extern const sun2_mode_t *g_mode;
+const sun2_mode_t *sun2_mode_lookup(const char *name);
+void sun2_mode_print_list(void);
+/* Build the IDPROM bytes for a given machine type, recompute byte-15 checksum. */
+void idprom_setup(unsigned char machine_type);
+
 void abortf(const char *fmt, ...);
 void enable_trace(int);
 

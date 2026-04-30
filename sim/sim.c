@@ -29,6 +29,8 @@
 #include <dirent.h>
 #include <ctype.h>
 
+#include "sim.h"
+
 #include "scsi.h"
 
 extern void sim68k(void);
@@ -213,15 +215,49 @@ setup_tape(char *tf)
   return 0;
 }
 
+/* Mode table.  Each entry pins down the machine identity (IDPROM byte 1),
+   the bwtwo CSR JUMPER_HIRES jumper (which the PROM samples to choose
+   resolution at boot), and the corresponding logical FB size. */
+static const sun2_mode_t sun2_modes[] = {
+    /* name        idprom hi w     h     description */
+    {"2/120",      0x01,   0, 1152, 900,  "Sun-2/120 Multibus, standard 1152x900 monitor"},
+    {"2/120-hi",   0x01,   1, 1024, 1024, "Sun-2/120 Multibus, hi-res jumper (1024x1024)"},
+    {"2/50",       0x02,   0, 1152, 900,  "Sun-2/50 VME, standard 1152x900 monitor"},
+};
+static const int n_sun2_modes = sizeof(sun2_modes) / sizeof(sun2_modes[0]);
+
+const sun2_mode_t *g_mode = &sun2_modes[0];   /* default: 2/120 1152x900 */
+
+const sun2_mode_t *sun2_mode_lookup(const char *name)
+{
+    for (int i = 0; i < n_sun2_modes; i++) {
+        if (strcmp(sun2_modes[i].name, name) == 0)
+            return &sun2_modes[i];
+    }
+    return NULL;
+}
+
+void sun2_mode_print_list(void)
+{
+    for (int i = 0; i < n_sun2_modes; i++) {
+        fprintf(stderr, "    %-10s  idprom=0x%02x hires=%d  %dx%d  %s\n",
+                sun2_modes[i].name, sun2_modes[i].idprom_machine,
+                sun2_modes[i].hires_jumper, sun2_modes[i].width, sun2_modes[i].height,
+                sun2_modes[i].desc);
+    }
+}
+
 void usage(void)
 {
   fprintf(stderr, "sun-2 emulator\n");
   fprintf(stderr, "usage:\n");
-  fprintf(stderr, " --prom=\n");
-  fprintf(stderr, " --disk=\n");
-  fprintf(stderr, " --tape=\n");
+  fprintf(stderr, " --prom=FILE\n");
+  fprintf(stderr, " --disk=FILE\n");
+  fprintf(stderr, " --tape=DIR\n");
+  fprintf(stderr, " --mode=NAME    (default: %s)\n", sun2_modes[0].name);
+  sun2_mode_print_list();
   fprintf(stderr, "optionally:\n");
-  fprintf(stderr, " --kernel=\n");
+  fprintf(stderr, " --kernel=FILE  --boot=FILE\n");
   exit(1);
 }
 
@@ -256,10 +292,11 @@ int main(int argc, char **argv)
       {"tape",   optional_argument, 0,  't' },
       {"kernel", optional_argument, 0,  'k' },
       {"boot",   optional_argument, 0,  'b' },
+      {"mode",   required_argument, 0,  'm' },
       {0,        0,                 0,  0 }
     };
 
-    c = getopt_long(argc, argv, "d:k:p:t:q", long_options, &option_index);
+    c = getopt_long(argc, argv, "d:k:p:t:m:q", long_options, &option_index);
     if (c == -1)
       break;
 
@@ -293,6 +330,17 @@ int main(int argc, char **argv)
       boot_arg = strdup(optarg);
       break;
 
+    case 'm': {
+      const sun2_mode_t *m = sun2_mode_lookup(optarg);
+      if (!m) {
+        fprintf(stderr, "unknown --mode='%s'.  Valid modes:\n", optarg);
+        sun2_mode_print_list();
+        exit(1);
+      }
+      g_mode = m;
+      break;
+    }
+
     case 'q':
       quiet++;
       break;
@@ -313,6 +361,11 @@ int main(int argc, char **argv)
     printf("\n");
     usage();
   }
+
+  printf("mode: %s (idprom_machine=0x%02x, hires_jumper=%d, fb=%dx%d) — %s\n",
+         g_mode->name, g_mode->idprom_machine, g_mode->hires_jumper,
+         g_mode->width, g_mode->height, g_mode->desc);
+  idprom_setup(g_mode->idprom_machine);
 
   if (kernel_arg && boot_arg) {
     setup_kernel(kernel_arg, boot_arg);

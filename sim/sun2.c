@@ -36,151 +36,112 @@
 #define debug 0
 
 static unsigned char *fbmem;
-//static SDL_Surface *screen;
 static SDL_Window* screen;
-static SDL_Surface* surface;
-static SDL_Color COLOR_BLACK = {0,0,0,0};
-static SDL_Color COLOR_WHITE = {255,255,255,255};
+static SDL_Renderer* renderer;
+static SDL_Texture* texture;
 
-
+/* Logical framebuffer dimensions (must match what the PROM writes). */
 static int rows, cols;
+/* Last observed window size — used by the resize-snap handler so we know
+   which dimension the user just changed. */
+static int last_win_w, last_win_h;
 
 static int toggle_trace;
 static unsigned int fbctrl;
 
-void sdl_clear(void)
+/* Sun bwtwo render: 1 bpp, MSB-first within byte, bit 1 = black, bit 0 = white.
+   Renders fbmem into the streaming texture. */
+static void sdl_render_frame(void)
 {
-  //unsigned char *p = screen->pixels;
-  unsigned char *p = surface->pixels;
+  if (!texture || !fbmem) return;
 
-  int i, j;
+  void *pixels;
+  int pitch;
+  if (SDL_LockTexture(texture, NULL, &pixels, &pitch) < 0) return;
 
-  for (i = 0; i < cols; i++)
-    for (j = 0; j < rows; j++) {
-      *p = ~*p;
-      p++;
+  const Uint32 black = 0xFF000000u;
+  const Uint32 white = 0xFFFFFFFFu;
+  int bytes_per_row = cols / 8;
+  int pitch_pix = pitch / (int)sizeof(Uint32);
+  Uint32 *base = (Uint32 *)pixels;
+
+  for (int y = 0; y < rows; y++) {
+    Uint32 *p = base + y * pitch_pix;
+    const unsigned char *src = fbmem + y * bytes_per_row;
+    for (int x = 0; x < bytes_per_row; x++) {
+      unsigned char b = src[x];
+      *p++ = (b & 0x80) ? black : white;
+      *p++ = (b & 0x40) ? black : white;
+      *p++ = (b & 0x20) ? black : white;
+      *p++ = (b & 0x10) ? black : white;
+      *p++ = (b & 0x08) ? black : white;
+      *p++ = (b & 0x04) ? black : white;
+      *p++ = (b & 0x02) ? black : white;
+      *p++ = (b & 0x01) ? black : white;
     }
-}
-
-// Helper function to find and set the SDL2 pixel
-void set_pixel(int offset,SDL_Color c) {
-  // Get plane depth of surface
-  int bpp = surface->format->BytesPerPixel;
-  // Temp var
-  int i=0;
-  // Get pixel array
-  uint8_t* pixels = (uint8_t*)surface-> pixels;
-  // Loop for each of R/G/B/Alpha
-  for(i=0;i<4;i++)
-    pixels[offset*bpp + i ] = SDL_MapRGB(surface->format, c.r, c.g, c.b);
-
-}
-
-void sdl_write(unsigned int offset, int size, unsigned value)
-{
-  //  Lock surface before modifying, this is near instant if the surface does not need locking
-  SDL_LockSurface(surface);
-
-  int i, h, v;
-
-  if (0) printf("sdl_write offset %x size %d <- %x\n", offset, size, value);
-
-  // Multipy offset with bit plane depth
-  offset *= 8;
-  v = offset / cols;
-  h = offset % cols;
-
-  switch (size) {
-  case 1:
-    for (i = 0; i < 8; i++) {
-      set_pixel(offset+i,(value & 0x80) ? COLOR_BLACK : COLOR_WHITE);
-      //ps[offset + i] = (value & 0x80) ? COLOR_BLACK : COLOR_WHITE;
-      value <<= 1;
-    }
-    break;
-  case 2:
-    //if (value == 0x0) { for (i = 0; i < 16; i++) ps[offset + i] = COLOR_WHITE; } else
-    if (value == 0x0) { for (i = 0; i < 16; i++) set_pixel(offset+i,COLOR_WHITE); } else
-    //if (value == 0xffff) { for (i = 0; i < 16; i++) ps[offset + i] = COLOR_BLACK; } else
-    if (value == 0xffff) { for (i = 0; i < 16; i++) set_pixel(offset+i,COLOR_BLACK); } else
-    for (i = 0; i < 16; i++) {
-      set_pixel(offset+i,(value & 0x8000) ? COLOR_BLACK : COLOR_WHITE);
-      //ps[offset + i] = (value & 0x8000) ? COLOR_BLACK : COLOR_WHITE;
-      value <<= 1;
-    }
-    break;
-  case 4:
-    //if (value == 0x0) { for (i = 0; i < 32; i++) ps[offset + i] = COLOR_WHITE; } else
-    if (value == 0x0) { for (i = 0; i < 32; i++) set_pixel(offset+i,COLOR_WHITE); } else
-    //if (value == 0xffffffff) { for (i = 0; i < 32; i++) ps[offset + i] = COLOR_BLACK; } else
-    if (value == 0xffffffff) { for (i = 0; i < 32; i++) set_pixel(offset+i,COLOR_BLACK); } else
-    for (i = 0; i < 32; i++) {
-      set_pixel(offset+i,(value & 0x80000000) ? COLOR_BLACK : COLOR_WHITE);
-      //ps[offset + i] = (value & 0x80000000) ? COLOR_BLACK : COLOR_WHITE;
-      value <<= 1;
-    }
-    break;
-
-  // Unlock surface after modifying
-  SDL_UnlockSurface(surface);
   }
 
-// This is no longer needed
-//#ifdef __linux__
-//  accumulate_update(h, v, 32, 1);
-  // for some reason this slows down mac os with SDL 1.2
-//  SDL_UpdateRect(screen, h, v, size*8, 1);
-//#endif
+  SDL_UnlockTexture(texture);
 }
 
 void sdl_init(void)
 {
-    int flags;
+    /* Logical FB dimensions come from the active --mode=.  The same mode also
+       drives the bwtwo CSR JUMPER_HIRES bit (sampled by PROM) so the PROM and
+       the renderer agree on stride. */
+    cols = g_mode->width;
+    rows = g_mode->height;
 
-#if 0
-    cols = 1152;
-    rows = 900;
-#else
-    cols = 1024;
-    rows = 1024;
-#endif
+    /* Default window size = native FB dimensions (1:1 logical pixel mapping).
+       Resize-snap below keeps the FB aspect on user resize. */
+    int win_w = cols;
+    int win_h = rows;
+    last_win_w = win_w;
+    last_win_h = win_h;
 
-    if (0) printf("Initialize display %dx%d\n", cols, rows);
-
-    //flags = SDL_INIT_VIDEO | SDL_INIT_NOPARACHUTE;
-    // Init parachute is the default in SDL2 and no longer needed
-    flags = SDL_INIT_VIDEO;
-
-    if (SDL_Init(flags)) {
-        printf("SDL initialization failed %s\n",SDL_GetError());
+    if (SDL_Init(SDL_INIT_VIDEO)) {
+        printf("SDL initialization failed: %s\n", SDL_GetError());
         return;
     }
 
-    // SDL2 is now hardware accelerated by default so this isn't needed anymore
-    // flags = SDL_HWSURFACE|SDL_ASYNCBLIT|SDL_HWACCEL;
-    flags = SDL_WINDOW_SHOWN;
-
-    //screen = SDL_SetVideoMode(cols, rows, 8, flags);
-    screen = SDL_CreateWindow("My Game Window",
-                          SDL_WINDOWPOS_CENTERED,
-                          SDL_WINDOWPOS_CENTERED,
-                          cols,rows,
-                          flags);
-
-    surface = SDL_GetWindowSurface(screen);
-
-
+    screen = SDL_CreateWindow("Sun2",
+                              SDL_WINDOWPOS_CENTERED,
+                              SDL_WINDOWPOS_CENTERED,
+                              win_w, win_h,
+                              SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
     if (!screen) {
-        printf("Could not open SDL display\n");
+        printf("Could not open SDL window: %s\n", SDL_GetError());
         return;
     }
 
-    if(!surface) {
-	printf("Can't init surface\n");
-	return;
+    renderer = SDL_CreateRenderer(screen, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    if (!renderer) {
+        renderer = SDL_CreateRenderer(screen, -1, 0);
+        if (!renderer) {
+            printf("Could not create renderer: %s\n", SDL_GetError());
+            return;
+        }
     }
 
-    SDL_SetWindowTitle(screen,"Sun2");
+    /* Map the logical 1024x1024 framebuffer onto whatever window size,
+       preserving aspect ratio and using nearest-neighbor for crisp pixels. */
+    SDL_RenderSetLogicalSize(renderer, cols, rows);
+    SDL_RenderSetIntegerScale(renderer, SDL_FALSE);
+    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "nearest");
+
+    texture = SDL_CreateTexture(renderer,
+                                SDL_PIXELFORMAT_ARGB8888,
+                                SDL_TEXTUREACCESS_STREAMING,
+                                cols, rows);
+    if (!texture) {
+        printf("Could not create texture: %s\n", SDL_GetError());
+        return;
+    }
+
+    SDL_RendererInfo info;
+    SDL_GetRendererInfo(renderer, &info);
+    printf("sdl_init: logical fb %dx%d, window %dx%d (resizable), renderer=%s\n",
+           cols, rows, win_w, win_h, info.name);
 }
 
 //void sun2_sdl_key(int sdl_code, int modifiers, unsigned int unicode, int down);
@@ -191,27 +152,50 @@ void sdl_poll(void)
   SDL_Event event;
   //SDL_Event ev1, *ev = &ev1;
 
-  //  send_accumulated_updates();
-  SDL_UpdateWindowSurface(screen);
+  sdl_render_frame();
+  SDL_RenderClear(renderer);
+  SDL_RenderCopy(renderer, texture, NULL, NULL);
+  SDL_RenderPresent(renderer);
 
   while (SDL_PollEvent(&event)) {
     switch (event.type) {
 	    case SDL_WINDOWEVENT:
-	//      sdl_update(ds, 0, 0, screen->w, screen->h);
+	      /* Snap window size to FB aspect on resize so the picture always
+	         fills the window — no letterbox bars from SDL_RenderSetLogicalSize.
+	         Strategy: figure out which dimension the user just changed, treat
+	         that one as authoritative, derive the other from cols:rows. */
+	      if (event.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
+	        int w = event.window.data1;
+	        int h = event.window.data2;
+	        int dw = w - last_win_w; if (dw < 0) dw = -dw;
+	        int dh = h - last_win_h; if (dh < 0) dh = -dh;
+	        int target_w, target_h;
+	        if (dw >= dh) {
+	          target_w = w;
+	          target_h = (int)((long)w * rows / cols);
+	        } else {
+	          target_h = h;
+	          target_w = (int)((long)h * cols / rows);
+	        }
+	        if (target_w < 1) target_w = 1;
+	        if (target_h < 1) target_h = 1;
+	        last_win_w = target_w;
+	        last_win_h = target_h;
+	        if (target_w != w || target_h != h)
+	          SDL_SetWindowSize(screen, target_w, target_h);
+	      }
 	      break;
 
 	    case SDL_KEYDOWN:
 	      sun2_sdl_key(event.key.keysym.sym, event.key.keysym.mod, event.key.keysym.scancode, 1);
-	      //sun2_sdl_key(ev->key.keysym.sym, ev->key.keysym.mod, ev->key.keysym.unicode, 1);
 	      break;
 
 	    case SDL_KEYUP:
 	      sun2_sdl_key(event.key.keysym.sym, event.key.keysym.mod, event.key.keysym.scancode, 0);
-	      //sun2_sdl_key(ev->key.keysym.sym, ev->key.keysym.mod, ev->key.keysym.unicode, 0);
 	      break;
 	    case SDL_QUIT:
-	//      sdl_system_shutdown_request();
-	      break;
+	      SDL_Quit();
+	      exit(0);
 	    case SDL_MOUSEMOTION:
 	//      sdl_send_mouse_event();
 	      break;
@@ -294,7 +278,6 @@ unsigned int sun2_video_write(unsigned int address, int size, unsigned int value
     p08[3] = value;
     break;
   }
-  sdl_write(address & 0xfffff, size, value);
   return 0;
 }
 
@@ -314,17 +297,59 @@ unsigned int sun2_kbm_write(unsigned int address, int size, unsigned int value)
   return 0;
 }
 
+/* bwtwo Multibus CSR at base+0x81800 (PA 0x781800).  16-bit big-endian register.
+   Bit layout (per C# RetroCore SunBwTwo.cs and TME tme-0.8/machine/sun/sun-bwtwo.c):
+     15 VIDEO_ENABLE  RW    11 JUMPER_B       RO
+     14 COPY_ENABLE   RW    10 JUMPER_A       RO
+     13 INT_ENABLE    RW     9 JUMPER_COLOR   RO
+     12 INT_ACTIVE    RO     8 JUMPER_HIRES   RO   <-- PROM reads this to pick resolution
+      6:1 COPYBASE_MASK RW
+   The PROM's resolution-detect (sun2-multi-rev-R.bin PC 0xef3168) reads BYTE at
+   PA 0x781800 (high byte of CSR) and tests bit 0 — that's bit 8 of the CSR =
+   JUMPER_HIRES.  JUMPER_HIRES=0 -> 1152x900 path; JUMPER_HIRES=1 -> 1024x1024.
+   The jumper value comes from the active --mode= entry (g_mode->hires_jumper). */
+#define BWTWO_CSR_RW_MASK    0xE07Eu  /* VIDEO_ENABLE, COPY_ENABLE, INT_ENABLE, COPYBASE */
+#define BWTWO_CSR_JUMPER_HIRES 0x0100u
+
+static unsigned int bwtwo_csr_ro_bits(void) {
+    return g_mode && g_mode->hires_jumper ? BWTWO_CSR_JUMPER_HIRES : 0;
+}
+
 unsigned int sun2_video_ctl_read(unsigned int address, int size)
 {
-  printf("sun2: fb ctrl @ %x -> %x (%d)\n", address, fbctrl, size);
-//fbctrl = 0;
-  return fbctrl;
+  unsigned int value;
+  unsigned int reg = (fbctrl & BWTWO_CSR_RW_MASK) | bwtwo_csr_ro_bits();
+  unsigned int off = address & 1;
+
+  switch (size) {
+  case 1:
+    value = off ? (reg & 0xff) : ((reg >> 8) & 0xff);
+    break;
+  case 2:
+    value = reg;
+    break;
+  default:
+    value = reg;
+    break;
+  }
+  if (0) printf("sun2: fb ctrl @ %x -> %x (%d)\n", address, value, size);
+  return value;
 }
 
 unsigned int sun2_video_ctl_write(unsigned int address, int size, unsigned int value)
 {
-  printf("sun2: fb ctrl @ %x <- %x (%d)\n", address, value, size);
-  fbctrl = value & 0xe07e;
+  if (0) printf("sun2: fb ctrl @ %x <- %x (%d)\n", address, value, size);
+  /* Only the RW bits are writable; ignore writes to RO jumper/status bits. */
+  if (size == 1) {
+    unsigned int off = address & 1;
+    if (off == 0)
+      fbctrl = (fbctrl & 0x00ff) | ((value & 0xff) << 8);
+    else
+      fbctrl = (fbctrl & 0xff00) | (value & 0xff);
+  } else {
+    fbctrl = value & 0xffff;
+  }
+  fbctrl &= BWTWO_CSR_RW_MASK;
   return 0;
 }
 
