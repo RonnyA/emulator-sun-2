@@ -1,5 +1,5 @@
 
-PROM  = media/rom/sun2-multi-rev-R.bin
+PROM  = media/rom/sun2-multi-rev-10F.bin
 DISK  = media/disk/disk.img
 TAPE  = media/tape/tape
 
