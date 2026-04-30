@@ -94,7 +94,7 @@ unsigned int g_buserr_pc = 0;
 int g_trace = 0;
 unsigned long g_isn_count;
 
-int trace_cpu_io = 0;
+int trace_cpu_io;
 int trace_cpu_rw;
 int trace_cpu_isn;
 int trace_cpu_bin;
@@ -991,6 +991,7 @@ void io_update(void)
   mm58167_update();
   scc_update();
   e3c400_update();
+  sun2_autotype_tick();
 
   if (sdl_poll_delay++ == 10000) {
     sdl_poll_delay = 0;

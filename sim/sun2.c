@@ -353,6 +353,54 @@ unsigned int sun2_video_ctl_write(unsigned int address, int size, unsigned int v
   return 0;
 }
 
+/* ---- auto-typer (drives the PROM monitor non-interactively for trace
+   capture).  Uses the same SCC keyboard channel as physical keystrokes:
+   pushes the press scancode, waits, then pushes the release scancode.
+   Driven from io_update via sun2_autotype_tick(). */
+
+extern unsigned int map_sdl_to_sun2kb[512];
+
+static unsigned autotype_pos;
+static unsigned autotype_phase;        /* 0 = press, 1 = release */
+static unsigned autotype_delay;        /* tick countdown before next action */
+#define AUTOTYPE_BOOT_DELAY  20000000  /* ~20M io_update ticks before first key — let PROM reach prompt */
+#define AUTOTYPE_PRESS_HOLD  100000    /* hold each key down */
+#define AUTOTYPE_GAP         200000    /* gap between successive keys */
+
+void sun2_autotype_tick(void)
+{
+  static int started;
+  if (!g_autotype) return;
+  if (!started) { autotype_delay = AUTOTYPE_BOOT_DELAY; started = 1; }
+  if (autotype_delay) { autotype_delay--; return; }
+  if (!g_autotype[autotype_pos]) return;
+
+  unsigned char ch = (unsigned char)g_autotype[autotype_pos];
+  /* Map to SDL keycode the existing keymap expects.  Lower-case
+     ASCII letters and digits go through directly (SDLK_a == 'a' etc.).
+     Convert '\n' to SDLK_RETURN (0x0D). */
+  if (ch == '\n') ch = '\r';     /* SDLK_RETURN = 0x0D */
+  unsigned int code = map_sdl_to_sun2kb[ch] & 0xff;
+  if (code == 0) {
+    printf("autotype: skipping unmapped char 0x%02x\n", ch);
+    autotype_pos++;
+    autotype_delay = AUTOTYPE_GAP;
+    return;
+  }
+
+  if (autotype_phase == 0) {
+    if (debug || 1) printf("autotype: press '%c' (scancode 0x%02x)\n", ch, code);
+    scc_in_push(3, code);
+    autotype_phase = 1;
+    autotype_delay = AUTOTYPE_PRESS_HOLD;
+  } else {
+    scc_in_push(3, code | 0x80);   /* release = bit 7 set */
+    autotype_phase = 0;
+    autotype_pos++;
+    autotype_delay = AUTOTYPE_GAP;
+  }
+}
+
 /* ----- */
 
 void sun2_kb_write(int value, int size)

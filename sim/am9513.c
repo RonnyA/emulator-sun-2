@@ -281,11 +281,27 @@ void am9513_wr_cmd(unsigned int value)
 unsigned int am9513_read(unsigned int pa, int size)
 {
   unsigned int offset = pa & 0xff;
-  unsigned int value;
+  unsigned int value = 0;
 
   switch (offset) {
-  case 0: value = am9513_status; break;
-  case 2: value = am9513_status; break;
+  case 0: case 1:
+    /* Data port read — returns the current value pointed at by the data
+       pointer (mode/load/hold/etc).  We don't fully model the data-pointer
+       read path; return 0.  The PROM mainly writes here. */
+    value = 0;
+    break;
+
+  case 2: case 3: {
+    /* Status register — bits 1..5 are the current OUT pin states for
+       counters 1..5; bit 7 is the byte-pointer.  Sun-2 PROM rev 1.0F
+       polls this to detect counter terminal-count after issuing a
+       "clr output bit" command.  Previously we returned a static
+       0x0b00 here, so OUT1 always read as 1 and the polling loop on
+       counter 1 never made progress. */
+    value = (am9513_output_bits & 0x3e);  /* OUT1..OUT5 in bits 1..5 */
+    if (am9513_data_ptr_byte) value |= 0x80;  /* BPR (byte pointer) */
+    break;
+  }
   }
 
   if (trace_am9513)

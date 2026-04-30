@@ -19,6 +19,12 @@
 
 extern int eprom_size;
 
+/* Auto-type: when set via --type=STRING, the emulator will inject the
+   given ASCII characters as keyboard scancodes after the PROM has had
+   time to come up.  Used to drive the PROM monitor non-interactively. */
+extern const char *g_autotype;
+void sun2_autotype_tick(void);
+
 /* Sun-2 hardware mode — selected by --mode= on the command line.
    Drives IDPROM machine type, bwtwo CSR JUMPER_HIRES bit, and SDL window size. */
 typedef struct sun2_mode_s {

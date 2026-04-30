@@ -228,6 +228,7 @@ static const sun2_mode_t sun2_modes[] = {
 static const int n_sun2_modes = sizeof(sun2_modes) / sizeof(sun2_modes[0]);
 
 const sun2_mode_t *g_mode = &sun2_modes[0];   /* default: 2/120 1152x900 */
+const char *g_autotype;
 
 const sun2_mode_t *sun2_mode_lookup(const char *name)
 {
@@ -294,10 +295,11 @@ int main(int argc, char **argv)
       {"kernel", optional_argument, 0,  'k' },
       {"boot",   optional_argument, 0,  'b' },
       {"mode",   required_argument, 0,  'm' },
+      {"type",   required_argument, 0,  'T' },
       {0,        0,                 0,  0 }
     };
 
-    c = getopt_long(argc, argv, "d:k:p:t:m:q", long_options, &option_index);
+    c = getopt_long(argc, argv, "d:k:p:t:m:T:q", long_options, &option_index);
     if (c == -1)
       break;
 
@@ -341,6 +343,11 @@ int main(int argc, char **argv)
       g_mode = m;
       break;
     }
+
+    case 'T':
+      g_autotype = strdup(optarg);
+      printf("autotype: will type %zu chars after boot delay\n", strlen(optarg));
+      break;
 
     case 'q':
       quiet++;

@@ -1561,16 +1561,36 @@ INLINE void m68ki_stack_frame_buserr(uint pc, uint sr, uint address, uint write,
 	m68ki_push_16(((!write)<<4) | ((!instruction)<<3) | fc);
 }
 
-/* Format 8 stack frame (68010).
- * 68010 only.  This is the 29 word bus/address error frame.
+/* Format 8 stack frame (68010 bus / address error).
+ *
+ * Layout exactly mirrors C# RetroCore's CreateStackFrame8
+ * (RetroCore/Emulated.HW/Motorola/CPU/MC68K/Instructionset.Helpers.cs
+ *  lines 1246-1294) which is the battle-tested reference for Sun-2
+ * boot ROMs.  29 words total; the resulting on-stack offsets match
+ * the SunOS bei_long8 struct (sys/sun3/sysm68k.h):
+ *
+ *   +00  Status Register
+ *   +02  Program Counter (4)
+ *   +06  Format/Vector (0x8xxx)
+ *   +08  Special Status Word
+ *   +0A  Fault Address (4)
+ *   +0E  unused
+ *   +10  Data Output Buffer
+ *   +12  unused
+ *   +14  Data Input Buffer
+ *   +16  unused
+ *   +18  Instruction Output Buffer (bei_irc)
+ *   +1A  Chip Mask # / MicroPC      (bei_maskpc)  ← MUST be deterministic
+ *   +1C  last internal-info word    ← MUST be deterministic
+ *   +1E..+39  14 words of internal info (left uninitialised — 68010 manual)
+ *
+ * Earlier code pushed 8× fake_push_32 then 1× push_16(0), leaving +1A
+ * and +1C uninitialised.  Sun PROM bus-error handlers read +1A
+ * (bei_maskpc), so garbage there caused unpredictable behaviour.
  */
 void m68ki_stack_frame_1000(uint pc, uint sr, uint vector, uint address, uint write, uint fc)
 {
-	/* VERSION
-	 * NUMBER
-	 * INTERNAL INFORMATION, 16 WORDS
-	 */
-	m68ki_fake_push_32();
+	/* Version + 14 words of internal info (uninitialised, like real chip) */
 	m68ki_fake_push_32();
 	m68ki_fake_push_32();
 	m68ki_fake_push_32();
@@ -1579,35 +1599,40 @@ void m68ki_stack_frame_1000(uint pc, uint sr, uint vector, uint address, uint wr
 	m68ki_fake_push_32();
 	m68ki_fake_push_32();
 
-	/* INSTRUCTION INPUT BUFFER */
+	/* Last internal-info word — zeroed deterministically (matches C# RetroCore) */
 	m68ki_push_16(0);
 
-	/* UNUSED, RESERVED (not written) */
-	m68ki_fake_push_16();
-
-	/* DATA INPUT BUFFER */
+	/* Chip Mask # and MicroPC (bei_maskpc) — zeroed (matches C# RetroCore) */
 	m68ki_push_16(0);
 
-	/* UNUSED, RESERVED (not written) */
-	m68ki_fake_push_16();
-	/* DATA OUTPUT BUFFER */
+	/* Instruction Output Buffer */
 	m68ki_push_16(0);
 
-	/* UNUSED, RESERVED (not written) */
+	/* Unused, reserved */
 	m68ki_fake_push_16();
 
-	/* FAULT ADDRESS */
+	/* Data Input Buffer */
+	m68ki_push_16(0);
+
+	/* Unused, reserved */
+	m68ki_fake_push_16();
+
+	/* Data Output Buffer */
+	m68ki_push_16(0);
+
+	/* Unused, reserved */
+	m68ki_fake_push_16();
+
+	/* Fault Address */
 	m68ki_push_32(address);
 
-	/* SPECIAL STATUS WORD (68010 layout):
-	 *   bit 15 = Rerun (0 = software rerun, set by PROM)
+	/* Special Status Word (68010 layout):
+	 *   bit 15 = Rerun  (0 = software-rerun, set by PROM)
 	 *   bit 13 = Instruction Fetch
 	 *   bit 12 = Data Fetch
-	 *   bit  8 = R/W (1 = read)
+	 *   bit  8 = R/W (1 = read, 0 = write)
 	 *   bits 0..2 = Function Code
-	 * Previously we put R/W at bit 4 and never set IF/DF, so PROM bus error
-	 * handlers (notably Sun-2 boot rev 1.0F) couldn't tell read from write
-	 * or instruction from data and looped trying to restart the cycle.
+	 * Bits chosen to match RetroCore HelperEnums.cs SpecialStatusWord enum.
 	 */
 	{
 		uint ssw = fc & 7;
@@ -1617,13 +1642,13 @@ void m68ki_stack_frame_1000(uint pc, uint sr, uint vector, uint address, uint wr
 		m68ki_push_16(ssw);
 	}
 
-	/* 1000, VECTOR OFFSET */
-	m68ki_push_16(0x8000 | (vector<<2));
+	/* Format 8 + vector offset */
+	m68ki_push_16(0x8000 | (vector << 2));
 
-	/* PROGRAM COUNTER */
+	/* Program Counter (faulting instruction; restartable for RTE) */
 	m68ki_push_32(pc);
 
-	/* STATUS REGISTER */
+	/* Status Register */
 	m68ki_push_16(sr);
 }
 
