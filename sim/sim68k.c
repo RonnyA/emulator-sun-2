@@ -531,32 +531,49 @@ void sw_int_throw(int intr);
 
 void sysenable_write(unsigned int address, unsigned int value, int size)
 {
+  unsigned int new_val;
   int replay = 0;
+
   if (trace_mmu || trace_irq) printf("mmu: sysen write %x <- %x (%d)\n", address, value, size);
+
+  /* The Sun-2 system-enable register is 16-bit big-endian.  PROM rev 1.0F
+     writes individual bytes via FC=3 byte access, where byte at offset 0x0e
+     is the high half and byte at offset 0x0f is the low half (the EN_INT
+     bit lives in the low byte at bit 6).  The previous code only handled
+     word writes (case 2), silently dropping byte writes — so EN_INT never
+     toggled and the pending IRQ 7 from the AM9513 was never delivered.
+     C# RetroCore triggers EN_INT-enable on the byte write to 0x0f
+     (MachineSun2Memory.cs:958-977). */
   switch (size) {
   case 2:
-    if ((sysen_reg & SUN2_SYSENABLE_EN_INT) && !(value & SUN2_SYSENABLE_EN_INT)) {
-      printf("sim68k: sysen_reg ints off; pending 0x%x, highest %d\n",
-	     g_int_controller_pending, g_int_controller_highest_int);
-    }
-    if (!(sysen_reg & SUN2_SYSENABLE_EN_INT) && (value & SUN2_SYSENABLE_EN_INT)) {
-      printf("sim68k: sysen_reg ints on; pending 0x%x, highest %d\n",
-	     g_int_controller_pending, g_int_controller_highest_int);
-      replay = 1;
-    }
-
-    sysen_reg = value;
-    if (trace_mmu) printf("mmu: sysen %x\n", sysen_reg);
-#if 0
-    if (value > 0xff)
-      enable_trace(1);
-#endif
-
-    if (replay) {
-      if (g_int_controller_highest_int != 0)
-	m68k_set_irq(g_int_controller_highest_int);
-    }
+    new_val = value & 0xffff;
     break;
+  case 1:
+    if ((address & 1) == 0)
+      new_val = (sysen_reg & 0x00ff) | ((value & 0xff) << 8);   /* high byte */
+    else
+      new_val = (sysen_reg & 0xff00) | (value & 0xff);          /* low byte */
+    break;
+  default:
+    return;
+  }
+
+  if ((sysen_reg & SUN2_SYSENABLE_EN_INT) && !(new_val & SUN2_SYSENABLE_EN_INT)) {
+    printf("sim68k: sysen_reg ints off; pending 0x%x, highest %d\n",
+	   g_int_controller_pending, g_int_controller_highest_int);
+  }
+  if (!(sysen_reg & SUN2_SYSENABLE_EN_INT) && (new_val & SUN2_SYSENABLE_EN_INT)) {
+    printf("sim68k: sysen_reg ints on; pending 0x%x, highest %d\n",
+	   g_int_controller_pending, g_int_controller_highest_int);
+    replay = 1;
+  }
+
+  sysen_reg = new_val;
+  if (trace_mmu) printf("mmu: sysen %x\n", sysen_reg);
+
+  if (replay) {
+    if (g_int_controller_highest_int != 0)
+      m68k_set_irq(g_int_controller_highest_int);
   }
 
   if (sysen_reg & SUN2_SYSENABLE_EN_INT1)

@@ -37,9 +37,14 @@ int am9513_device_ack(int which)
   switch (which) {
   case 1:
     int_controller_clear(IRQ_9513_TIMER1);
+    /* Clear the OUT1 latch so the next counter underflow can re-fire IRQ.
+       Without this the counter terminates only once and the system never
+       sees periodic timer ticks (rev-1.0F PROM relies on this). */
+    am9513_output_bits &= ~(1 << 1);
     return M68K_INT_ACK_AUTOVECTOR;
   case 2:
     int_controller_clear(IRQ_9513_TIMER2);
+    am9513_output_bits &= ~(1 << 2);
     return M68K_INT_ACK_AUTOVECTOR;
   }
   return -1;
@@ -48,8 +53,6 @@ int am9513_device_ack(int which)
 void am9513_update(void)
 {
   int i, bit;
-
-  trace_am9513 = 0;
 
 #if 0
   if (++am9513_prescale < 10)
@@ -291,6 +294,54 @@ unsigned int am9513_read(unsigned int pa, int size)
   return value;
 }
 
+/* AM9513 data-pointer auto-increment.  After every successful data
+   access the pointer cycles Mode → Load → Hold within a counter group,
+   then wraps to Mode of the next counter (1..5).  The PROM relies on
+   this to write 16-bit mode/load/hold triples sequentially after a
+   single "load data ptr" command. */
+static void am9513_advance_dp(void)
+{
+  int e = (am9513_data_ptr & 0x18) >> 3;
+  int g = (am9513_data_ptr & 0x07);
+
+  if (g >= 1 && g <= 5) {
+    if (e < 2) {
+      e++;
+    } else {
+      e = 0;
+      g = (g < 5) ? g + 1 : 1;
+    }
+    am9513_data_ptr = (am9513_data_ptr & ~0x1f) | ((e & 3) << 3) | (g & 7);
+  }
+}
+
+/* Word write to the data port — used when the chip is in 16-bit data-bus
+   mode (Master Mode bit 13 set).  Sun-2 rev 1.0F PROM enables this and
+   then writes 16-bit mode/load/hold values atomically.  The earlier code
+   truncated word writes to 8 bits, dropping the high byte and corrupting
+   the timer counters so no periodic IRQ ever fired. */
+static void am9513_wr_data16(unsigned int value)
+{
+  int e = (am9513_data_ptr & 0x18) >> 3;
+  int g = (am9513_data_ptr & 0x7);
+
+  value &= 0xffff;
+
+  if (trace_am9513)
+    printf("am9513_wr_data16: e%d g%d <- %04x\n", e, g, value);
+
+  if (g >= 1 && g <= 5) {
+    switch (e) {
+    case 0: am9513_ctr[g].mode = value; break;
+    case 1: am9513_ctr[g].load = value; break;
+    case 2: am9513_ctr[g].hold = value; break;
+    }
+  }
+  /* 16-bit mode bypasses the LSB/MSB byte sequencer */
+  am9513_data_ptr_byte = 0;
+  am9513_advance_dp();
+}
+
 void am9513_write(unsigned int pa, unsigned int value, int size)
 {
   unsigned int offset = pa & 0xff;
@@ -298,11 +349,21 @@ void am9513_write(unsigned int pa, unsigned int value, int size)
   if (trace_am9513)
     printf("am9513: write %x (%d) <- %x\n", pa, size, value);
 
-  value &= 0x00ff;
+  if (size == 2) {
+    /* 16-bit access.  Data port: write whole 16-bit register atomically.
+       Command port: AM9513 commands are 8 bits; PROM sends 0xff in the
+       high byte as padding.  Take the low byte. */
+    switch (offset) {
+    case 0: am9513_wr_data16(value); break;
+    case 2: am9513_wr_cmd(value & 0xff); break;
+    }
+    return;
+  }
 
+  /* Byte access — preserves the existing 8-bit-mode byte sequencer */
   switch (offset) {
-  case 0: am9513_wr_data(value); break;
-  case 2: am9513_wr_cmd(value); break;
+  case 0: am9513_wr_data(value & 0xff); break;
+  case 2: am9513_wr_cmd(value & 0xff); break;
   }
 }
 

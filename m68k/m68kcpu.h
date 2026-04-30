@@ -1599,9 +1599,24 @@ void m68ki_stack_frame_1000(uint pc, uint sr, uint vector, uint address, uint wr
 	/* FAULT ADDRESS */
 	m68ki_push_32(address);
 
-	/* SPECIAL STATUS WORD */
-	m68ki_push_16(((!write)<<4) | fc);
-	
+	/* SPECIAL STATUS WORD (68010 layout):
+	 *   bit 15 = Rerun (0 = software rerun, set by PROM)
+	 *   bit 13 = Instruction Fetch
+	 *   bit 12 = Data Fetch
+	 *   bit  8 = R/W (1 = read)
+	 *   bits 0..2 = Function Code
+	 * Previously we put R/W at bit 4 and never set IF/DF, so PROM bus error
+	 * handlers (notably Sun-2 boot rev 1.0F) couldn't tell read from write
+	 * or instruction from data and looped trying to restart the cycle.
+	 */
+	{
+		uint ssw = fc & 7;
+		if (fc == 2 || fc == 6) ssw |= (1u << 13);   /* instruction fetch (program space) */
+		if (fc == 1 || fc == 5) ssw |= (1u << 12);   /* data fetch (data space) */
+		if (!write)             ssw |= (1u << 8);    /* read */
+		m68ki_push_16(ssw);
+	}
+
 	/* 1000, VECTOR OFFSET */
 	m68ki_push_16(0x8000 | (vector<<2));
 
