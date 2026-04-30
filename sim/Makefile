@@ -14,14 +14,14 @@ UNAME_S := $(shell uname -s)
 
 # Changed this to reflect move to SDL2
 ifeq ($(UNAME_S),Darwin)
-	EXTRA_INC = -I/Library/Frameworks/SDL2.framework/Headers
-	LIBS = -F /Library/Frameworks -framework SDL2 -framework Cocoa
-else ($(UNAME_S),NetBSD)
+	EXTRA_INC = $(shell sdl2-config --cflags)
+	LIBS = $(shell sdl2-config --libs)
+else ifeq ($(UNAME_S),NetBSD)
 	EXTRA_INC = -I/usr/pkg/include
 	LIBS = -R/usr/pkg/lib -L/usr/pkg/lib -lSDL2 -lpthread
 else
-	EXTRA_INC =
-	LIBS = -lSDL2 -lpthread
+	EXTRA_INC = $(shell sdl2-config --cflags)
+	LIBS = $(shell sdl2-config --libs) -lpthread
 endif
 
 CFLAGS = -I. -I$(M68K_SRC) $(EXTRA_INC) -g -O2 $(DEFS)
