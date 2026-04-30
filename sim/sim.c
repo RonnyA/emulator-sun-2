@@ -100,13 +100,14 @@ read_kernel(void)
 }
 
 int eprom_size;
-char eprom_raw[32*1024];
 
 int
 read_binary(int fd, int addr)
 {
 	extern unsigned char g_rom[];
-	eprom_size = read(fd, g_rom/*eprom_raw*/, sizeof(eprom_raw));
+	eprom_size = read(fd, g_rom, MAX_ROM);
+	if (eprom_size > 0)
+		printf("eprom: loaded %d bytes\n", eprom_size);
 	return eprom_size;
 }
 

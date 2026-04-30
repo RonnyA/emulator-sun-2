@@ -14,8 +14,10 @@
 #define IRQ_SW_INT1     1
 
 /* ROM and RAM sizes */
-#define MAX_ROM 32768       // 32k ROM
+#define MAX_ROM 65536       // 64k ROM (Sun-2 boot ROMs: 32 KB rev-R/Q, 64 KB rev-10F)
 #define MAX_RAM 0xffffff    // 16MB of RAM
+
+extern int eprom_size;
 
 /* Sun-2 hardware mode — selected by --mode= on the command line.
    Drives IDPROM machine type, bwtwo CSR JUMPER_HIRES bit, and SDL window size. */

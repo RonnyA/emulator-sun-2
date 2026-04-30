@@ -166,10 +166,13 @@ unsigned int io_read(int size, unsigned int va, unsigned int pa)
   case 2: value = 0xffff; break;
   }
 
-  /* for eprom, hardware bypasses mapping with cpu va */
+  /* for eprom, hardware bypasses mapping with cpu va.  Mask scales with the
+     loaded ROM size so 32 KB ROMs (rev-R / rev-Q) wrap at 0x8000 and 64 KB
+     ROMs (rev-10F) wrap at 0x10000.  Falls back to 32 KB if eprom_size hasn't
+     been set yet. */
   if (pa < 0x800 || pa >= 0xef0000) {
-//  prom:
-    pa = va & 0x7fff;
+    unsigned mask = (eprom_size > 0) ? (unsigned)(eprom_size - 1) : 0x7fff;
+    pa = va & mask;
     switch (size) {
     case 1: value = READ_BYTE(g_rom, pa); break;
     case 2: value = READ_WORD(g_rom, pa); break;
