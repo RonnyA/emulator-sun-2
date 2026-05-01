@@ -740,20 +740,24 @@ int m68k_execute(int num_cycles)
 		USE_CYCLES(CPU_INT_CYCLES);
 		CPU_INT_CYCLES = 0;
 
-#if 1
+		/* On fault, roll back any registers (D0-D7/A0-A7) the partially-
+		 * executed instruction modified, restoring the snapshot taken at
+		 * m68k_execute entry.  Real 68010 hardware leaves the registers
+		 * in their pre-instruction state when a bus error occurs. */
 		if (m68ki_fault_pending) {
+			extern int trace_mmu;
 			int i;
 			for (i = 0; i < 16; i++) {
 				if (m68ki_cpu.dar[i] != save_regs[i]) {
-					printf("fault: ");
-					if (i < 8) printf("D%d", i); else printf("A%d", i-8);
-					printf(" changed; old %08x new %08x\n", save_regs[i], m68ki_cpu.dar[i]);
-					// fix
+					if (trace_mmu) {
+						printf("fault: %s%d changed; old %08x new %08x\n",
+							i < 8 ? "D" : "A", i & 7,
+							save_regs[i], m68ki_cpu.dar[i]);
+					}
 					m68ki_cpu.dar[i] = save_regs[i];
 				}
 			}
 		}
-#endif
 
 		/* return how many clocks we used */
 		return m68ki_initial_cycles - GET_CYCLES();
@@ -868,16 +872,19 @@ void m68k_set_buserr(uint pc)
 #endif
 	cpu->t1_flag = m68ki_fault_sr;
 
-#if 1
+	/* Bus-error tracing is gated behind trace_mmu in the host — demand-
+	 * paging fires constantly during normal SunOS operation, so dumping
+	 * full CPU state on every fault is overwhelming.  Re-enable with
+	 * `-q` off and trace_mmu set if you need to debug a specific fault. */
 	{
 		extern int quiet;
-		if (!quiet) {
+		extern int trace_mmu;
+		if (!quiet && trace_mmu) {
 			void m68ki_dump_state(void);
 			printf("m68k_set_buserr\n");
 			m68ki_dump_state();
 		}
 	}
-#endif
 
 	m68ki_exception_buserr();
 }

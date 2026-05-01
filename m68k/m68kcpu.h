@@ -1376,24 +1376,13 @@ INLINE void m68ki_jump(uint new_pc)
 
 INLINE void m68ki_jump_vector(uint vector)
 {
-	{
-		extern int quiet;
-		if (!quiet) {
-			void m68ki_dump_state(void);
-			printf("m68ki_jump_vector (inline)\n");
-			m68ki_dump_state();
-			printf("68k: vector 0x%x, old pc 0x%x (prev pc 0x%x), ", vector, REG_PC, REG_PPC);
-		}
-	}
 	REG_PC = (vector<<2) + REG_VBR;
-{ extern int quiet; if (!quiet) printf("fetch 0x%x (%x), ", vector, REG_PC); }
 	/* 68010 manual: vector table reads use FC=5 (supervisor data), NOT
 	   FC=6 (supervisor program).  Vectors are stored as data — 32-bit
 	   pointers to handlers — and the 68010 issues a supervisor-data
 	   bus cycle to fetch them.  RetroCore commit 719710a1 fixed the
 	   same bug in their CPU and noted "broke Sun2 PROM boot entirely". */
 	REG_PC = m68ki_read_data_32(REG_PC);
-{ extern int quiet; if (!quiet) printf("new pc 0x%x\n", REG_PC); }
 	m68ki_pc_changed(REG_PC);
 #if 0
 	if (vector == 0x20) enable_trace(1);
@@ -1949,10 +1938,8 @@ if (CPU_STOPPED && (CPU_STOPPED & ~STOP_LEVEL_STOP) == 0) printf("CPU UNSTOPPED!
 	CPU_STOPPED &= ~STOP_LEVEL_STOP;
 
 	/* If we are halted, don't do anything */
-	if(CPU_STOPPED) {
- printf("m68ki_exception_interrupt() stopped and int %d\n", int_level);
+	if(CPU_STOPPED)
 		return;
-	}
 
 	/* Acknowledge the interrupt */
 	vector = m68ki_int_ack(int_level);

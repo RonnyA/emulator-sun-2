@@ -216,7 +216,8 @@ pending_buserr();
     break;
 
   default:
-    printf("io: read %x -> %x (%d) pc %x\n", pa, value, size, m68k_get_reg(NULL, M68K_REG_PC));
+    if (trace_cpu_io)
+      printf("io: read %x -> %x (%d) pc %x\n", pa, value, size, m68k_get_reg(NULL, M68K_REG_PC));
     break;
   }
 
@@ -260,7 +261,8 @@ void io_write(int size, unsigned int pa, unsigned int value)
     break;
 
   default:
-    printf("io: write %x <- %x (%d)\n", pa, value, size);
+    if (trace_cpu_io)
+      printf("io: write %x <- %x (%d)\n", pa, value, size);
     break;
   }
 }
@@ -545,12 +547,14 @@ void sysenable_write(unsigned int address, unsigned int value, int size)
   }
 
   if ((sysen_reg & SUN2_SYSENABLE_EN_INT) && !(new_val & SUN2_SYSENABLE_EN_INT)) {
-    printf("sim68k: sysen_reg ints off; pending 0x%x, highest %d\n",
-	   g_int_controller_pending, g_int_controller_highest_int);
+    if (trace_irq)
+      printf("sim68k: sysen_reg ints off; pending 0x%x, highest %d\n",
+	     g_int_controller_pending, g_int_controller_highest_int);
   }
   if (!(sysen_reg & SUN2_SYSENABLE_EN_INT) && (new_val & SUN2_SYSENABLE_EN_INT)) {
-    printf("sim68k: sysen_reg ints on; pending 0x%x, highest %d\n",
-	   g_int_controller_pending, g_int_controller_highest_int);
+    if (trace_irq)
+      printf("sim68k: sysen_reg ints on; pending 0x%x, highest %d\n",
+	     g_int_controller_pending, g_int_controller_highest_int);
     replay = 1;
   }
 
@@ -674,14 +678,14 @@ unsigned int cpu_read_mbio(unsigned int address, int size)
 {
   unsigned int value;
   value = 0xffffffff;
-  if (1) printf("cpu_read_mbio address %x (%d) -> %x\n", address, size, value);
+  if (trace_cpu_io) printf("cpu_read_mbio address %x (%d) -> %x\n", address, size, value);
   pending_buserr();
   return value;
 }
 
 void cpu_write_mbio(unsigned int address, int size, unsigned int value)
 {
-  if (1) printf("cpu_write_mbio address %x (%d) <- %x\n", address, size, value);
+  if (trace_cpu_io) printf("cpu_write_mbio address %x (%d) <- %x\n", address, size, value);
   pending_buserr();
 }
 
@@ -1038,10 +1042,11 @@ void int_controller_set(unsigned int value)
       g_int_controller_highest_int = value;
       if (INTS_ENABLED) {
 	m68k_set_irq(g_int_controller_highest_int);
-      } else
+      } else if (trace_irq)
 	printf("sim68k: ints not enabled; set %d\n", value);
     }
-  else printf("sim68k: tried to set irq %d (old_pending 0x%x, controller_pending 0x%x. highest_int %d)\n",
+  else if (trace_irq)
+    printf("sim68k: tried to set irq %d (old_pending 0x%x, controller_pending 0x%x. highest_int %d)\n",
 	      value, old_pending, g_int_controller_pending, g_int_controller_highest_int);
 }
 
@@ -1277,7 +1282,7 @@ unsigned int cpu_read(int size, unsigned int address)
       trace_all();
     }
     if (sysen_reg & SUN2_SYSENABLE_EN_BOOTN) {
-      if (!quiet) {
+      if (trace_mmu) {
 	printf("fault: bus error! read, pc %x sr %04x isn_count %lu\n",
 	       m68k_get_reg(NULL, M68K_REG_PC), m68k_get_reg(NULL, M68K_REG_SR), g_isn_count);
 
@@ -1321,12 +1326,12 @@ unsigned int cpu_read(int size, unsigned int address)
       break;
 
     case PGTYPE_MBIO:
-      printf("cpu_read: MBIO; address %x pa %x size %d pte %x\n", address, pa, size, pte);
+      if (trace_mmu) printf("cpu_read: MBIO; address %x pa %x size %d pte %x\n", address, pa, size, pte);
       value = cpu_read_mbio(pa, size);
       break;
 
     default:
-      printf("cpu_read: mtype %d; address %x pa %x size %d pte %x\n", mtype, address, pa, size, pte);
+      if (trace_mmu) printf("cpu_read: mtype %d; address %x pa %x size %d pte %x\n", mtype, address, pa, size, pte);
     }
   }
 
@@ -1362,7 +1367,7 @@ void cpu_write(int size, unsigned int address, unsigned int value)
       //trace_all();
     }
     if (sysen_reg & SUN2_SYSENABLE_EN_BOOTN) {
-      if (!quiet) {
+      if (trace_mmu) {
 	printf("fault: bus error! write, pc %x sr %04x isn_count %lu\n",
 	       m68k_get_reg(NULL, M68K_REG_PC),	m68k_get_reg(NULL, M68K_REG_SR), g_isn_count);
 
@@ -1429,7 +1434,7 @@ void cpu_write(int size, unsigned int address, unsigned int value)
     break;
 
   default:
-    printf("cpu_write: mtype %d; address %x pa %x size %d pte %x\n", mtype, address, pa, size, pte);
+    if (trace_mmu) printf("cpu_write: mtype %d; address %x pa %x size %d pte %x\n", mtype, address, pa, size, pte);
     break;
   }
 }
