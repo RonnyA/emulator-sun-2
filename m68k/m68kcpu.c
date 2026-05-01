@@ -44,6 +44,27 @@ int  m68ki_remaining_cycles = 0;                     /* Number of clocks remaini
 uint m68ki_tracing = 0;
 uint m68ki_address_space;
 
+/* External IRQ "pending" flags.  m68k_set_irq sets these; m68k_execute's
+ * main loop checks them at instruction boundaries (before the next opcode
+ * fetch) and dispatches the interrupt then.  Matches C# RetroCore's
+ * deferred-interrupt model — interrupts only fire between fully-completed
+ * instructions, never mid-instruction.
+ *
+ * Without deferral, a memory-write callback that synchronously raises an
+ * IRQ (e.g. sysenable_write -> sw_int_throw -> int_controller_set ->
+ * m68k_set_irq) could push an interrupt frame before the asserting MOVE
+ * instruction has finished updating PC, leaving a corrupted user-frame
+ * on the kernel stack.  Real Sun-2 hardware checks IPL only between
+ * instructions, so the asserting instruction always completes first.
+ *
+ * NMI (level 7) needs its own flag because edge-triggered NMI bypasses
+ * the IPL mask check; the level-comparison gate that handles normal IRQs
+ * would never fire NMI when the CPU is already at IPL=7 (which is
+ * exactly when the PROM's F12/abort-wait loops sit).
+ */
+volatile uint m68ki_irq_pending = 0;
+volatile uint m68ki_nmi_pending = 0;
+
 #if M68K_EMULATE_FC
 uint  m68ki_access_pc;
 uint  m68ki_access_address;
@@ -668,6 +689,22 @@ int m68k_execute(int num_cycles)
 		/* Main loop.  Keep going until we run out of clock cycles */
 		do
 		{
+			/* Deferred external-IRQ delivery — fires only at clean
+			 * instruction boundaries, matching C# RetroCore semantics.
+			 * NMI (edge-triggered, level 7) bypasses the IPL mask;
+			 * normal IRQs respect the mask.  Internal IPL drops
+			 * (MOVE-to-SR / RTE) still go through m68ki_check_interrupts
+			 * at SR-write time. */
+			if (m68ki_nmi_pending) {
+				m68ki_nmi_pending = 0;
+				m68ki_irq_pending = 0;
+				m68ki_exception_interrupt(7);
+			} else if (m68ki_irq_pending) {
+				m68ki_irq_pending = 0;
+				if (CPU_INT_LEVEL > FLAG_INT_MASK)
+					m68ki_exception_interrupt(CPU_INT_LEVEL >> 8);
+			}
+
 			/* Set tracing accodring to T1. (T0 is done inside instruction) */
 			m68ki_trace_t1(); /* auto-disable (see m68kcpu.h) */
 
@@ -764,12 +801,25 @@ void m68k_set_irq(unsigned int int_level)
 	uint old_level = CPU_INT_LEVEL;
 	CPU_INT_LEVEL = int_level << 8;
 
-	/* A transition from < 7 to 7 always interrupts (NMI) */
-	/* Note: Level 7 can also level trigger like a normal IRQ */
-	if(old_level != 0x0700 && CPU_INT_LEVEL == 0x0700)
-		m68ki_exception_interrupt(7); /* Edge triggered level 7 (NMI) */
-	else
-		m68ki_check_interrupts(); /* Level triggered (IRQ) */
+	/* NMI edge: when transitioning from level <7 to level 7, mark NMI
+	 * pending so it bypasses the IPL mask check at the next instruction
+	 * boundary.  Required because the Sun-2 PROM's F12/abort-wait loops
+	 * sit at IPL=7 — without an NMI-bypass path, level-7 assertions
+	 * during those loops would never deliver. */
+	if (old_level != 0x0700 && CPU_INT_LEVEL == 0x0700)
+		m68ki_nmi_pending = 1;
+
+	/* Defer normal IRQ delivery to the next instruction boundary.
+	 * m68k_execute checks m68ki_irq_pending before each instruction fetch
+	 * and runs m68ki_exception_interrupt then.  Matches C# RetroCore:
+	 * external IRQs only fire between fully-completed instructions.
+	 *
+	 * Internal IPL drops (MOVE-to-SR / RTE) still go through
+	 * m68ki_check_interrupts() inside set_sr, which fires immediately —
+	 * those calls happen at the end of the SR-writing instruction, so
+	 * REG_PC already points at the next inst and the resulting frame is
+	 * well-formed. */
+	m68ki_irq_pending = 1;
 }
 
 void m68k_mark_buserr(void)
