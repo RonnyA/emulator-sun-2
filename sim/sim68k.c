@@ -94,7 +94,7 @@ unsigned int g_buserr_pc = 0;
 int g_trace = 0;
 unsigned long g_isn_count;
 
-int trace_cpu_io;
+int trace_cpu_io = 0;
 int trace_cpu_rw;
 int trace_cpu_isn;
 int trace_cpu_bin;
@@ -1088,18 +1088,6 @@ void pending_buserr(void)
   g_buserr = 1;
   g_buserr_pc = m68k_get_reg(NULL, M68K_REG_PPC);
   m68k_mark_buserr();
-
-#if 0
-  {
-    extern unsigned int m68ki_access_pc;
-    extern unsigned int m68ki_access_address;
-    extern unsigned char m68ki_access_fc;
-    extern unsigned char m68ki_access_write;
-    extern unsigned char m68ki_access_size;
-    printf("pending_buserr: access pc=%x address=%x fc=%d write=%d size=%d\n",
-	   m68ki_access_pc, m68ki_access_address, m68ki_access_fc, m68ki_access_write, m68ki_access_size);
-  }
-#endif
 }
 
 unsigned int cpu_map_address(unsigned int address, unsigned int fc, int m, unsigned int *mtype, unsigned int *pfault, unsigned int *ppte)

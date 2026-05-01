@@ -353,10 +353,38 @@ unsigned int sun2_video_ctl_write(unsigned int address, int size, unsigned int v
   return 0;
 }
 
+/* Sun keyboard L1-A (Stop-A) abort sequence.  Bound to F12 to match
+   RetroCore SunKeyboardMapper.IsAbortKey().  Real Sun keyboard scancodes:
+     L1 = 1, A = 77, idle = 0x7F.  Bit 7 of a scancode marks a key release. */
+#define SUN_KEY_L1   1
+#define SUN_KEY_A    77
+#define SUN_KEY_IDLE 0x7F
+
+/* Auto-abort: matches RetroCore SunVideoBoard.cs (ABORT_AUTO_BOOT path).
+   On the FIRST keyboard "bell off" command from the PROM, synthesise the
+   L1-A abort burst — drops the auto-boot to the PROM monitor command
+   prompt.  Subsequent bell-offs (e.g. test-acknowledgment beeps) are
+   no-op so commands like 'x' run normally. */
+static int auto_abort_enabled = 1;
+static int auto_abort_done = 0;
+
+static void sun2_send_abort(void)
+{
+  scc_in_push(3, SUN_KEY_L1);
+  scc_in_push(3, SUN_KEY_A);
+  scc_in_push(3, SUN_KEY_A   | 0x80);
+  scc_in_push(3, SUN_KEY_L1  | 0x80);
+  scc_in_push(3, SUN_KEY_IDLE);
+}
+
 /* ---- auto-typer (drives the PROM monitor non-interactively for trace
    capture).  Uses the same SCC keyboard channel as physical keystrokes:
    pushes the press scancode, waits, then pushes the release scancode.
-   Driven from io_update via sun2_autotype_tick(). */
+   Driven from io_update via sun2_autotype_tick().
+
+   Special character `\033` (ESC) in the input string sends the L1-A
+   abort burst — the equivalent of pressing F12 in the SDL window —
+   so headless test runs can break into the PROM monitor. */
 
 extern unsigned int map_sdl_to_sun2kb[512];
 
@@ -371,11 +399,31 @@ void sun2_autotype_tick(void)
 {
   static int started;
   if (!g_autotype) return;
-  if (!started) { autotype_delay = AUTOTYPE_BOOT_DELAY; started = 1; }
+  /* Wait for auto-abort to have dropped the PROM to the monitor prompt
+     before injecting any keystrokes — otherwise the keys queue up in the
+     SCC FIFO ahead of the L1-A abort burst and get consumed by the
+     still-running auto-boot.  Then add a short post-abort settle delay
+     so the PROM has finished switching context. */
+  if (auto_abort_enabled && !auto_abort_done) return;
+  if (!started) {
+    autotype_delay = AUTOTYPE_GAP * 4;   /* settle after auto-abort */
+    started = 1;
+  }
   if (autotype_delay) { autotype_delay--; return; }
   if (!g_autotype[autotype_pos]) return;
 
   unsigned char ch = (unsigned char)g_autotype[autotype_pos];
+
+  /* Special: ESC (0x1B) → L1-A abort burst (matches F12 in SDL window) */
+  if (ch == 0x1B) {
+    printf("autotype: send L1-A (abort)\n");
+    sun2_send_abort();
+    autotype_pos++;
+    autotype_phase = 0;
+    autotype_delay = AUTOTYPE_GAP;
+    return;
+  }
+
   /* Map to SDL keycode the existing keymap expects.  Lower-case
      ASCII letters and digits go through directly (SDLK_a == 'a' etc.).
      Convert '\n' to SDLK_RETURN (0x0D). */
@@ -405,22 +453,25 @@ void sun2_autotype_tick(void)
 
 void sun2_kb_write(int value, int size)
 {
+    /* Sun keyboard command protocol.  PROM writes a 1-byte command to the
+       keyboard SCC data port; real keyboard responds with 0..N bytes via
+       the SCC RX FIFO.  Bell on/off produce no SCC response on real hw
+       (only drive the beeper); we hijack the FIRST bell-off as the
+       auto-abort trigger, then become inert. */
     switch (value) {
-    case 0x01: /* reset */
-      scc_in_push(3, 0xff);
-      scc_in_push(3, 0x02);
-      scc_in_push(3, 0x7f);
+    case 0x01: /* RESET */
+      scc_in_push(3, 0xff);   /* reset done */
+      scc_in_push(3, 0x02);   /* layout id 0x02 = US English Type 4 */
+      scc_in_push(3, 0x7f);   /* idle */
       break;
-    case 0x02: /* bell on */
+    case 0x02: /* BELL ON */
       break;
-    case 0x03: /* bell off */
-      /* send abort */
-      scc_in_push(3, 0x00+1);
-      scc_in_push(3, 0x00+77);
-      scc_in_push(3, 0x80+77);
-      scc_in_push(3, 0x80+1);
-
-      scc_in_push(3, 0x7f);
+    case 0x03: /* BELL OFF */
+      if (auto_abort_enabled && !auto_abort_done) {
+        printf("kb: auto-abort (first bell-off) → L1-A burst\n");
+        sun2_send_abort();
+        auto_abort_done = 1;
+      }
       break;
     }
 }
@@ -435,6 +486,16 @@ void sun2_sdl_key(SDL_Keycode sdl_code, uint16_t modifiers, SDL_Scancode scancod
   unsigned int mapped, shifted;
 
   if (0) printf("sdl: %u %u %u %d\n", sdl_code, modifiers, scancode, down);
+
+  /* F12 → L1-A (Stop-A) abort burst, matching RetroCore
+     SunKeyboardMapper.IsAbortKey().  Press once on key-down only. */
+  if (scancode == SDL_SCANCODE_F12 || sdl_code == SDLK_F12) {
+    if (down) {
+      printf("kb: F12 → L1-A abort\n");
+      sun2_send_abort();
+    }
+    return;
+  }
 
   // If the keycode is over 128 use the scancode instead
   if(sdl_code >= 255)
