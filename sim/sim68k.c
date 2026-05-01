@@ -1015,6 +1015,24 @@ void int_controller_set(unsigned int value)
 
   g_int_controller_pending |= (1<<value);
 
+  /* Level 7 (NMI) is edge-triggered: every assertion is a fresh NMI
+   * pulse, even if the pending bit was already set.  Real Sun-2 hardware
+   * pulses the IRQ7 line on each am9513 timer1 tick and the CPU detects
+   * each pulse as a new edge.  In our model the kernel may not have
+   * acked the previous pulse before a new one arrives (am9513 ticks
+   * between instructions while the previous NMI handler is still
+   * running), and the "if (pending bit changed)" gate would otherwise
+   * drop the second pulse.  Always notify the CPU; m68k_set_irq turns
+   * a level-7 assertion while the CPU is at IPL=7 into m68ki_nmi_pending.
+   * Matches C# RetroCore SetPendingInterrupt's separate nmi_pending
+   * queue. */
+  if (value == 7) {
+    if (INTS_ENABLED) m68k_set_irq(7);
+    else if (trace_irq) printf("sim68k: ints not enabled; level 7 dropped\n");
+    if (g_int_controller_highest_int < 7) g_int_controller_highest_int = 7;
+    return;
+  }
+
   if(old_pending != g_int_controller_pending && value > g_int_controller_highest_int)
     {
       g_int_controller_highest_int = value;

@@ -801,13 +801,20 @@ void m68k_set_irq(unsigned int int_level)
 	uint old_level = CPU_INT_LEVEL;
 	CPU_INT_LEVEL = int_level << 8;
 
-	/* NMI edge: when transitioning from level <7 to level 7, mark NMI
-	 * pending so it bypasses the IPL mask check at the next instruction
-	 * boundary.  Required because the Sun-2 PROM's F12/abort-wait loops
-	 * sit at IPL=7 — without an NMI-bypass path, level-7 assertions
-	 * during those loops would never deliver. */
-	if (old_level != 0x0700 && CPU_INT_LEVEL == 0x0700)
-		m68ki_nmi_pending = 1;
+	/* NMI semantics — match C# RetroCore SetPendingInterrupt:
+	 *   1. Transition from <7 to 7         (level transition)   -> NMI edge
+	 *   2. Level 7 asserted while CPU is currently at IPL=7      -> NMI edge
+	 *      (CPU is masking, but hardware re-pulsed; e.g. am9513
+	 *      timer1 ticks again while the previous NMI handler is
+	 *      still running.  Without this case, repeat NMI ticks are
+	 *      lost — the level-comparison gate that handles normal IRQs
+	 *      never fires for level=7 when mask is also 7.)
+	 * Required because the Sun-2 PROM's F12/abort-wait loops sit at
+	 * IPL=7. */
+	if (int_level == 7) {
+		if (old_level != 0x0700 || FLAG_INT_MASK == 0x0700)
+			m68ki_nmi_pending = 1;
+	}
 
 	/* Defer normal IRQ delivery to the next instruction boundary.
 	 * m68k_execute checks m68ki_irq_pending before each instruction fetch
