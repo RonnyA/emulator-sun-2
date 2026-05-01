@@ -21,7 +21,7 @@ sunos35:
 
 run: all
 	@test -f $(DISK) || (echo "No disk.img found. Run 'make sunos20', 'make sunos32', or 'make sunos35' first." && exit 1)
-	sim/sim --prom=$(PROM) --disk=$(DISK) --tape=$(TAPE)
+	sim/sim --prom=$(PROM) --disk=$(DISK) --tape=$(TAPE) --auto-abort
 
 clean:
 	make -C m68k clean
