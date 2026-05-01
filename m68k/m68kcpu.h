@@ -1905,6 +1905,11 @@ INLINE void m68ki_exception_illegal(void)
 				 m68ki_cpu_names[CPU_TYPE], ADDRESS_68K(REG_PPC), REG_IR,
 				 m68ki_disassemble_quick(ADDRESS_68K(REG_PPC))));
 
+	{ extern int quiet;
+	  if (!quiet)
+	    printf("ILLEGAL INSN: opcode=0x%04x at pc=0x%x (ppc=0x%x) sr=0x%04x\n",
+	           REG_IR, REG_PC, REG_PPC, m68ki_get_sr()); }
+
 	sr = m68ki_init_exception();
 	m68ki_stack_frame_0000(REG_PC, sr, EXCEPTION_ILLEGAL_INSTRUCTION);
 	m68ki_jump_vector(EXCEPTION_ILLEGAL_INSTRUCTION);
