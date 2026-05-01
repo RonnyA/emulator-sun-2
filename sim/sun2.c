@@ -388,16 +388,47 @@ static void sun2_send_abort(void)
 
 extern unsigned int map_sdl_to_sun2kb[512];
 
+#define SUN_KEY_LSHIFT 99
+
 static unsigned autotype_pos;
-static unsigned autotype_phase;        /* 0 = press, 1 = release */
 static unsigned autotype_delay;        /* tick countdown before next action */
 #define AUTOTYPE_BOOT_DELAY  20000000  /* ~20M io_update ticks before first key — let PROM reach prompt */
 #define AUTOTYPE_PRESS_HOLD  100000    /* hold each key down */
 #define AUTOTYPE_GAP         200000    /* gap between successive keys */
 
+/* ASCII → Sun-2 scancode + shift flag.  Returns 1 if mapped, 0 otherwise.
+   Shifted characters require pressing LSHIFT around the key press. */
+static int autotype_lookup(unsigned char ch, unsigned int *out_code, int *out_shifted)
+{
+  static const struct { unsigned char ch; unsigned char code; } shifted[] = {
+    {'!', 30}, {'@', 31}, {'#', 32}, {'$', 33}, {'%', 34}, {'^', 35},
+    {'&', 36}, {'*', 37}, {'(', 38}, {')', 39}, {'_', 40}, {'+', 41},
+    {'~', 42}, {'{', 64}, {'}', 65}, {':', 86}, {'"', 87}, {'|', 88},
+    {'<', 107}, {'>', 108}, {'?', 109},
+  };
+  for (size_t i = 0; i < sizeof(shifted)/sizeof(shifted[0]); i++) {
+    if (shifted[i].ch == ch) {
+      *out_code = shifted[i].code;
+      *out_shifted = 1;
+      return 1;
+    }
+  }
+  if (ch >= 'A' && ch <= 'Z') {
+    unsigned int code = map_sdl_to_sun2kb[ch - 'A' + 'a'] & 0xff;
+    if (code) { *out_code = code; *out_shifted = 1; return 1; }
+  }
+  unsigned int code = map_sdl_to_sun2kb[ch] & 0xff;
+  if (code) { *out_code = code; *out_shifted = 0; return 1; }
+  return 0;
+}
+
 void sun2_autotype_tick(void)
 {
   static int started;
+  static unsigned char emit_buf[6];   /* shift-dn, key-dn, key-up, shift-up */
+  static unsigned emit_count;
+  static unsigned emit_idx;
+
   if (!g_autotype) return;
   /* Wait for auto-abort to have dropped the PROM to the monitor prompt
      before injecting any keystrokes — otherwise the keys queue up in the
@@ -410,6 +441,20 @@ void sun2_autotype_tick(void)
     started = 1;
   }
   if (autotype_delay) { autotype_delay--; return; }
+
+  /* Drain any pending scancodes for the current char (shift-dn / key-dn /
+     key-up / shift-up — up to 4 bytes for a shifted char). */
+  if (emit_idx < emit_count) {
+    scc_in_push(3, emit_buf[emit_idx++]);
+    if (emit_idx < emit_count) {
+      autotype_delay = AUTOTYPE_PRESS_HOLD;
+    } else {
+      autotype_delay = AUTOTYPE_GAP;
+      autotype_pos++;
+    }
+    return;
+  }
+
   if (!g_autotype[autotype_pos]) return;
 
   unsigned char ch = (unsigned char)g_autotype[autotype_pos];
@@ -419,33 +464,37 @@ void sun2_autotype_tick(void)
     printf("autotype: send L1-A (abort)\n");
     sun2_send_abort();
     autotype_pos++;
-    autotype_phase = 0;
     autotype_delay = AUTOTYPE_GAP;
     return;
   }
 
-  /* Map to SDL keycode the existing keymap expects.  Lower-case
-     ASCII letters and digits go through directly (SDLK_a == 'a' etc.).
-     Convert '\n' to SDLK_RETURN (0x0D). */
   if (ch == '\n') ch = '\r';     /* SDLK_RETURN = 0x0D */
-  unsigned int code = map_sdl_to_sun2kb[ch] & 0xff;
-  if (code == 0) {
+
+  unsigned int code;
+  int shifted;
+  if (!autotype_lookup(ch, &code, &shifted)) {
     printf("autotype: skipping unmapped char 0x%02x\n", ch);
     autotype_pos++;
     autotype_delay = AUTOTYPE_GAP;
     return;
   }
 
-  if (autotype_phase == 0) {
-    if (debug || 1) printf("autotype: press '%c' (scancode 0x%02x)\n", ch, code);
-    scc_in_push(3, code);
-    autotype_phase = 1;
+  emit_count = 0;
+  if (shifted) emit_buf[emit_count++] = SUN_KEY_LSHIFT;
+  emit_buf[emit_count++] = (unsigned char)code;
+  emit_buf[emit_count++] = (unsigned char)(code | 0x80);
+  if (shifted) emit_buf[emit_count++] = SUN_KEY_LSHIFT | 0x80;
+  emit_idx = 0;
+
+  printf("autotype: %s '%c' (scancode 0x%02x)\n",
+         shifted ? "shift+press" : "press", ch, code);
+
+  scc_in_push(3, emit_buf[emit_idx++]);
+  if (emit_idx < emit_count) {
     autotype_delay = AUTOTYPE_PRESS_HOLD;
   } else {
-    scc_in_push(3, code | 0x80);   /* release = bit 7 set */
-    autotype_phase = 0;
-    autotype_pos++;
     autotype_delay = AUTOTYPE_GAP;
+    autotype_pos++;
   }
 }
 
