@@ -260,6 +260,7 @@ void usage(void)
   sun2_mode_print_list();
   fprintf(stderr, "optionally:\n");
   fprintf(stderr, " --kernel=FILE  --boot=FILE\n");
+  fprintf(stderr, " --auto-abort   send L1-A on first PROM bell-off (drops to monitor)\n");
   exit(1);
 }
 
@@ -289,17 +290,18 @@ int main(int argc, char **argv)
     int this_option_optind = optind ? optind : 1;
     int option_index = 0;
     static struct option long_options[] = {
-      {"prom",   optional_argument, 0,  'p' },
-      {"disk",   optional_argument, 0,  'd' },
-      {"tape",   optional_argument, 0,  't' },
-      {"kernel", optional_argument, 0,  'k' },
-      {"boot",   optional_argument, 0,  'b' },
-      {"mode",   required_argument, 0,  'm' },
-      {"type",   required_argument, 0,  'T' },
-      {0,        0,                 0,  0 }
+      {"prom",       optional_argument, 0,  'p' },
+      {"disk",       optional_argument, 0,  'd' },
+      {"tape",       optional_argument, 0,  't' },
+      {"kernel",     optional_argument, 0,  'k' },
+      {"boot",       optional_argument, 0,  'b' },
+      {"mode",       required_argument, 0,  'm' },
+      {"type",       required_argument, 0,  'T' },
+      {"auto-abort", no_argument,       0,  'A' },
+      {0,            0,                 0,  0 }
     };
 
-    c = getopt_long(argc, argv, "d:k:p:t:m:T:q", long_options, &option_index);
+    c = getopt_long(argc, argv, "d:k:p:t:m:T:qA", long_options, &option_index);
     if (c == -1)
       break;
 
@@ -351,6 +353,11 @@ int main(int argc, char **argv)
 
     case 'q':
       quiet++;
+      break;
+
+    case 'A':
+      sun2_set_auto_abort(1);
+      printf("auto-abort enabled (first PROM bell-off → L1-A drops to monitor)\n");
       break;
 
     case '?':

@@ -365,8 +365,10 @@ unsigned int sun2_video_ctl_write(unsigned int address, int size, unsigned int v
    L1-A abort burst — drops the auto-boot to the PROM monitor command
    prompt.  Subsequent bell-offs (e.g. test-acknowledgment beeps) are
    no-op so commands like 'x' run normally. */
-static int auto_abort_enabled = 1;
+static int auto_abort_enabled = 0;     /* default: off; --auto-abort turns it on */
 static int auto_abort_done = 0;
+
+void sun2_set_auto_abort(int enabled) { auto_abort_enabled = enabled; }
 
 static void sun2_send_abort(void)
 {

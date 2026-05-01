@@ -92,6 +92,7 @@ unsigned int sun2_kbm_write(unsigned int address, int size, unsigned int value);
 unsigned int sun2_video_ctl_read(unsigned int address, int size);
 unsigned int sun2_video_ctl_write(unsigned int address, int size, unsigned int value);
 void sun2_kb_write(int value, int size);
+void sun2_set_auto_abort(int enabled);
 
 void int_controller_set(unsigned int irq);
 void int_controller_clear(unsigned int irq);
