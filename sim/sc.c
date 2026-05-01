@@ -266,10 +266,17 @@ void sc_dma_read_data(unsigned char *buf, int bufsiz)
     sc_dma_count++;
   }
 
+  /* Note: PROM's "sd: short transfer" diagnostic at PC 0xef9448 is NOT
+     driven by the DMA-count register — measurements show count_post is
+     already 0xFFFF (= -1, perfect transfer) after a 512-byte read.
+     The check must be on a different residue indicator (SCSI message
+     phase, controller status bit, or scsi-byte-counter).  Test still
+     passes with the warnings — RetroCore TODO.txt notes the same. */
+
   if (bufsiz & 1) {
     sc_icr |= SC_ICR_ODD_LENGTH;
     sc_data = buf[bufsiz-1];
-    printf("sc: setting odd length %d\n", bufsiz);
+    if (trace_sc) printf("sc: setting odd length %d\n", bufsiz);
   } else
     sc_icr &= ~SC_ICR_ODD_LENGTH;
 }
@@ -277,6 +284,11 @@ void sc_dma_read_data(unsigned char *buf, int bufsiz)
 void sc_reset_odd_len(void)
 {
   sc_icr &= ~SC_ICR_ODD_LENGTH;
+}
+
+void sc_dma_complete_no_xfer(void)
+{
+  sc_dma_count = 0xffff;
 }
 
 void sc_dma_write_data(unsigned char *buf, int bufsiz)

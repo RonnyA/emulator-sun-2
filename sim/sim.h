@@ -76,6 +76,11 @@ int sc_device_ack(void);
 void sc_set_cmd_reg(unsigned int v);
 unsigned int sc_get_data(void);
 void sc_reset_odd_len(void);
+/* After a SCSI command that did NO DMA transfer, snap DmaCount to
+   0xFFFF so the PROM's "sd: short transfer" residue check sees a
+   clean transfer.  Mirrors RetroCore SCSIHostAdapter.cs OnLastMessage
+   when bytesReceived == 0. */
+void sc_dma_complete_no_xfer(void);
 void sc_dma_read_data(unsigned char *buf, int bufsiz);
 void sc_dma_write_data(unsigned char *buf, int bufsiz);
 

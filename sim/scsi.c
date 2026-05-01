@@ -502,10 +502,12 @@ scsi_bus_data = 0;
 	  *pirq = 1;
 	  sc_reset_odd_len();
 	  switch (scsi_cmd_buf[0]) {
-	  case 0x00: /* STATUS (test unit ready) */
+	  case 0x00: /* STATUS (test unit ready) — no DMA */
 	    if (trace_scsi) printf("scsi: command status\n");
 	    _scsi_test_unit_ready(id_selected, scsi_cmd_buf, 6, &pbuf, &psiz);
-//	    sc_dma_read_data(pbuf, psiz);
+	    /* No DMA; snap residue to 0xFFFF so PROM "sd: short transfer"
+	       check (PC ef9448) sees a clean transfer.  See sc.c. */
+	    sc_dma_complete_no_xfer();
 	    _scsi_set_phase(PHASE_STATUS, 0);
 	    break;
 	  case 0x01: /* REWIND */
