@@ -12038,7 +12038,6 @@ void m68k_op_movec_32_rc(void)
 				return;
 			case 0x801:			   /* VBR */
 				REG_VBR = REG_DA[(word2 >> 12) & 15];
-printf("XXX write VBR %x @ pc %x\n", REG_VBR, REG_PC);
 				return;
 			case 0x802:			   /* CAAR */
 				if(CPU_TYPE_IS_EC020_PLUS(CPU_TYPE))
