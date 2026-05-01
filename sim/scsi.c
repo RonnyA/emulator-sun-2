@@ -220,11 +220,36 @@ int _scsi_read_block(int id, unsigned char *cmd, int cmd_size, unsigned char **p
 
   if (ret < xfer_size) {
     u->eof = 1;
-    u->status[0] = 0x02;
-    if (u->tape || trace_scsi)
-      printf("scsi%d: short/EOF — got %d, wanted %d; setting eof=1, status=0x02\n",
+    if (u->tape) {
+      /* Tape: zero-pad to full requested size, GOOD status.  Sun-2 PROM
+         `b st()` does READ(64 blocks) expecting a full DMA; tpboot files
+         are smaller (file 01 ≈ 52 blocks).  A short read with CHECK
+         CONDITION makes PROM print "st: sense error" / "st: error 0"
+         and bail.  Real tape would pad and tpboot ignores trailing
+         zeros for the in-progress block.
+
+         After EOF, advance to the next tape file so subsequent READs
+         pull from file 02 etc. — that's how tpboot loads each stage. */
+      memset(u->data + ret, 0, xfer_size - ret);
+      u->status[0] = 0x00;
+      printf("scsi%d: tape short read; padded %d -> %d bytes; status=GOOD; eof=1\n",
              id, ret, xfer_size);
-    *psiz = ret;
+      if (u->fname[u->fileno + 1]) {
+        int next = u->fileno + 1;
+        printf("scsi%d: tape EOF -> advance file %d -> %d ('%s')\n",
+               id, u->fileno, next, u->fname[next]);
+        _scsi_set_filenum(id, next);
+      } else {
+        printf("scsi%d: tape EOF and no more files (end of media)\n", id);
+      }
+      /* Leave *psiz = xfer_size so DMA delivers the full padded buffer. */
+    } else {
+      u->status[0] = 0x02;
+      if (trace_scsi)
+        printf("scsi%d: short — got %d, wanted %d; eof=1 status=0x02 [disk]\n",
+               id, ret, xfer_size);
+      *psiz = ret;
+    }
   }
 
   return 0;
