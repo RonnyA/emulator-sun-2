@@ -1387,8 +1387,12 @@ INLINE void m68ki_jump_vector(uint vector)
 	}
 	REG_PC = (vector<<2) + REG_VBR;
 { extern int quiet; if (!quiet) printf("fetch 0x%x (%x), ", vector, REG_PC); }
-//	REG_PC = m68ki_read_data_32(REG_PC);
-	REG_PC = m68ki_read_program_32(REG_PC);
+	/* 68010 manual: vector table reads use FC=5 (supervisor data), NOT
+	   FC=6 (supervisor program).  Vectors are stored as data — 32-bit
+	   pointers to handlers — and the 68010 issues a supervisor-data
+	   bus cycle to fetch them.  RetroCore commit 719710a1 fixed the
+	   same bug in their CPU and noted "broke Sun2 PROM boot entirely". */
+	REG_PC = m68ki_read_data_32(REG_PC);
 { extern int quiet; if (!quiet) printf("new pc 0x%x\n", REG_PC); }
 	m68ki_pc_changed(REG_PC);
 #if 0

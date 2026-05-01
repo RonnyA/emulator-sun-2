@@ -859,6 +859,12 @@ void m68k_pulse_reset(void)
 	FLAG_INT_MASK = 0x0700;
 	/* Reset VBR */
 	REG_VBR = 0;
+	/* SFC/DFC: 68010 manual says undefined after reset, but Sun-2 PROM
+	   relies on the conventional UserDataSpace (1) default before its
+	   first explicit MOVEC.  RetroCore commit 719710a1 made the same
+	   change with the note "matching old CPU". */
+	REG_SFC = 1;
+	REG_DFC = 1;
 	/* Go to supervisor mode */
 	m68ki_set_sm_flag(SFLAG_SET | MFLAG_CLEAR);
 
