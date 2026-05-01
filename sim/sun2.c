@@ -405,23 +405,22 @@ void sun2_autotype_tick(void)
 
 void sun2_kb_write(int value, int size)
 {
-    /* Sun-2 keyboard command protocol.  The PROM writes a 1-byte command
-       to the keyboard SCC data port; the real keyboard responds (or not)
-       with a stream of bytes pushed back through the SCC RX FIFO. */
     switch (value) {
-    case 0x01: /* RESET */
-      /* Real keyboard answers with 0xff (reset done), layout id (0x02 =
-         US US-English type 4), then 0x7f (all-keys-up = idle). */
+    case 0x01: /* reset */
       scc_in_push(3, 0xff);
       scc_in_push(3, 0x02);
       scc_in_push(3, 0x7f);
       break;
-    case 0x02: /* BELL ON */
-    case 0x03: /* BELL OFF */
-      /* Real keyboard rings/silences the bell with no SCC response.
-         (Earlier code synthesised a fake STOP+A "abort" key sequence on
-         bell-off, which fired during the PROM's "x" extended-test beep
-         and caused the test to abort the moment it called bell-off.) */
+    case 0x02: /* bell on */
+      break;
+    case 0x03: /* bell off */
+      /* send abort */
+      scc_in_push(3, 0x00+1);
+      scc_in_push(3, 0x00+77);
+      scc_in_push(3, 0x80+77);
+      scc_in_push(3, 0x80+1);
+
+      scc_in_push(3, 0x7f);
       break;
     }
 }
