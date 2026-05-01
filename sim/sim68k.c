@@ -1117,7 +1117,14 @@ unsigned int cpu_map_address(unsigned int address, unsigned int fc, int m, unsig
   pgmapindex = (pmeg_number << 4) | pageindex;
   pte = pgmap[pgmapindex];
 
-  pgmap[pgmapindex] |= (1<<21) | (m ? 1<<20 : 0);
+  /* Statistics bits (Accessed/Modified) updated AFTER protection check —
+     real Sun-2 hardware does NOT update them on a faulting access (per
+     Sun-2 Engineering Manual: "the statistics bits will not be updated
+     when the page is invalid or when the protection code does not allow
+     the attempted operation").  RetroCore Sun2MMU.cs:531-539 matches.
+     Doing it before the check leaks the access bit into PMEs that SunOS
+     may pattern-match for demand-paging — manifests as a panic in `sh`
+     during userland boot.  Moved past the proterr/!valid checks below. */
 
   /* sun-2/120 implements 12 bits yielding 23 bit pa */
   *ppte = pte & 0xfff00fff;
@@ -1163,6 +1170,14 @@ unsigned int cpu_map_address(unsigned int address, unsigned int fc, int m, unsig
   if ((pte & 0x80000000) == 0) {
     buserr_reg = 0;
     *pfault = 1;
+  }
+
+  /* Statistics bits — only on a successful translation (see comment above). */
+  if (!*pfault) {
+    unsigned int am = (1u << 21);            /* accessed */
+    if (m) am |= (1u << 20);                 /* modified (write access) */
+    if ((pgmap[pgmapindex] & am) != am)
+      pgmap[pgmapindex] |= am;
   }
 
   int show = 0;
