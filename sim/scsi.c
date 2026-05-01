@@ -2,6 +2,8 @@
 #include <fcntl.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
+#include <sys/stat.h>
 
 #include "sim.h"
 #include "scsi.h"
@@ -185,16 +187,30 @@ int _scsi_read_block(int id, unsigned char *cmd, int cmd_size, unsigned char **p
   *pbuf = u->data;
   *psiz = xfer_size;
 
-  if (trace_scsi) printf("scsi%d: read xfer; block=%d, blocks=%d, bytes=%d\n", id, sblock, scount, xfer_size);
+  if (u->tape || trace_scsi)
+    printf("scsi%d: read xfer; %s file %d '%s' fd=%d block=%d blocks=%d bytes=%d offset=%lld\n",
+           id, u->tape ? "TAPE" : "DISK", u->fileno,
+           (u->fileno >= 0 && u->fname[u->fileno]) ? u->fname[u->fileno] : "(null)",
+           u->fd, sblock, scount, xfer_size, (long long)offset);
 
   if (fd > 0) {
-    lseek(fd, offset, SEEK_SET);
+    off_t lr = lseek(fd, offset, SEEK_SET);
+    if (lr < 0)
+      printf("scsi%d: lseek(%lld) failed: %s\n", id, (long long)offset, strerror(errno));
     ret = read(fd, u->data, xfer_size);
     if (ret < 0) {
+      printf("scsi%d: read FAILED fd=%d bytes=%d: %s\n", id, fd, xfer_size, strerror(errno));
       perror( u->fname[ u->fileno ] );
       abortf("scsi read failed\n");
     }
+    if (u->tape || trace_scsi) {
+      off_t pos = lseek(fd, 0, SEEK_CUR);
+      printf("scsi%d: read got %d/%d bytes; new fpos=%lld\n",
+             id, ret, xfer_size, (long long)pos);
+    }
   } else {
+    if (u->tape || trace_scsi)
+      printf("scsi%d: read with NO fd (fd=%d); zero-filling %d bytes\n", id, u->fd, xfer_size);
     memset(u->data, 0, xfer_size);
   }
 
@@ -205,7 +221,9 @@ int _scsi_read_block(int id, unsigned char *cmd, int cmd_size, unsigned char **p
   if (ret < xfer_size) {
     u->eof = 1;
     u->status[0] = 0x02;
-    if (trace_scsi) printf("scsi%d: read eof; chk\n", id);
+    if (u->tape || trace_scsi)
+      printf("scsi%d: short/EOF — got %d, wanted %d; setting eof=1, status=0x02\n",
+             id, ret, xfer_size);
     *psiz = ret;
   }
 
@@ -303,7 +321,8 @@ int _scsi_request_sense(int id, unsigned char *cmd, int cmd_size, unsigned char 
 
   /* tape? */
   if (u->tape) {
-    if (trace_scsi) printf("scsi%d: eof %d\n", id, u->eof);
+    printf("scsi%d: REQUEST_SENSE [tape] file=%d eof=%d -> sense=0x%02x\n",
+           id, u->fileno, u->eof, u->eof ? 0x01 : 0x00);
     u->data[0] = u->eof ? 0x01 : 0x00;
     u->data[4] = u->data[0];
 
@@ -511,7 +530,9 @@ scsi_bus_data = 0;
 	    _scsi_set_phase(PHASE_STATUS, 0);
 	    break;
 	  case 0x01: /* REWIND */
-	    if (trace_scsi) printf("scsi: command rewind\n");
+	    if (scsi_units[id_selected].tape || trace_scsi)
+	      printf("scsi%d: REWIND (was file %d)\n",
+	             id_selected, scsi_units[id_selected].fileno);
 	    _scsi_set_phase(PHASE_STATUS, 0);
 	    _scsi_set_filenum(id_selected, 0);
 	    break;
@@ -566,7 +587,11 @@ scsi_bus_data = 0;
 	  *pirq = 1;
 	  switch (scsi_cmd_buf[0]) {
 	  case 0x11: /* SPACE */
-	    if (trace_scsi) printf("scsi: command space\n");
+	    if (scsi_units[id_selected].tape || trace_scsi)
+	      printf("scsi%d: SPACE (advance from file %d) cmd=%02x %02x %02x %02x %02x %02x\n",
+	             id_selected, scsi_units[id_selected].fileno,
+	             scsi_cmd_buf[0], scsi_cmd_buf[1], scsi_cmd_buf[2],
+	             scsi_cmd_buf[3], scsi_cmd_buf[4], scsi_cmd_buf[5]);
 	    _scsi_set_phase(PHASE_STATUS, 0);
 	    _scsi_next_file(id_selected);
 	    break;
@@ -719,19 +744,45 @@ int _scsi_set_filenum(int unit, int num)
 
   u = &scsi_units[unit];
 
-  if (trace_scsi) printf("scsi%d: set file %d '%s'\n", unit, num, u->fname[num]);
+  if (u->tape || trace_scsi)
+    printf("scsi%d: set file %d '%s' (was %d)%s\n",
+           unit, num, u->fname[num] ? u->fname[num] : "(null)",
+           u->fileno, u->tape ? " [tape]" : "");
 
   /* if open, close active file */
   if (u->fd > 0) {
-    close(u->fd);
+    if (u->tape || trace_scsi)
+      printf("scsi%d: close fd=%d (file %d '%s')\n",
+             unit, u->fd, u->fileno,
+             (u->fileno >= 0 && u->fname[u->fileno]) ? u->fname[u->fileno] : "(null)");
+    if (close(u->fd) < 0)
+      printf("scsi%d: close failed: %s\n", unit, strerror(errno));
     u->fd = 0;
   }
 
   fname = u->fname[num];
+  if (!fname) {
+    printf("scsi%d: set file %d: NO FILENAME REGISTERED — open skipped\n", unit, num);
+    return -1;
+  }
+
   fd = open(fname, u->ro ? O_RDONLY : O_RDWR);
   if (fd < 0) {
+    printf("scsi%d: open('%s', %s) FAILED: %s\n",
+           unit, fname, u->ro ? "O_RDONLY" : "O_RDWR", strerror(errno));
     perror(fname);
     return -1;
+  }
+
+  if (u->tape || trace_scsi) {
+    struct stat st;
+    if (fstat(fd, &st) == 0)
+      printf("scsi%d: open('%s', %s) OK fd=%d size=%lld%s\n",
+             unit, fname, u->ro ? "O_RDONLY" : "O_RDWR", fd,
+             (long long)st.st_size, u->tape ? " [tape]" : "");
+    else
+      printf("scsi%d: open('%s') OK fd=%d (fstat failed: %s)\n",
+             unit, fname, fd, strerror(errno));
   }
 
   u->fd = fd;
@@ -745,10 +796,17 @@ int _scsi_set_filenum(int unit, int num)
 int _scsi_next_file(int unit)
 {
   int current;
+  struct scsi_unit_s *u = &scsi_units[unit];
 
-  current = scsi_units[unit].fileno;
-  if (scsi_units[unit].fname[current+1]) {
+  current = u->fileno;
+  if (u->fname[current+1]) {
+    if (u->tape || trace_scsi)
+      printf("scsi%d: next-file %d -> %d ('%s')\n",
+             unit, current, current+1, u->fname[current+1]);
     _scsi_set_filenum(unit, current+1);
+  } else {
+    if (u->tape || trace_scsi)
+      printf("scsi%d: next-file %d -> NONE (end of media)\n", unit, current);
   }
 
   return 0;
@@ -771,6 +829,14 @@ int scsi_set_disk_image(int unit, char *fname)
 
 int scsi_set_tape_image(int unit, int fileno, char *fname)
 {
+  struct stat st;
+  if (stat(fname, &st) == 0)
+    printf("scsi%d: tape register file %d '%s' size=%lld\n",
+           unit, fileno, fname, (long long)st.st_size);
+  else
+    printf("scsi%d: tape register file %d '%s' (stat failed: %s)\n",
+           unit, fileno, fname, strerror(errno));
+
   scsi_units[unit].fname[fileno] = strdup(fname);
   scsi_units[unit].fd = 0;
   scsi_units[unit].fileno = -1;
