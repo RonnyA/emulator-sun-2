@@ -19,7 +19,7 @@ endif
 
 SIM = sim/sim$(EXE_EXT)
 
-.PHONY: all release sunos20 sunos32 sunos35 run run-trace clean help fetch-sdl2
+.PHONY: all release sunos20 sunos32 sunos35 run run-trace clean help fetch-sdl2 fetch-npcap-sdk
 
 all:
 	$(MAKE) -C m68k all
@@ -87,6 +87,14 @@ clean:
 fetch-sdl2:
 	@sh scripts/fetch-sdl2.sh
 
+# Vendor the Npcap SDK under external/npcap-sdk/  (Windows only).
+# Required to compile against libpcap on Windows — the Npcap *runtime*
+# alone (wpcap.dll in System32\Npcap) doesn't ship pcap.h or the import
+# library.  After running this, sim/Makefile auto-detects the SDK and
+# defaults NET_BACKEND to pcap.
+fetch-npcap-sdk:
+	@sh scripts/fetch-npcap-sdk.sh
+
 help:
 	@echo "sun-2 emulator build"
 	@echo "  make             Build for the host (default)"
@@ -101,6 +109,9 @@ help:
 	@echo "  make sunos35     Stage SunOS 3.5 disk (no run)"
 	@echo "  make fetch-sdl2  Download SDL2 MinGW devel into external/SDL2/"
 	@echo "                   (only needed for local Windows / w64devkit builds)"
+	@echo "  make fetch-npcap-sdk"
+	@echo "                   Download Npcap SDK into external/npcap-sdk/ for"
+	@echo "                   building libpcap support on Windows"
 	@echo
 	@echo "Network backend (override per-build):"
 	@echo "  make NET_BACKEND=bpf    BSD Packet Filter (default macOS/BSD)"

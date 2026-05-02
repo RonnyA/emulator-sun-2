@@ -40,6 +40,26 @@ endif
 #   make NET_BACKEND=stub      # disable networking entirely
 #   make NET_BACKEND=pcap      # force libpcap on macOS, etc
 # ---------------------------------------------------------------------
+# On Windows we look for the Npcap SDK in three places, in order:
+#   1. NPCAP_SDK env var (if set, points at the SDK root)
+#   2. ../external/npcap-sdk/  (vendored by `make fetch-npcap-sdk`)
+#   3. C:/Program Files/Npcap/SDK  (Npcap installer's optional component)
+# If any of those exists we default to NET_BACKEND=pcap; otherwise
+# we fall back to stub so a fresh checkout builds without extra setup.
+VENDORED_NPCAP_DIR := ../external/npcap-sdk
+NPCAP_PROGFILES   := /c/Program Files/Npcap/SDK
+NPCAP_PROGFILES_W := C:/Program Files/Npcap/SDK
+
+ifndef NPCAP_SDK
+    ifneq ($(wildcard $(VENDORED_NPCAP_DIR)/Include/pcap.h),)
+        NPCAP_SDK := $(abspath $(VENDORED_NPCAP_DIR))
+    else ifneq ($(wildcard $(NPCAP_PROGFILES)/Include/pcap.h),)
+        NPCAP_SDK := $(NPCAP_PROGFILES)
+    else ifneq ($(wildcard $(NPCAP_PROGFILES_W)/Include/pcap.h),)
+        NPCAP_SDK := $(NPCAP_PROGFILES_W)
+    endif
+endif
+
 ifeq ($(UNAME_S),Darwin)
     NET_BACKEND ?= bpf
 else ifeq ($(UNAME_S),NetBSD)
@@ -49,10 +69,7 @@ else ifeq ($(UNAME_S),FreeBSD)
 else ifeq ($(UNAME_S),OpenBSD)
     NET_BACKEND ?= bpf
 else ifeq ($(IS_WINDOWS),1)
-    # Default Windows to libpcap only when an Npcap SDK is visible.
-    # Otherwise fall back to the no-network stub so a fresh checkout
-    # builds without extra setup.
-    ifdef NPCAP_SDK
+    ifneq ($(NPCAP_SDK),)
         NET_BACKEND ?= pcap
     else
         NET_BACKEND ?= stub
@@ -70,13 +87,12 @@ else ifeq ($(NET_BACKEND),pcap)
     NET_OBJ  := net_pcap.o
     NET_DEFS := -DNET_BACKEND_PCAP
     ifeq ($(IS_WINDOWS),1)
-        # Npcap SDK location — set via env var.  In CI we download the
-        # Npcap SDK and point NPCAP_SDK at the extracted folder.
-        ifndef NPCAP_SDK
-            $(warning NPCAP_SDK is not set; assuming Npcap SDK headers are on the include path)
+        ifeq ($(NPCAP_SDK),)
+            $(error NET_BACKEND=pcap requires the Npcap SDK. Run 'make fetch-npcap-sdk' or set NPCAP_SDK=/path/to/sdk)
         endif
-        NET_INC  := $(if $(NPCAP_SDK),-I"$(NPCAP_SDK)/Include")
-        NET_LIBS := $(if $(NPCAP_SDK),-L"$(NPCAP_SDK)/Lib/x64") -lwpcap
+        NET_INC  := -I"$(NPCAP_SDK)/Include"
+        # 64-bit hosts use Lib/x64; 32-bit toolchains use Lib/.  We're 64-bit.
+        NET_LIBS := -L"$(NPCAP_SDK)/Lib/x64" -lwpcap
     else
         NET_INC  :=
         NET_LIBS := -lpcap
