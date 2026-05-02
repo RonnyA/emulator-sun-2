@@ -32,6 +32,7 @@
 #endif
 
 #include "sim.h"
+#include "icon_data.h"
 
 #define debug 0
 
@@ -112,6 +113,20 @@ void sdl_init(void)
     if (!screen) {
         printf("Could not open SDL window: %s\n", SDL_GetError());
         return;
+    }
+
+    /* Set the SDL window icon from the embedded RGBA pixel array.  The
+       array in icon_data.h is 64x64 RGBA top-to-bottom, byte order R,G,B,A.
+       The .ico embedded via sim.rc covers the taskbar / Alt-Tab / file
+       explorer use; this call covers the in-window decoration. */
+    {
+        SDL_Surface *icon = SDL_CreateRGBSurfaceFrom(
+            (void *)icon_data, ICON_WIDTH, ICON_HEIGHT, 32, ICON_WIDTH * 4,
+            0x000000ff, 0x0000ff00, 0x00ff0000, 0xff000000);
+        if (icon) {
+            SDL_SetWindowIcon(screen, icon);
+            SDL_FreeSurface(icon);
+        }
     }
 
     renderer = SDL_CreateRenderer(screen, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);

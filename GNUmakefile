@@ -1,29 +1,108 @@
 
-PROM  = media/rom/sun2-multi-rev-R.bin
-DISK  = media/disk/disk.img
-TAPE  = media/tape/tape
+PROM   = media/rom/sun2-multi-rev-R.bin
+DISK   = media/disk/disk.img
+
+# Which SunOS to stage when "make run" is called and disk.img is missing.
+# Override with: make run RUN_VERSION=20  (or 35).
+RUN_VERSION ?= 32
+
+# .exe suffix on Windows so `make run` finds the binary either way.
+ifeq ($(OS),Windows_NT)
+    EXE_EXT := .exe
+else ifneq (,$(findstring MINGW,$(shell uname -s 2>/dev/null)))
+    EXE_EXT := .exe
+else ifneq (,$(findstring MSYS,$(shell uname -s 2>/dev/null)))
+    EXE_EXT := .exe
+else
+    EXE_EXT :=
+endif
+
+SIM = sim/sim$(EXE_EXT)
+
+.PHONY: all release sunos20 sunos32 sunos35 run run-trace clean help fetch-sdl2
 
 all:
-	make -C m68k all
-	make -C sim all
+	$(MAKE) -C m68k all
+	$(MAKE) -C sim  all
 
+# CI calls "make release"; for the sun-2 build the regular target
+# already compiles with -O2, so this is just an alias for `all`.
+release: all
+
+# ---------------------------------------------------------------------
+# Disk staging.  Each target copies the matching SunOS image to the
+# generic disk.img the simulator opens, and (where applicable) writes
+# the right tape directory name to media/tape/tape so the bootloader
+# can find install media.
+#
+# We use cp instead of `ln -s` so this works on Windows hosts where
+# real symlinks need Developer Mode / admin rights.
+# ---------------------------------------------------------------------
 sunos20:
 	cp media/disk/my-sun2-s2.0-disk.img $(DISK)
-	ln -sf tape2.0 media/tape/tape
+	rm -rf media/tape/tape
+	cp -R media/tape/tape2.0 media/tape/tape
 
 sunos32:
 	cp media/disk/my-sun2-s3.2-disk.img $(DISK)
-	ln -sf tape3.2 media/tape/tape
+	rm -rf media/tape/tape
+	cp -R media/tape/tape3.2 media/tape/tape
 
 sunos35:
 	cp media/disk/my-sun2-s3.5-disk.img $(DISK)
-	rm -f media/tape/tape
+	rm -rf media/tape/tape
+
+# ---------------------------------------------------------------------
+# Run the emulator with a disk attached.  If disk.img isn't staged yet,
+# auto-stage SunOS $(RUN_VERSION) first.  On Windows, also drop SDL2.dll
+# next to the binary so it loads without putting external/ on PATH.
+#
+# Default `make run` passes `-q` so the bus-error / vector / register
+# trace stays off.  Without -q the printf flood from the Multibus probe
+# loop runs the emulator at well under 1% real-time and the PROM never
+# reaches its banner.  Use `make run-trace` to get the verbose path
+# back when actually debugging the simulator.
+# ---------------------------------------------------------------------
+define stage_and_run
+@if [ ! -f "$(DISK)" ]; then \
+    echo "No $(DISK); staging SunOS $(RUN_VERSION) ..."; \
+    $(MAKE) sunos$(RUN_VERSION); \
+fi
+$(if $(filter .exe,$(EXE_EXT)),@if [ -f external/SDL2/x86_64-w64-mingw32/bin/SDL2.dll ] && [ ! -f sim/SDL2.dll ]; then cp external/SDL2/x86_64-w64-mingw32/bin/SDL2.dll sim/SDL2.dll; fi)
+$(SIM) $(1) --prom=$(PROM) --disk=$(DISK) --tape=media/tape/tape
+endef
 
 run: all
-	@test -f $(DISK) || (echo "No disk.img found. Run 'make sunos20', 'make sunos32', or 'make sunos35' first." && exit 1)
-	sim/sim --prom=$(PROM) --disk=$(DISK) --tape=$(TAPE)
+	$(call stage_and_run,-q)
+
+run-trace: all
+	$(call stage_and_run,)
 
 clean:
-	make -C m68k clean
-	make -C sim clean
+	$(MAKE) -C m68k clean
+	$(MAKE) -C sim  clean
 
+# Vendor SDL2 MinGW devel under external/SDL2/  (Windows / w64devkit only).
+# Lets you build without MSYS2.  Override version with SDL2_VERSION=...
+fetch-sdl2:
+	@sh scripts/fetch-sdl2.sh
+
+help:
+	@echo "sun-2 emulator build"
+	@echo "  make             Build for the host (default)"
+	@echo "  make release     Same as 'make' (kept for CI symmetry)"
+	@echo "  make clean       Remove build artifacts"
+	@echo "  make run         Build, stage default disk, and run (quiet)"
+	@echo "  make run-trace   Same as run but with full bus-error / vector trace"
+	@echo "  make run RUN_VERSION=20|32|35"
+	@echo "                   Stage that SunOS image instead of the default 3.2"
+	@echo "  make sunos20     Stage SunOS 2.0 disk + tape (no run)"
+	@echo "  make sunos32     Stage SunOS 3.2 disk + tape (no run)"
+	@echo "  make sunos35     Stage SunOS 3.5 disk (no run)"
+	@echo "  make fetch-sdl2  Download SDL2 MinGW devel into external/SDL2/"
+	@echo "                   (only needed for local Windows / w64devkit builds)"
+	@echo
+	@echo "Network backend (override per-build):"
+	@echo "  make NET_BACKEND=bpf    BSD Packet Filter (default macOS/BSD)"
+	@echo "  make NET_BACKEND=pcap   libpcap (default Linux) / Npcap (Windows)"
+	@echo "  make NET_BACKEND=stub   No networking"

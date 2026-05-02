@@ -850,7 +850,7 @@ void cpu_write_byte(unsigned int address, unsigned int value)
   if (trace_cpu_rw)
     printf("cpu_write_byte fc=%x %x <- %x @ %x\n", g_fc, address, value, m68k_get_reg(NULL, M68K_REG_PC));
 
-  { extern uint m68ki_fault_pending; if (m68ki_fault_pending) printf("PENDING FAULT! cpu_write_byte %08x\n", address); }
+  { extern unsigned int m68ki_fault_pending; if (m68ki_fault_pending) printf("PENDING FAULT! cpu_write_byte %08x\n", address); }
   //_check_write(address, value, 1);
 
   WRITE_BYTE(g_ram, address, value);
@@ -861,7 +861,7 @@ void cpu_write_word(unsigned int address, unsigned int value)
   if (trace_cpu_rw)
     printf("cpu_write_word fc=%x %x <- %x @ %x\n", g_fc, address, value, m68k_get_reg(NULL, M68K_REG_PC));
 
-  { extern uint m68ki_fault_pending; if (m68ki_fault_pending) printf("PENDING FAULT! cpu_write_word %08x\n", address); }
+  { extern unsigned int m68ki_fault_pending; if (m68ki_fault_pending) printf("PENDING FAULT! cpu_write_word %08x\n", address); }
   //_check_write(address, value, 2);
 
   WRITE_WORD(g_ram, address, value);
@@ -872,7 +872,7 @@ void cpu_write_long(unsigned int address, unsigned int value)
   if (trace_cpu_rw)
     printf("cpu_write_long fc=%x %x <- %x @ %x\n", g_fc, address, value, m68k_get_reg(NULL, M68K_REG_PC));
 
-  { extern uint m68ki_fault_pending; if (m68ki_fault_pending) printf("PENDING FAULT! cpu_write_long %08x\n", address); }
+  { extern unsigned int m68ki_fault_pending; if (m68ki_fault_pending) printf("PENDING FAULT! cpu_write_long %08x\n", address); }
   //_check_write(address, value, 4);
 
   if (address < MAX_RAM) {
@@ -1535,9 +1535,9 @@ void trace_file_entry(int what, unsigned int *record, int size)
 
   if (trace_bin_fd == 0) {
 #ifdef __linux__
-    int flags = O_CREAT | O_TRUNC | O_LARGEFILE | O_WRONLY;
+    int flags = O_CREAT | O_TRUNC | O_LARGEFILE | O_WRONLY | O_BINARY;
 #else
-    int flags = O_CREAT | O_TRUNC | O_WRONLY;
+    int flags = O_CREAT | O_TRUNC | O_WRONLY | O_BINARY;
 #endif
 
     trace_bin_fd = open("trace.bin", flags, 0666);
@@ -1735,8 +1735,11 @@ void sim68k(void)
    */
   if (signal (SIGINT, termination_handler) == SIG_IGN)
     signal (SIGINT, SIG_IGN);
+#ifdef SIGHUP
+  /* SIGHUP doesn't exist on Windows. */
   if (signal (SIGHUP, termination_handler) == SIG_IGN)
     signal (SIGHUP, SIG_IGN);
+#endif
   if (signal (SIGTERM, termination_handler) == SIG_IGN)
     signal (SIGTERM, SIG_IGN);
 

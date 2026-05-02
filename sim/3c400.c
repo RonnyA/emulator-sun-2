@@ -37,23 +37,12 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-
-#if defined(__unix__)|| defined(__MACH__)
-#include <net/bpf.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <net/if.h>
-#include <sys/ioctl.h>
-#include <sys/uio.h>
-#include <unistd.h>
-#include <signal.h>
-#include <sys/time.h>
-#endif
+#include <time.h>
 
 #include "sim68k.h"
 #include "m68k.h"
 #include "sim.h"
+#include "net.h"
 
 // This is not a good place but here is the configuration for the mac-address and the BPF device and network device you wish to use
 // TODO: There probably should be a configuration file to set this
@@ -65,35 +54,9 @@
 #define MAC5 0x06;
 #define MAC6 0xe0;
 
-// BPF interface
+// Default host interface for the network backend (override at runtime
+// when the host config supports it).  Used by net_open().
 #define BPFINTERFACE "vmnet8"
-
-
-#if defined(__unix__)|| defined(__MACH__)
-// This is the filter that we use for BPF, if PA is >2 then this filter is used
-struct bpf_insn bpf_ours[] = {
-	// Load first 4 from dest addr
-	BPF_STMT (BPF_LD + BPF_W + BPF_ABS, 0),
-	// Compare to first 4 octets of our mac
-	BPF_JUMP (BPF_JMP + BPF_JEQ + BPF_K, 0x08002001, 0, 3 ),
-	// Load last 2 from dest addr
-	BPF_STMT (BPF_LD + BPF_H + BPF_ABS, 4),
-	// Compare to last 2 octets of our mac
-	BPF_JUMP (BPF_JMP + BPF_JEQ + BPF_K, 0x06e0, 5, 0 ),
-	// Load first 4 from dest addr
-	BPF_STMT (BPF_LD + BPF_W + BPF_ABS, 0),
-	// Compare to first 4 of broadcast-addrress
-	BPF_JUMP (BPF_JMP + BPF_JEQ + BPF_K, 0xFFFFFFFF, 0, 2),
-	// Load last 2 from dest addr
-	BPF_STMT (BPF_LD + BPF_H + BPF_ABS, 4),
-	// Compare to last of broadcast-mac
-	BPF_JUMP (BPF_JMP + BPF_JEQ + BPF_K, 0xFFFF, 1, 0),
-	// If there's no match, reject the packet
-	BPF_STMT (BPF_RET + BPF_K, 0),
-	// Otherwise receive the packet
-	BPF_STMT (BPF_RET + BPF_K, -1)
-};
-#endif
 
 // Try to make sure struct is correctly represented
 #pragma pack(1)
@@ -237,21 +200,13 @@ unsigned char *mebbuffer;
 //  Trace positive means outputting lots of debug information on the lowlevel processing of the emulation, best enabled by using the e3c400_enable_trace function...
 int trace_3c400 = 0;
 
-#if defined(__unix__)|| defined(__MACH__)
-// File handle for the BPF connection
-int bpf = 0;
-// Counter to hold onto how many frames are waiting in the buffer 
-int bpf_buflen = 0;
-// Struct for BPF header and received packet
-struct bpf_hdr* bpf_buf;
-struct bpf_hdr* bpf_packet;
-// Slowdown counter which prevents the BPF code from running on every I/O iteration since it slows down the emulator signficantly
+// Active network backend handle.  NULL when networking is disabled
+// or the host couldn't be opened (e.g. permissions on /dev/bpf*,
+// missing libpcap, no Npcap driver, etc).
+static net_iface_t *netif = NULL;
+// Slowdown counter which prevents the network read code from running
+// on every I/O iteration since it slows down the emulator significantly.
 uint32_t bpfscan = 0;
-//  Some time measurement tools
-clock_t bpfbegin = 0;
-clock_t bpfend = 0;
-double bpfelapsed;
-#endif
 
 // Polynomial used
 uint32_t poly = 0xedb88320;
@@ -428,15 +383,12 @@ void handle_outgoing_packets() {
 		}
 		if(trace_3c400)
 			printf("\n");
-		int byteswritten;
-		// Send packet if we have BPF
-		#if defined(__unix__) || defined(__MACH__)
-		if(bpf) {		
-			byteswritten=write(bpf,&mexbuffer[firstbyte],2048-firstbyte);
+		// Send packet through whichever backend is active.
+		if(netif) {
+			int byteswritten = net_send(netif, &mexbuffer[firstbyte], 2048-firstbyte);
 			if(trace_3c400)
-				printf("Bytes written to BPF: %d\n",byteswritten);
+				printf("Bytes written to net(%s): %d\n", net_backend_name(), byteswritten);
 		}
-		#endif
 		// Set tbsw to zero so that other packets can be sent
 		mecsr->csr.tbsw = 0;
 		// Check whether interrupt on transmit sent is set
@@ -643,84 +595,17 @@ void e3c400_init(void) {
 	for(p=0;p<2046;p++)	
 		mebbuffer[p] = 0;
 
-	// Open BPF and bind to the interface
-	#if defined(__unix__) || defined(__MACH__)
-	char buf[11] = { 0 };
-	// This should open the next available BPF device
-	for(p=0;p<99;p++) {
-		snprintf(buf,sizeof(buf),"/dev/bpf%i",p);
-		bpf = open(buf, O_RDWR);
-		// If we managed to open the device exit the loop
-		if(bpf != -1)
-			break;
-	}	
-	// Check whether BPF is still -1
-	if(bpf == -1)
-		// Warn user
-		printf("Can't open BPF interface, check permissions of /dev/bpf*\n");
-	// Associate the BPF with our requested network device (set near the top of this file)
-	const char* interface = BPFINTERFACE;
-	struct ifreq bindif;
-	strcpy(bindif.ifr_name, interface);
-	// Check whether we were able to bind
-	if(ioctl(bpf, BIOCSETIF, &bindif ) < 0) {
-		// Set BPF to 0 so we don't use it
-		bpf=0;
-		// Warn user
-		printf("Unable to bind to requested network device %s\n",interface);
-	}
-
-	// Initial buffer length set to 1
-	int bpg_buflen = 1;
-	// Set immediate mode
-	if(ioctl(bpf, BIOCIMMEDIATE, &bpf_buflen) == -1) {
-		// Set BPF to 0 so we don't use it
-		bpf=0;
-		// Warn user
-		printf("Unable to set BPF immediate mode, BPF disabled\n");
-	}
-	int fionbio = 1;
-	
-	// Set non-blocking I/O
-	if(ioctl(bpf,FIONBIO, &fionbio) == -1) {
-		// Set BPF to 0 so we don't use it
-		bpf=0;
-		// Warn user
-		printf("Unable to enable BPF non-blocking I/O, BPF disabled\n");
-	}
-	
-	// Set the BPF packet filter, we're not really interested in overwhelming the 68010 processor with packets not destined to the SUN ethernet addr
-	// or broadcast packets.  If the PA value in the control register isn't explicitely set to promiscious mode we'll drop all frames not destined to us or broadcast     
-
-	// Set up filter struct from our pre-defined packet filter
-	struct bpf_program filter;
-	filter.bf_len = sizeof(bpf_ours) / sizeof(struct bpf_insn);
-	filter.bf_insns = &bpf_ours[0];
-	// Init filter if PA >2
-	if(mecsr->csr.pa > 2) {
-		printf("Driver mode is promiscious, no filter set\n");
-		if(ioctl(bpf, BIOCSETF, &filter) < 0) {
-			//  Set BPF to 0 so we don't use it
-			bpf=0;
-			// Warn user
-			printf("Can't enable BPF packet filtering, BPF disabled\n");
-		} 
-	} 
-	// Set promiscious mode
-	int promisc=1;
-	if(ioctl(bpf,BIOCPROMISC,&promisc) <0) {
-		// Warn user
-		printf("Failed to set promiscious mode, your success with broadcast packet will vary\n");
-	}
-	// Stop BPF from overwriting the mac address in the header, it makes life much easier if we can identify our own fake mac-address on the wire
-	int noautofill=1;
-	if(ioctl(bpf,BIOCSHDRCMPLT,&noautofill) < 0) {
-		//  Set BPF to 0 so we don't usee it
-		bpf=0;
-		//  Warn user
-		printf("Can't disable BPF autofill of src mac-address, BPF disabled\n");
-	}
-	#endif
+	// Open the host network interface through whichever backend was
+	// linked in (BPF on macOS/BSD, libpcap on Linux, Npcap on Windows,
+	// or stub when networking is disabled at build time).
+	uint8_t mac[6] = { romaddr->addr.o1, romaddr->addr.o2, romaddr->addr.o3,
+	                   romaddr->addr.o4, romaddr->addr.o5, romaddr->addr.o6 };
+	netif = net_open(BPFINTERFACE, mac, /*promiscuous=*/1);
+	if (!netif)
+		printf("3C400: networking disabled (net(%s) open failed for '%s')\n",
+		       net_backend_name(), BPFINTERFACE);
+	else
+		printf("3C400: net(%s) bound to %s\n", net_backend_name(), BPFINTERFACE);
 }
 
 
@@ -728,16 +613,11 @@ void e3c400_init(void) {
 void e3c400_update(void) {
 	// Temporary loop variable
 	int p=0;
-	// BPF buffer
-	char *buffer = NULL;
-	char *pointer = NULL;
-	// Get which buffer to use
+	// Receive scratch buffer (one ethernet frame).
+	unsigned char framebuf[2048];
+	int framelen = 0;
+	// Which receive buffer (A or B) we should drop the next packet into.
 	unsigned char whichbuffer;
-	// Buffer length
-	size_t blen=0;
-	ssize_t readbytes = 0;
-	// BPF header
-	struct bpf_hdr *bh = NULL;
 	// Check the reset bit
 	if(mecsr->csr.reset) {
 		// Reset the Transmit and Receive enable bits
@@ -778,96 +658,45 @@ void e3c400_update(void) {
 	}
 	//  Check for outgoing packets and send them
 	handle_outgoing_packets();
-	// Increment the BGP scan counter by 1 for each update loop
+	// Increment the scan counter by 1 for each update loop
 	bpfscan++;
-	// If BPF is active and set, there are are packets waiting and the adapter is ready to receive them, and we're on an update round where we take care of the bpf
-	// Despite only running this every 5k runs it still manages to perform at around 10Mbits per second on a modern processor
-	// If you find that the network is very slow, you might consider lowering this number from 5000, maybe by 1000 at a time until you find a compromise
-	// It would be better to have BPF signal the process when there is a packet waiting, that is however unsupported on at least Mac OS X
-	if(bpf && (mecsr->csr.absw || mecsr->csr.bbsw) && (bpfscan % 5000 == 0)) {
-		// Get buffer length
-		if(ioctl(bpf, BIOCGBLEN, &blen) <0) {
-			printf("Can't get BPF buffer length\n");
-			bpf=0;
-			return;
-		}
-		// Malloc buffer
-		if( ( buffer = malloc(blen)) == NULL) {
-			printf("Can't allocate memory for BPF buffer\n");
-			bpf=0;
-			return;
-		}
-		// Zero out readbytes
-		readbytes=0;
+	// Only poll the host network every Nth update — reading packets from
+	// libpcap / BPF is the dominant cost in this loop on most hosts.  On
+	// modern processors a stride of 5000 gives roughly 10 Mbit/s sustained
+	// throughput; lower it if you need lower latency at the cost of CPU.
+	if (netif && (mecsr->csr.absw || mecsr->csr.bbsw) && (bpfscan % 5000 == 0)) {
+		// Drain whatever the backend has buffered.
+		while (mecsr->csr.absw || mecsr->csr.bbsw) {
+			framelen = net_recv(netif, framebuf, sizeof(framebuf));
+			if (framelen <= 0) break;       /* 0 = no packet, <0 = error */
 
-		// Loop if there are packets
-		while(mecsr->csr.absw || mecsr->csr.bbsw) {
-			// Set null terminator at start of buffer
-			(void)memset(buffer,'\0',blen);
+			if (trace_3c400)
+				printf("3C400: %d bytes received from net(%s)\n",
+				       framelen, net_backend_name());
 
-			// Read from BPF
-			readbytes=read(bpf,buffer,blen);
-	
-			// If no bytes are available, exit
-			if(readbytes <= 0)
-				break;
-
-			if(trace_3c400 && readbytes >=0)
-				printf("3C400: %ld bytes available to process in receive buffer\n",readbytes);
-
-			// Set up pointer to work with packet(s)
-			pointer=buffer;	
-
-			// Process packets if the OS is ready to accept packets and we have data
-			while(readbytes >0 && pointer < (buffer + readbytes)) {
-				// Get the BPF header
-				bh = (struct bpf_hdr *)pointer;		
-
-				// Find which buffer to use
-				whichbuffer = find_buffer();
-				if(whichbuffer == 'A') {
-					// Verify that caplen isn't longer than our buffer size
-					if(bh->bh_caplen < 2046) {
-						// Copy from after the BPF header, and for as long as we had packets
-						// Packet is always placed until the end of the meabuffer
-						memcpy(&meabuffer[0],(pointer + bh->bh_hdrlen),bh->bh_caplen);
-						// Set the first free bytes of the meahdr, to tell the OS where the packet starts
-						// We have to take into account the 2 byte header of meahdr and the FCS
-						meahdr->hdr.firstfree=bh->bh_datalen;
-						// Process the packet
-						handle_incoming_packet();		
-					} else {
-						// Notify user
-						printf("Packet length exceeds 3C400 ethernet buffer\n");
-					}
-				} else if(whichbuffer == 'B') {
-					// Verify that caplen isn't longer than our buffer size
-					if(bh->bh_caplen < 2046) {
-						// Copy from after the BPF header, and for as long as we had packets
-						// Packet is always placed until the end of the meabuffer
-						memcpy(&mebbuffer[0],(pointer + bh->bh_hdrlen),bh->bh_caplen);
-						// Set the first free bytes of the mebhdr, to tell the OS where the packet starts
-						// We have to take into account the 2 byte header of meahdr and the FCS
-						mebhdr->hdr.firstfree=bh->bh_caplen;
-						// Process the packet
-						handle_incoming_packet();		
-					} else {
-						// Notify user
-						printf("Packet length exceeds 3C400 ethernet buffer\n");
-					}
+			whichbuffer = find_buffer();
+			if (whichbuffer == 'A') {
+				if (framelen < 2046) {
+					memcpy(&meabuffer[0], framebuf, framelen);
+					meahdr->hdr.firstfree = framelen;
+					handle_incoming_packet();
 				} else {
-					// No buffers available, exit loop, we'll come back later...
-					printf("No buffers available for received ethernet packet, discarding\n");
-					// Return
-					return;
+					printf("Packet length exceeds 3C400 ethernet buffer\n");
 				}
-				pointer += BPF_WORDALIGN(bh->bh_hdrlen + bh->bh_caplen);
+			} else if (whichbuffer == 'B') {
+				if (framelen < 2046) {
+					memcpy(&mebbuffer[0], framebuf, framelen);
+					mebhdr->hdr.firstfree = framelen;
+					handle_incoming_packet();
+				} else {
+					printf("Packet length exceeds 3C400 ethernet buffer\n");
+				}
+			} else {
+				printf("No buffers available for received ethernet packet, discarding\n");
+				return;
 			}
-		} // Loop while buffers are ready
+		}
 	}
-	if(bpf && buffer)
-		free(buffer);
-	
 }
 	
 // Handle reading bytes from the emulated e3c400

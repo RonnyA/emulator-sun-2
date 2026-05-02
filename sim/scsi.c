@@ -726,7 +726,7 @@ int _scsi_set_filenum(int unit, int num)
   }
 
   fname = u->fname[num];
-  fd = open(fname, u->ro ? O_RDONLY : O_RDWR);
+  fd = open(fname, (u->ro ? O_RDONLY : O_RDWR) | O_BINARY);
   if (fd < 0) {
     perror(fname);
     return -1;

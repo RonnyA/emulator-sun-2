@@ -4,6 +4,21 @@
  * 10/2014  Brad Parker <brad@heeltoe.com>
  */
 
+#ifndef SUN2_SIM_H
+#define SUN2_SIM_H
+
+#include <stdint.h>
+#include <fcntl.h>
+
+/* On Windows, open() defaults to TEXT mode — \r\n is translated to \n on
+   read, \n becomes \r\n on write, and 0x1A is treated as EOF.  That
+   silently corrupts every binary image we open (PROM, disk, tape).
+   POSIX systems don't have an O_BINARY flag because they never had this
+   problem; provide a no-op so callers can always pass it. */
+#ifndef O_BINARY
+# define O_BINARY 0
+#endif
+
 /* IRQ connections */
 #define IRQ_9513_TIMER1	7
 #define IRQ_SCC         6
@@ -96,4 +111,6 @@ void abortf(const char *fmt, ...);
 
 unsigned int cpu_read(int size, unsigned int address);
 void cpu_write(int size, unsigned int address, unsigned int value);
+
+#endif /* SUN2_SIM_H */
 

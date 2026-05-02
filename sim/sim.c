@@ -28,6 +28,15 @@
 #include <getopt.h>
 #include <dirent.h>
 #include <ctype.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+
+/* htonl/htons live in winsock2.h on Windows and arpa/inet.h on POSIX. */
+#ifdef _WIN32
+#  include <winsock2.h>
+#else
+#  include <arpa/inet.h>
+#endif
 
 #include "sim.h"
 
@@ -89,7 +98,7 @@ read_kernel(void)
 {
 	int fd;
 
-	fd = open(kernel_filename, O_RDONLY);
+	fd = open(kernel_filename, O_RDONLY | O_BINARY);
 	if (fd < 0) {
 		perror(kernel_filename);
 		exit(1);
@@ -115,7 +124,7 @@ read_eprom(void)
 {
 	int fd;
 
-	fd = open(eprom_filename, O_RDONLY);
+	fd = open(eprom_filename, O_RDONLY | O_BINARY);
 	if (fd < 0) {
 		perror(eprom_filename);
 		exit(1);
@@ -178,11 +187,20 @@ setup_tape(char *tf)
 
   if (dir) {
     while ((d = readdir(dir))) {
-      if (d->d_type == DT_REG || d->d_type == DT_LNK) {
-	/* only take tape files named "xx" where "xx" is two digits */
-	if (strlen(d->d_name) == 2 && isdigit(d->d_name[0])) {
-	  tapefilename[n++] = strdup(d->d_name);
-	}
+      /* Some libc/dirent implementations (e.g. older w64devkit MinGW)
+         don't expose d_type at all; use stat() unconditionally. */
+      char probe[1024];
+      struct stat st;
+      snprintf(probe, sizeof(probe), "%s/%s", tape_filename, d->d_name);
+      if (stat(probe, &st) != 0) continue;
+      if (!S_ISREG(st.st_mode)
+#ifdef S_ISLNK
+          && !S_ISLNK(st.st_mode)
+#endif
+         ) continue;
+      /* only take tape files named "xx" where "xx" is two digits */
+      if (strlen(d->d_name) == 2 && isdigit(d->d_name[0])) {
+        tapefilename[n++] = strdup(d->d_name);
       }
     }
 
@@ -278,6 +296,15 @@ int main(int argc, char **argv)
 {
   int c;
   int digit_optind = 0;
+
+  /* Disable stdio buffering so trace output reaches the terminal (or
+     a tee/redirect) immediately.  MSVC/MinGW's CRT treats _IOLBF as
+     _IOFBF for non-tty handles, so even line-buffered stdout would
+     hide startup banners and perror() messages until the process
+     exits — which made it look like the SCSI disk wasn't opening
+     when in fact the printfs were just stuck in the FILE buffer. */
+  setvbuf(stdout, NULL, _IONBF, 0);
+  setvbuf(stderr, NULL, _IONBF, 0);
 
   if (argc <= 1) {
     usage();
