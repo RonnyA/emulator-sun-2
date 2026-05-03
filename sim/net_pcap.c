@@ -35,21 +35,68 @@ struct net_iface_s {
 
 const char *net_backend_name(void) { return "pcap"; }
 
-/* If iface == NULL, pick the first non-loopback device pcap can see. */
-static char *pcap_pick_default(char *errbuf)
+/* True if s is a non-empty string of ASCII digits. */
+static int is_decimal_index(const char *s)
 {
+    if (!s || !*s) return 0;
+    for (const char *p = s; *p; p++)
+        if (*p < '0' || *p > '9') return 0;
+    return 1;
+}
+
+/*
+ * Resolve the user-supplied --net-iface value into the actual device
+ * name pcap_open_live wants.
+ *
+ *   user == NULL           pick the first non-loopback adapter
+ *   user is "1".."N"       use the Nth entry from pcap_findalldevs
+ *                          (matches what `--net-list` printed)
+ *   user is anything else  pass through as a literal name
+ *
+ * Returns a malloc'd string the caller must free.  Returns NULL and
+ * prints a diagnostic if no interface could be resolved.
+ */
+static char *resolve_iface(const char *user, char *errbuf)
+{
+    /* For literal device names we don't enumerate — Npcap names are
+       opaque GUIDs and Linux names are short, but either way pcap
+       takes them verbatim. */
+    if (user && !is_decimal_index(user))
+        return strdup(user);
+
     pcap_if_t *all = NULL;
-    if (pcap_findalldevs(&all, errbuf) != 0 || !all)
+    if (pcap_findalldevs(&all, errbuf) != 0 || !all) {
+        fprintf(stderr, "net(pcap): no usable interfaces (%s)\n", errbuf);
         return NULL;
+    }
 
     char *picked = NULL;
-    for (pcap_if_t *d = all; d != NULL; d = d->next) {
-        if (d->flags & PCAP_IF_LOOPBACK) continue;
-        picked = strdup(d->name);
-        break;
+
+    if (user) {
+        int want = atoi(user);
+        int n = 0;
+        for (pcap_if_t *d = all; d != NULL; d = d->next) {
+            if (++n == want) {
+                picked = strdup(d->name);
+                fprintf(stderr, "net(pcap): --net-iface=%d -> %s\n",
+                        want, d->name);
+                break;
+            }
+        }
+        if (!picked)
+            fprintf(stderr,
+                    "net(pcap): no interface at index %d "
+                    "(run --net-list to see %d available)\n", want, n);
+    } else {
+        /* Auto-pick: prefer the first non-loopback device. */
+        for (pcap_if_t *d = all; d != NULL; d = d->next) {
+            if (d->flags & PCAP_IF_LOOPBACK) continue;
+            picked = strdup(d->name);
+            break;
+        }
+        if (!picked)
+            picked = strdup(all->name);
     }
-    if (!picked && all)
-        picked = strdup(all->name);
 
     pcap_freealldevs(all);
     return picked;
@@ -60,26 +107,18 @@ net_iface_t *net_open(const char *iface, const uint8_t mac[6], int promiscuous)
     (void)mac; /* pcap doesn't need the MAC; the 3c400 filters in software */
 
     char errbuf[PCAP_ERRBUF_SIZE];
-    char *picked = NULL;
-
-    if (!iface) {
-        picked = pcap_pick_default(errbuf);
-        if (!picked) {
-            fprintf(stderr, "net(pcap): no usable interfaces (%s)\n", errbuf);
-            return NULL;
-        }
-        iface = picked;
-    }
+    char *picked = resolve_iface(iface, errbuf);
+    if (!picked) return NULL;
 
     /* snaplen 2048 matches the 3c400 receive buffer; timeout 1ms keeps
        pcap_next_ex() from blocking the emulator's main loop. */
-    pcap_t *p = pcap_open_live(iface,
+    pcap_t *p = pcap_open_live(picked,
                                2048,
                                promiscuous ? 1 : 0,
                                1 /* read timeout, ms */,
                                errbuf);
     if (!p) {
-        fprintf(stderr, "net(pcap): pcap_open_live(%s): %s\n", iface, errbuf);
+        fprintf(stderr, "net(pcap): pcap_open_live(%s): %s\n", picked, errbuf);
         free(picked);
         return NULL;
     }
@@ -91,7 +130,7 @@ net_iface_t *net_open(const char *iface, const uint8_t mac[6], int promiscuous)
     pcap_setnonblock(p, 1, errbuf);
 #endif
 
-    fprintf(stderr, "net(pcap): bound to %s\n", iface);
+    fprintf(stderr, "net(pcap): bound to %s\n", picked);
     free(picked);
 
     net_iface_t *nh = calloc(1, sizeof(*nh));

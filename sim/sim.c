@@ -279,7 +279,10 @@ void usage(void)
   sun2_mode_print_list();
   fprintf(stderr, "optionally:\n");
   fprintf(stderr, " --kernel=FILE  --boot=FILE\n");
-  fprintf(stderr, " --net-iface=NAME   bind the 3C400 to this host interface\n");
+  fprintf(stderr, " --net-iface=NAME|N bind the 3C400 to this host interface.\n");
+  fprintf(stderr, "                    NAME is a literal name (e.g. eth0 or a Windows\n");
+  fprintf(stderr, "                    \\Device\\NPF_{...} GUID).  N is an index into\n");
+  fprintf(stderr, "                    --net-list (1-based).\n");
   fprintf(stderr, "                    (env: SUN2_NET_IFACE; default: backend auto-picks)\n");
   fprintf(stderr, " --net-list         list available host interfaces and exit\n");
   fprintf(stderr, " -q                 quiet (suppress bus-error/vector trace)\n");

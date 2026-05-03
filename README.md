@@ -107,22 +107,38 @@ make NET_BACKEND=stub      # disable networking entirely
 ### Picking a host interface
 
 The emulated 3C400 has to be bound to one of your physical or virtual
-host interfaces. Three ways to choose:
+host interfaces. Four ways to choose:
 
 ```sh
 make net-list                          # list available interfaces
 ./sim/sim --net-list                   # same, ran directly
-./sim/sim --net-iface=eth0 ...         # CLI flag
-SUN2_NET_IFACE=eth0 make run           # env var
+./sim/sim --net-iface=eth0  ...        # CLI flag, literal name
+./sim/sim --net-iface=7     ...        # CLI flag, index from --net-list
+SUN2_NET_IFACE=7 make run              # env var (name or index both work)
 ```
+
+`--net-iface` accepts either:
+
+- a literal interface name (Linux: `eth0`, `wlan0`; macOS: `en0`;
+  Windows: `\Device\NPF_{4B014404-...}` from `--net-list`)
+- a positive integer N — uses the Nth entry from the `--net-list`
+  output, 1-based. Much friendlier than copy-pasting GUIDs.
 
 If neither flag nor env var is given, the active backend auto-picks:
 `pcap` takes the first non-loopback adapter; `bpf` falls back to
 `en0`.
 
-Windows interface names from `--net-list` look like
-`\Device\NPF_{4B014404-...}`. The accompanying description (e.g.
-"Intel(R) Wi-Fi 6 AX201") tells you which physical adapter that is.
+`--net-list` shows the IPv4/IPv6 addresses bound to each interface,
+so you can match a Windows GUID to a real network:
+
+```
+  7. \Device\NPF_{286B7E72-117D-4187-9C6D-C05A5240173B}
+     Microsoft Corporation
+     IPv6: fe80::84fc:ecef:f1e5:578d
+     IPv4: 192.168.1.180/24  (network 192.168.1.0/24)
+```
+
+Then either: `--net-iface=7` or `--net-iface=\Device\NPF_{...}`.
 
 ### Networking on Windows
 
