@@ -58,15 +58,38 @@ static int is_decimal_index(const char *s)
  */
 static char *resolve_iface(const char *user, char *errbuf)
 {
+    /* Strip leading/trailing whitespace from the user-supplied name
+       so a stray space (env var, copy/paste) doesn't become a literal
+       part of the adapter name. */
+    char *trimmed = NULL;
+    if (user) {
+        while (*user == ' ' || *user == '\t' || *user == '\n' || *user == '\r')
+            user++;
+        if (*user == '\0') {
+            user = NULL;
+        } else {
+            trimmed = strdup(user);
+            char *end = trimmed + strlen(trimmed);
+            while (end > trimmed && (end[-1] == ' ' || end[-1] == '\t' ||
+                                     end[-1] == '\n' || end[-1] == '\r'))
+                *--end = '\0';
+            user = trimmed;
+        }
+    }
+
     /* For literal device names we don't enumerate — Npcap names are
        opaque GUIDs and Linux names are short, but either way pcap
        takes them verbatim. */
-    if (user && !is_decimal_index(user))
-        return strdup(user);
+    if (user && !is_decimal_index(user)) {
+        char *ret = strdup(user);
+        free(trimmed);
+        return ret;
+    }
 
     pcap_if_t *all = NULL;
     if (pcap_findalldevs(&all, errbuf) != 0 || !all) {
         fprintf(stderr, "net(pcap): no usable interfaces (%s)\n", errbuf);
+        free(trimmed);
         return NULL;
     }
 
@@ -99,6 +122,7 @@ static char *resolve_iface(const char *user, char *errbuf)
     }
 
     pcap_freealldevs(all);
+    free(trimmed);
     return picked;
 }
 

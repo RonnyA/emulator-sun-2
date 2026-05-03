@@ -409,10 +409,23 @@ int main(int argc, char **argv)
     usage();
   }
 
-  /* Fall back to SUN2_NET_IFACE env var if --net-iface wasn't given. */
+  /* Fall back to SUN2_NET_IFACE env var if --net-iface wasn't given.
+     Strip leading/trailing whitespace — a stray space (e.g. from
+     `SUN2_NET_IFACE=7 ` in a shell) would otherwise be passed to
+     pcap_open_live and turn into "no such adapter '7 '". */
   if (g_net_iface == NULL) {
     const char *e = getenv("SUN2_NET_IFACE");
-    if (e && e[0]) g_net_iface = strdup(e);
+    if (e) {
+      while (*e == ' ' || *e == '\t' || *e == '\n' || *e == '\r') e++;
+      if (*e) {
+        char *dup = strdup(e);
+        char *end = dup + strlen(dup);
+        while (end > dup && (end[-1] == ' ' || end[-1] == '\t' ||
+                             end[-1] == '\n' || end[-1] == '\r'))
+          *--end = '\0';
+        if (dup[0]) g_net_iface = dup; else free(dup);
+      }
+    }
   }
 
   printf("mode: %s (idprom_machine=0x%02x, hires_jumper=%d, fb=%dx%d) — %s\n",

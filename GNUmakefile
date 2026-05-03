@@ -19,6 +19,27 @@ endif
 
 SIM = sim/sim$(EXE_EXT)
 
+# ---------------------------------------------------------------------
+# Capture extra positional words after `run` / `run-trace`, so the user
+# can write `make run 7` to pass --net-iface=7 to sim.  Standard GNU
+# Make idiom: pull every goal after the first into RUN_ARGS, then add
+# a no-op rule for each captured word so `make` doesn't error with
+# "no rule to make target '7'".
+#
+# Use the FIRST captured word as the network interface; ignore the
+# rest.  This keeps the syntax simple and lets the user still pass
+# things like `make run 7 RUN_VERSION=20` (variable assignments are
+# not in MAKECMDGOALS so they don't get captured).
+# ---------------------------------------------------------------------
+RUN_TARGETS := run run-trace
+ifneq (,$(filter $(RUN_TARGETS),$(MAKECMDGOALS)))
+    RUN_ARGS := $(wordlist 2,$(words $(MAKECMDGOALS)),$(MAKECMDGOALS))
+    ifneq (,$(RUN_ARGS))
+        $(eval $(RUN_ARGS):;@:)
+        NET_IFACE_FLAG := --net-iface=$(firstword $(RUN_ARGS))
+    endif
+endif
+
 .PHONY: all release sunos20 sunos32 sunos35 run run-trace net-list clean help fetch-sdl2 fetch-npcap-sdk
 
 all:
@@ -69,7 +90,7 @@ define stage_and_run
     $(MAKE) sunos$(RUN_VERSION); \
 fi
 $(if $(filter .exe,$(EXE_EXT)),@if [ -f external/SDL2/x86_64-w64-mingw32/bin/SDL2.dll ] && [ ! -f sim/SDL2.dll ]; then cp external/SDL2/x86_64-w64-mingw32/bin/SDL2.dll sim/SDL2.dll; fi)
-$(SIM) $(1) --prom=$(PROM) --disk=$(DISK) --tape=media/tape/tape
+$(SIM) $(1) $(NET_IFACE_FLAG) --prom=$(PROM) --disk=$(DISK) --tape=media/tape/tape
 endef
 
 run: all
@@ -111,10 +132,13 @@ help:
 	@echo "  make release     Same as 'make' (kept for CI symmetry)"
 	@echo "  make clean       Remove build artifacts"
 	@echo "  make run         Build, stage default disk, and run (quiet)"
+	@echo "  make run N       Same, with --net-iface=N (index from --net-list,"
+	@echo "                   or a literal interface name like eth0)"
 	@echo "  make run-trace   Same as run but with full bus-error / vector trace"
+	@echo "  make run-trace N Trace mode with --net-iface=N"
 	@echo "  make net-list    Print available host network interfaces"
-	@echo "                   (then pass one with --net-iface=NAME or"
-	@echo "                    SUN2_NET_IFACE=NAME)"
+	@echo "                   (then pass one with 'make run N' or"
+	@echo "                    --net-iface=NAME or SUN2_NET_IFACE=NAME)"
 	@echo "  make run RUN_VERSION=20|32|35"
 	@echo "                   Stage that SunOS image instead of the default 3.2"
 	@echo "  make sunos20     Stage SunOS 2.0 disk + tape (no run)"
