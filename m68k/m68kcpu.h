@@ -1583,14 +1583,23 @@ INLINE void m68ki_stack_frame_buserr(uint pc, uint sr, uint address, uint write,
  */
 void m68ki_stack_frame_1000(uint pc, uint sr, uint vector, uint address, uint write, uint fc)
 {
-	/* Version + 14 words of internal info (uninitialised, like real chip) */
-	m68ki_fake_push_32();
-	m68ki_fake_push_32();
-	m68ki_fake_push_32();
-	m68ki_fake_push_32();
-	m68ki_fake_push_32();
-	m68ki_fake_push_32();
-	m68ki_fake_push_32();
+	/* Version + 14 words of internal info.  Real 68010 leaves these as
+	   microcode state (effectively undefined per the spec), but the Sun-2
+	   PROM bus-error dispatcher at $ef3aa4 indexes into this region:
+	     btst #5, ($62,A6)   — frame offset +0x1A (Chip Mask + MicroPC)
+	     move.w ($68,A6), D0 — frame offset +0x20 (1st internal-info word)
+	   With fake_push_32 (decrement-without-write) the dispatcher reads
+	   stale stack contents and dispatches to a wrong handler — the
+	   "invalidate kernel image PMEG" path on a tape-boot bcopy fault.
+	   Push 0 so the dispatch is deterministic.  Matches what RetroCore's
+	   battle-tested Sun-2 boot path produces. */
+	m68ki_push_32(0);
+	m68ki_push_32(0);
+	m68ki_push_32(0);
+	m68ki_push_32(0);
+	m68ki_push_32(0);
+	m68ki_push_32(0);
+	m68ki_push_32(0);
 
 	/* Last internal-info word — zeroed deterministically (matches C# RetroCore) */
 	m68ki_push_16(0);
@@ -1776,6 +1785,20 @@ INLINE void m68ki_exception_buserr(void)
 	uint pc = m68ki_fault_pc;
 
 	m68ki_fault_pending = 0;
+
+	/* Auto-dump the instruction trace ring (--trace-ring=N) on bus errors
+	   matching --trace-ring-addr= (default: any). */
+	{
+		extern int trace_ring_size;
+		extern unsigned int trace_ring_trigger_addr;
+		extern void trace_ring_dump(const char *);
+		if (trace_ring_size > 0 &&
+		    (trace_ring_trigger_addr == 0 || address == trace_ring_trigger_addr)) {
+			char buf[64];
+			snprintf(buf, sizeof(buf), "bus error addr=%x pc=%x", address, pc);
+			trace_ring_dump(buf);
+		}
+	}
 
 	if(CPU_TYPE_IS_000(CPU_TYPE))
 		/*m68ki_stack_frame_buserr(REG_PC, sr, address, write, instruction, fc)*/;

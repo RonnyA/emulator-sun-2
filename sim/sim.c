@@ -298,10 +298,12 @@ int main(int argc, char **argv)
       {"mode",       required_argument, 0,  'm' },
       {"type",       required_argument, 0,  'T' },
       {"auto-abort", no_argument,       0,  'A' },
+      {"trace-ring", required_argument, 0,  'R' },
+      {"trace-ring-addr", required_argument, 0, 'X' },
       {0,            0,                 0,  0 }
     };
 
-    c = getopt_long(argc, argv, "d:k:p:t:m:T:qA", long_options, &option_index);
+    c = getopt_long(argc, argv, "d:k:p:t:m:T:qAR:X:", long_options, &option_index);
     if (c == -1)
       break;
 
@@ -359,6 +361,21 @@ int main(int argc, char **argv)
       sun2_set_auto_abort(1);
       printf("auto-abort enabled (first PROM bell-off → L1-A drops to monitor)\n");
       break;
+
+    case 'R': {
+      extern void trace_ring_init(int);
+      int n = (int)strtol(optarg, NULL, 0);
+      if (n <= 0) { fprintf(stderr, "--trace-ring=N requires N>0\n"); exit(1); }
+      trace_ring_init(n);
+      break;
+    }
+
+    case 'X': {
+      extern unsigned int trace_ring_trigger_addr;
+      trace_ring_trigger_addr = (unsigned int)strtoul(optarg, NULL, 0);
+      printf("trace-ring: trigger addr set to 0x%x (0=any bus error)\n", trace_ring_trigger_addr);
+      break;
+    }
 
     case '?':
       usage();

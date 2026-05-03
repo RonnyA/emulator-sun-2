@@ -107,6 +107,88 @@ int trace_scsi;
 int trace_armed;
 int trace_irq;
 
+/* --- Instruction trace ring buffer ---
+   Records the last N executed instructions with full register state.
+   Enabled via --trace-ring=N CLI flag.  Auto-dumps when a bus error
+   occurs at trace_ring_trigger_addr (default 0xc0000 — the kernel-image
+   bcopy fault we're hunting).  Set trace_ring_trigger_addr=0 to dump on
+   any bus error, or any other VA to retarget. */
+struct trace_slot {
+  unsigned int pc, ppc, ir, sr;
+  unsigned int d[8];
+  unsigned int a[8];
+};
+static struct trace_slot *trace_ring;
+int trace_ring_size;          /* 0 = disabled */
+static int trace_ring_head;
+static int trace_ring_armed;
+unsigned int trace_ring_trigger_addr = 0xc0000;
+
+void trace_ring_init(int n) {
+  if (n <= 0) return;
+  free(trace_ring);
+  trace_ring = calloc(n, sizeof(*trace_ring));
+  trace_ring_size = n;
+  trace_ring_head = 0;
+  trace_ring_armed = 1;
+  printf("trace-ring: enabled, %d slots, trigger addr=0x%x (0=any)\n",
+         n, trace_ring_trigger_addr);
+}
+
+void trace_ring_record(void) {
+  unsigned int pc = m68k_get_reg(NULL, M68K_REG_PC);
+  if (!trace_ring_armed || trace_ring_size == 0) return;
+  /* Skip known tight loops that flood the ring:
+     - ef6c28/ef6c2a: PROM bcopy inner loop
+     - ef90ec/ef90ee: PROM post-tape-read delay loop
+     Set trace_ring_skip_bcopy=0 to record everything. */
+  extern int trace_ring_skip_bcopy;
+  if (trace_ring_skip_bcopy && (pc == 0xef6c28 || pc == 0xef6c2a ||
+                                 pc == 0xef90ec || pc == 0xef90ee ||
+                                 pc == 0xef0588 || pc == 0xef058a ||
+                                 pc == 0xef3ad8 || pc == 0xef3ada))
+    return;
+  struct trace_slot *s = &trace_ring[trace_ring_head];
+  s->pc  = pc;
+  s->ppc = m68k_get_reg(NULL, M68K_REG_PPC);
+  s->ir  = m68k_get_reg(NULL, M68K_REG_IR);
+  s->sr  = m68k_get_reg(NULL, M68K_REG_SR);
+  for (int i = 0; i < 8; i++) {
+    s->d[i] = m68k_get_reg(NULL, M68K_REG_D0 + i);
+    s->a[i] = m68k_get_reg(NULL, M68K_REG_A0 + i);
+  }
+  trace_ring_head = (trace_ring_head + 1) % trace_ring_size;
+}
+
+int trace_ring_skip_bcopy = 1;
+
+void trace_ring_dump(const char *reason) {
+  if (!trace_ring_armed || trace_ring_size == 0) return;
+  trace_ring_armed = 0;  /* one-shot */
+  printf("\n========== TRACE RING DUMP (%s) — %d slots ==========\n",
+         reason, trace_ring_size);
+  /* iterate from oldest (head = oldest after wrap) to newest */
+  for (int i = 0; i < trace_ring_size; i++) {
+    int idx = (trace_ring_head + i) % trace_ring_size;
+    struct trace_slot *s = &trace_ring[idx];
+    if (s->pc == 0 && s->ir == 0) continue;
+    char dbuf[128];
+    m68k_disassemble(dbuf, s->pc, M68K_CPU_TYPE_68010);
+    printf("[%4d] PC=%06x PPC=%06x IR=%04x SR=%04x  %s\n",
+           i, s->pc, s->ppc, s->ir, s->sr, dbuf);
+    /* full register snapshot every 25 slots and on the very last */
+    if ((i % 25) == 0 || i == trace_ring_size - 1) {
+      printf("       D: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+             s->d[0], s->d[1], s->d[2], s->d[3],
+             s->d[4], s->d[5], s->d[6], s->d[7]);
+      printf("       A: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+             s->a[0], s->a[1], s->a[2], s->a[3],
+             s->a[4], s->a[5], s->a[6], s->a[7]);
+    }
+  }
+  printf("========== END TRACE RING ==========\n\n");
+}
+
 extern int quiet;
 
 unsigned int g_int_controller_pending = 0;	/* list of pending interrupts */
@@ -364,41 +446,82 @@ void pgmap_write(unsigned int address, unsigned int value, int size)
   printf("mmu: pgmap write %x <- %x (%d)\n", address, value, size);
 
   /* Sun-2 MMU page-map index: (pmeg << 4) | VA[14:11].  See RetroCore
-     Sun2MMU.cs:262-273 for the canonical decode.  Earlier code applied
-     a rotate-left-by-1 to the pmeg before indexing — bijective, hence
-     functionally invisible since reads went through the same rotate,
-     but it scrambles trace comparison vs the RetroCore reference. */
+     Sun2MMU.cs:262-273 for the canonical decode. */
   unsigned int segindex = (((address >> 15) & 0x1ff) << 3) | context_user_reg;
   unsigned int pmeg = segmap[segindex];
   unsigned int index = (pmeg << 4) | ((address >> 11) & 0xf);
 
-  pa = (value & PTE_PGFRAME) << PAGE_SIZE_LOG2;
-  pgtype = (value & PTE_PGTYPE) >> PTE_PGTYPE_SHIFT;
-
-  if (trace_mmu_rw)
-  printf("pgmap: write pgmap[0x%x] <- %x;  address %x pa %x, pgtype %d; pc %x\n",
-	 index, value, address, pa, pgtype, m68k_get_reg(NULL, M68K_REG_PC));
-
-  if (trace_mmu_bin) {
-    trace_file_pte_set(address, pa, pgtype, (sysen_reg & SUN2_SYSENABLE_EN_BOOTN) ? 1 : 0, value);
+  /* Byte-granular PTE update: low 2 bits of address pick which byte of the
+     32-bit PTE is targeted (big-endian: offset 0 = bits 31..24, ...,
+     offset 3 = bits 7..0).  Matches RetroCore Sun2MMU.cs:397-407.  Without
+     this, byte/word writes silently clobbered the other PTE bytes. */
+  unsigned int offset = address & 0x3;
+  unsigned int cur = pgmap[index];
+  unsigned int newval;
+  switch (size) {
+  case 1: {
+    unsigned int shift = (3 - offset) * 8;
+    newval = (cur & ~(0xffu << shift)) | ((value & 0xff) << shift);
+    break;
+  }
+  case 2: {
+    /* word writes target offset 0 (high half) or 2 (low half) */
+    unsigned int shift = (2 - (offset & 0x2)) * 8;
+    newval = (cur & ~(0xffffu << shift)) | ((value & 0xffff) << shift);
+    break;
+  }
+  case 4:
+  default:
+    newval = value;
+    break;
   }
 
-  pgmap[index] = value;
+  pa = (newval & PTE_PGFRAME) << PAGE_SIZE_LOG2;
+  pgtype = (newval & PTE_PGTYPE) >> PTE_PGTYPE_SHIFT;
+
+  if (trace_mmu_rw)
+  printf("pgmap: write pgmap[0x%x] <- %x (was %x, sz %d off %d);  address %x pa %x, pgtype %d; pc %x\n",
+	 index, newval, cur, size, offset, address, pa, pgtype, m68k_get_reg(NULL, M68K_REG_PC));
+
+  if (trace_mmu_bin) {
+    trace_file_pte_set(address, pa, pgtype, (sysen_reg & SUN2_SYSENABLE_EN_BOOTN) ? 1 : 0, newval);
+  }
+
+  pgmap[index] = newval;
 }
 
 unsigned int pgmap_read(unsigned int address, int size)
 {
-  unsigned int value;
+  unsigned int value, full;
 
   unsigned int segindex = (((address >> 15) & 0x1ff) << 3) | context_user_reg;
   unsigned int pmeg = segmap[segindex];
   unsigned int index = (pmeg << 4) | ((address >> 11) & 0xf);
+  unsigned int offset = address & 0x3;
 
-  value = pgmap[index];
+  full = pgmap[index];
+
+  /* Byte-granular extract matching pgmap_write semantics. */
+  switch (size) {
+  case 1: {
+    unsigned int shift = (3 - offset) * 8;
+    value = (full >> shift) & 0xff;
+    break;
+  }
+  case 2: {
+    unsigned int shift = (2 - (offset & 0x2)) * 8;
+    value = (full >> shift) & 0xffff;
+    break;
+  }
+  case 4:
+  default:
+    value = full;
+    break;
+  }
 
   if (trace_mmu_rw)
-  printf("pgmap: read address %x value %x; index %x\n",
-	 address, value, index);
+  printf("pgmap: read address %x value %x (full %x sz %d off %d); index %x\n",
+	 address, value, full, size, offset, index);
 
   return value;
 }
@@ -406,11 +529,22 @@ unsigned int pgmap_read(unsigned int address, int size)
 void segmap_write(unsigned int address, unsigned int value, int size)
 {
   unsigned int index;
+  unsigned int offset = address & 0x1;   /* 0 = high byte (no-op), 1 = data byte */
 
   index = (((address >> 15) & 0x1ff) << 3) | context_user_reg;
-  segmap[index] = value;
 
-  //printf("mmu: segmap write %x <- %x (%d)\n", address, value, size);
+  /* Per RetroCore Sun2MMU.cs:415-422 — segmap entries are 8 bits wide.
+     A byte write to offset 4 (high byte) is a no-op; only offset 5 stores
+     data.  Word writes naturally land the data byte at offset 5 on a
+     big-endian machine, so size==2 stores the LOW 8 bits regardless. */
+  if (size == 1 && offset == 0) {
+    if (trace_mmu_rw)
+      printf("segmap: write address %x segmap[%x] <- %x (sz1 off0 NO-OP)\n",
+             address, index, value);
+    return;
+  }
+
+  segmap[index] = value;
 
   if (trace_mmu_rw)
   printf("segmap: write address %x segmap[%x] <- %x (%d)\n",
@@ -442,16 +576,17 @@ void context_write(unsigned int address, unsigned int value, int size)
     if (size == 2) {
       context_sys_reg = (value >> 8) & 0x7;
       context_user_reg = value & 0x7;
+      if (trace_mmu_rw) printf("CTX: sys<-%x user<-%x (word)\n", context_sys_reg, context_user_reg);
     }
     if (size == 1) {
       context_sys_reg = value & 0x7;
-      if (trace_mmu) printf("mmu: write sys context <- %x\n", value & 0x7);
+      if (trace_mmu_rw) printf("CTX: sys<-%x (byte)\n", context_sys_reg);
     }
     break;
   case sun2_context_reg+1:
     if (size == 1) {
       context_user_reg = value & 0x7;
-      if (trace_mmu) printf("mmu: write user context <- %x\n", value & 0x7);
+      if (trace_mmu_rw) printf("CTX: user<-%x (byte)\n", context_user_reg);
     }
     break;
   }
@@ -604,8 +739,12 @@ void mmu_write(unsigned int address, unsigned int value, int size)
   if (trace_mmu) printf("mmu: write %x <- %x (%d)\n", address, value, size);
 
   switch (address & 0x000f) {
+  /* pgmap PTE is a 4-byte register: byte/word writes can target any of
+     the 4 byte positions (offsets 0..3).  Long writes are aligned to 0. */
   case sun2_pgmap_reg:
   case sun2_pgmap_reg+1:
+  case sun2_pgmap_reg+2:
+  case sun2_pgmap_reg+3:
     pgmap_write(address, value, size);
     break;
   case sun2_segmap_reg:
@@ -640,6 +779,8 @@ unsigned int mmu_read(unsigned int address, int size)
   switch (address & 0x000f) {
   case sun2_pgmap_reg:
   case sun2_pgmap_reg+1:
+  case sun2_pgmap_reg+2:
+  case sun2_pgmap_reg+3:
     value = pgmap_read(address, size);
     break;
   case sun2_segmap_reg:
@@ -1390,6 +1531,14 @@ void cpu_write(int size, unsigned int address, unsigned int value)
 //    if (address > 0xe00000 || pa > 0xe00000)
 //      printf("cpu_write; OBMEM va %x pa %x size %d <- %x (pte %x)\n", address, pa, size, value, pte);
 
+    /* OBMEM unpopulated: PA 0x400000..0x6FFFFF on Sun-2/120 (4MB max RAM) — drop
+       writes silently, no bus error.  Matches RetroCore commit 0028975e
+       "Sun-2: Fix RAM size and MMU".  Symmetric with the read path which
+       already returns 0xFFFFFFFF for this range. */
+    if (pa >= (4*1024*1024) && pa < 0x700000) {
+      /* silently absorb */
+      break;
+    }
     if (pa >= 0x700000)
       cpu_write_obmem(pa, size, value);
     else {
@@ -1822,6 +1971,40 @@ g_trace = 1;
 	unsigned int d0;
 	d0 = m68k_get_reg(NULL, M68K_REG_D0);
 	collect_console(d0);
+      }
+      /* PROM putchar at 0xef50e4: char arg is on stack at A7+4 (long).
+	 Mirror every emitted char to stderr so we can see what tpboot/PROM
+	 prints during automated runs. */
+      if (m68k_get_reg(NULL, M68K_REG_PC) == 0xef50e4) {
+	extern unsigned char g_ram[];
+	unsigned int sp = m68k_get_reg(NULL, M68K_REG_SP);
+	unsigned int va = sp + 4 + 3;  /* low byte of long arg, big-endian */
+	unsigned int mtype, fault, pte;
+	unsigned int pa = cpu_map_address(va, 5, 0, &mtype, &fault, &pte);
+	unsigned char ch = g_ram[pa];
+	fprintf(stderr, "%c", ch);
+	fflush(stderr);
+      }
+      /* tpboot 'st: short transfer' print site at 0xa3c2c. Catch the
+	 trigger so we can correlate it with the controller's residual.
+	 Per Docs/sun-scsi-tpboot.md §4: requested_length lives at -0x1c(A6),
+	 print-enable flag at +0x10(A6). scsi_cmd_buf still holds the most
+	 recent CDB at this point (size resets but bytes persist). */
+      if (m68k_get_reg(NULL, M68K_REG_PC) == 0xa3c2c) {
+	extern unsigned char scsi_cmd_buf[];
+	unsigned int d7  = m68k_get_reg(NULL, M68K_REG_D7);
+	unsigned int sp  = m68k_get_reg(NULL, M68K_REG_SP);
+	unsigned int a6  = m68k_get_reg(NULL, M68K_REG_A6);
+	unsigned int req = m68k_read_memory_32(a6 - 0x1c);
+	unsigned int flg = m68k_read_memory_32(a6 + 0x10);
+	printf("\n>>> tpboot st:short-transfer trigger D7=%u "
+	       "requested=%u(0x%x) enable_print=%u "
+	       "CDB=%02x %02x %02x %02x %02x %02x SP=%x A6=%x\n",
+	       d7, req, req, flg,
+	       scsi_cmd_buf[0], scsi_cmd_buf[1], scsi_cmd_buf[2],
+	       scsi_cmd_buf[3], scsi_cmd_buf[4], scsi_cmd_buf[5],
+	       sp, a6);
+	fflush(stdout);
       }
 #endif
 

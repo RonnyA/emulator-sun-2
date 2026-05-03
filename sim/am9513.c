@@ -20,7 +20,18 @@ struct am9513_ctr_s {
   unsigned short load;
   unsigned short hold;
   unsigned short cntr;
-} am9513_ctr[6];
+};
+
+/* Datasheet: after Master Reset every Counter Mode register holds 0x0B00.
+   We zero index 0 (unused — counters are addressed 1..5). */
+struct am9513_ctr_s am9513_ctr[6] = {
+  { 0,      0, 0, 0 },
+  { 0x0b00, 0, 0, 0 },
+  { 0x0b00, 0, 0, 0 },
+  { 0x0b00, 0, 0, 0 },
+  { 0x0b00, 0, 0, 0 },
+  { 0x0b00, 0, 0, 0 },
+};
 
 unsigned int am9513_status = 0x0b00;
 unsigned int am9513_data_ptr;
@@ -170,7 +181,28 @@ void am9513_wr_cmd(unsigned int value)
 
   //if ((value & 0xff) != 0xe1) printf("am9513_wr_cmd; cmd %x ", value);
   switch (value & 0xff) {
-  case 0xff: if (trace_am9513) printf("am9513: reset\n"); return;
+  case 0xff:
+    /* Master Reset: per datasheet, disarms all counters, zeros Master
+       Mode / Load / Hold registers and sets every Counter Mode register
+       to 0x0B00.  Also clear the IRQ-pending flags so a stray edge
+       isn't latched after reset. */
+    if (trace_am9513) printf("am9513: reset\n");
+    {
+      int j;
+      for (j = 1; j < 6; j++) {
+        am9513_ctr[j].mode = 0x0b00;
+        am9513_ctr[j].load = 0;
+        am9513_ctr[j].hold = 0;
+        am9513_ctr[j].cntr = 0;
+      }
+      am9513_armed_bits = 0;
+      am9513_output_bits = 0;
+      am9513_irq_t1 = 0;
+      am9513_irq_t2 = 0;
+      am9513_data_ptr = 0;
+      am9513_data_ptr_byte = 0;
+    }
+    return;
   case 0xe7: if (trace_am9513) printf("am9513: clr mm13\n"); return;
   case 0xe6: if (trace_am9513) printf("am9513: clr mm12\n"); return;
   case 0xe0: if (trace_am9513) printf("am9513: clr mm14\n"); return;
@@ -205,17 +237,20 @@ void am9513_wr_cmd(unsigned int value)
   case 0xa0:
     if (trace_am9513) printf("am9513: save hold\n");
 
+    /* SAVE: copy counter -> HOLD (datasheet).  S5..S1 select counters in
+       value bits 4..0; previous code used '&&' (logical) and wrong shift,
+       so SAVE always clobbered all five counters' LOAD registers. */
     for (i = 1; i < 6; i++) {
-      if (value && (1 << i))
-	am9513_ctr[i].load = am9513_ctr[i].cntr;
+      if (value & (1 << (i - 1)))
+	am9513_ctr[i].hold = am9513_ctr[i].cntr;
     }
     return;
   case 0x80:
     if (trace_am9513) printf("am9513: disarm and save\n");
 
     for (i = 1; i < 6; i++) {
-      if (value && (1 << i))
-	am9513_ctr[i].load = am9513_ctr[i].cntr;
+      if (value & (1 << (i - 1)))
+	am9513_ctr[i].hold = am9513_ctr[i].cntr;
     }
     bits = value & 0x1f;
     am9513_armed_bits &= ~(bits << 1);
@@ -232,7 +267,7 @@ void am9513_wr_cmd(unsigned int value)
     }
 
     for (i = 1; i < 6; i++) {
-      if (value && (1 << i))
+      if (value & (1 << (i - 1)))
 	am9513_ctr[i].cntr = am9513_ctr[i].load;
     }
     bits = value & 0x1f;
@@ -250,7 +285,7 @@ void am9513_wr_cmd(unsigned int value)
     }
 
     for (i = 1; i < 6; i++) {
-      if (value && (1 << i))
+      if (value & (1 << (i - 1)))
 	am9513_ctr[i].cntr = am9513_ctr[i].load;
     }
     return;
