@@ -705,12 +705,15 @@ int m68k_execute(int num_cycles)
 
 #if 1
 		if (m68ki_fault_pending) {
+			extern int quiet;
 			int i;
 			for (i = 0; i < 16; i++) {
 				if (m68ki_cpu.dar[i] != save_regs[i]) {
-					printf("fault: ");
-					if (i < 8) printf("D%d", i); else printf("A%d", i-8);
-					printf(" changed; old %08x new %08x\n", save_regs[i], m68ki_cpu.dar[i]);
+					if (!quiet) {
+						printf("fault: ");
+						if (i < 8) printf("D%d", i); else printf("A%d", i-8);
+						printf(" changed; old %08x new %08x\n", save_regs[i], m68ki_cpu.dar[i]);
+					}
 					// fix
 					m68ki_cpu.dar[i] = save_regs[i];
 				}

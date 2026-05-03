@@ -668,14 +668,14 @@ unsigned int cpu_read_mbio(unsigned int address, int size)
 {
   unsigned int value;
   value = 0xffffffff;
-  if (1) printf("cpu_read_mbio address %x (%d) -> %x\n", address, size, value);
+  if (!quiet) printf("cpu_read_mbio address %x (%d) -> %x\n", address, size, value);
   pending_buserr();
   return value;
 }
 
 void cpu_write_mbio(unsigned int address, int size, unsigned int value)
 {
-  if (1) printf("cpu_write_mbio address %x (%d) <- %x\n", address, size, value);
+  if (!quiet) printf("cpu_write_mbio address %x (%d) <- %x\n", address, size, value);
   pending_buserr();
 }
 
@@ -1014,10 +1014,14 @@ void int_controller_set(unsigned int value)
       g_int_controller_highest_int = value;
       if (INTS_ENABLED) {
 	m68k_set_irq(g_int_controller_highest_int);
-      } else
+      } else if (!quiet)
 	printf("sim68k: ints not enabled; set %d\n", value);
     }
-  else printf("sim68k: tried to set irq %d (old_pending 0x%x, controller_pending 0x%x. highest_int %d)\n",
+  else if (!quiet)
+    /* Fires every time an IRQ is raised while a previous one is still
+       pending (or at lower priority).  Normal under network load —
+       the 3C400 fires IRQ_SW_INT3 per packet — so gate behind -q. */
+    printf("sim68k: tried to set irq %d (old_pending 0x%x, controller_pending 0x%x. highest_int %d)\n",
 	      value, old_pending, g_int_controller_pending, g_int_controller_highest_int);
 }
 
@@ -1295,7 +1299,8 @@ unsigned int cpu_read(int size, unsigned int address)
       break;
 
     case PGTYPE_MBIO:
-      printf("cpu_read: MBIO; address %x pa %x size %d pte %x\n", address, pa, size, pte);
+      if (!quiet)
+        printf("cpu_read: MBIO; address %x pa %x size %d pte %x\n", address, pa, size, pte);
       value = cpu_read_mbio(pa, size);
       break;
 
