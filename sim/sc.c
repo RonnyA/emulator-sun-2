@@ -154,7 +154,7 @@ unsigned int sc_read(unsigned address, int size)
 
   case 0xc:
     value = sc_dma_count;
-    if (trace_sc) printf("sc: read dma_count %x\n", sc_dma_count);
+    if (trace_sc) printf("sc: read dma_count %04x\n", sc_dma_count);
     break;
 
   default:
@@ -211,7 +211,7 @@ void sc_write(unsigned int address, int size, unsigned int value)
 
   case 0xc:
     sc_dma_count = value;
-    if (trace_sc) printf("sc: write dma_count %x (%d)\n", sc_dma_count, sc_dma_count);
+    if (trace_sc) printf("sc: write dma_count %04x\n", sc_dma_count);
     break;
 
   case 0xf:
@@ -239,6 +239,10 @@ void sc_dma_read_data(unsigned char *buf, int bufsiz)
   int i;
   extern unsigned char g_ram[];
 
+  unsigned short dc_before = sc_dma_count;
+  if (trace_sc && bufsiz <= 32)
+    printf("sc: dma_read enter bufsiz=%d dma_count=%04x\n", bufsiz, dc_before);
+
   if (trace_armed) {
     unsigned int va, pa, mtype, fault, pte;
 
@@ -254,7 +258,16 @@ void sc_dma_read_data(unsigned char *buf, int bufsiz)
   }
 #endif
 
-  for (i = 0; i < bufsiz; i++) {
+  /* For odd lengths, real Sun-2 SC hardware DMA-transfers (bufsiz-1)
+     bytes and parks the last byte in sc_data with ODD_LENGTH set.  The
+     PROM's scsi_transfer (0xef8eb0 area) detects ODD_LENGTH after the
+     transfer, reads sc_data, writes it to (DMA_addr + N - 1) itself,
+     and adjusts dma_count by +1 to compensate.  If we tick dma_count
+     for ALL N bytes, the PROM's +1 over-shoots and the mode-2
+     promotion gate at 0xef9650 fails -> "st: error 80" cosmetic noise. */
+  int dma_n = (bufsiz & 1) ? (bufsiz - 1) : bufsiz;
+
+  for (i = 0; i < dma_n; i++) {
     unsigned int mtype, fault;
     unsigned int va, pa, pte;
 
@@ -266,19 +279,16 @@ void sc_dma_read_data(unsigned char *buf, int bufsiz)
     sc_dma_count++;
   }
 
-  /* Note: PROM's "sd: short transfer" diagnostic at PC 0xef9448 is NOT
-     driven by the DMA-count register — measurements show count_post is
-     already 0xFFFF (= -1, perfect transfer) after a 512-byte read.
-     The check must be on a different residue indicator (SCSI message
-     phase, controller status bit, or scsi-byte-counter).  Test still
-     passes with the warnings — RetroCore TODO.txt notes the same. */
-
   if (bufsiz & 1) {
     sc_icr |= SC_ICR_ODD_LENGTH;
     sc_data = buf[bufsiz-1];
-    if (trace_sc) printf("sc: setting odd length %d\n", bufsiz);
+    if (trace_sc) printf("sc: setting odd length %d (holding=%02x)\n", bufsiz, sc_data);
   } else
     sc_icr &= ~SC_ICR_ODD_LENGTH;
+
+  if (trace_sc && bufsiz <= 32)
+    printf("sc: dma_read exit  bufsiz=%d dma_count=%04x (delta=%d)\n",
+           bufsiz, sc_dma_count, (unsigned short)(sc_dma_count - dc_before));
 }
 
 void sc_reset_odd_len(void)
@@ -318,10 +328,11 @@ void sc_dma_write_data(unsigned char *buf, int bufsiz)
     sc_dma_count++;
   }
 
-  if (bufsiz & 1)
-    sc_icr |= SC_ICR_ODD_LENGTH;
-  else
-    sc_icr &= ~SC_ICR_ODD_LENGTH;
+  /* DATA OUT: host clocks every byte through the controller; nothing is
+     parked in the holding register.  Leaving ODD_LENGTH set on odd-length
+     transfers makes tpboot's post-write fixup subtract 1, producing a
+     spurious residual ("st: short transfer" on MODE SELECT len=13). */
+  sc_icr &= ~SC_ICR_ODD_LENGTH;
 }
 
 unsigned int sc_get_data(void)

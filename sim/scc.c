@@ -7,6 +7,7 @@
 
 #include <stdio.h>
 #include <stdint.h>
+#include <unistd.h>
 
 #include "sim68k.h"
 #include "m68k.h"
@@ -200,16 +201,16 @@ void scc_wr_ctl(int ch, int value, int size)
       scc_rr[ch][reg] = value;
       break;
     case 9:
-      printf("scc%d: wr9 <- %02x (%d)\n", ch, value, size);
+      if (trace_scc) printf("scc%d: wr9 <- %02x (%d)\n", ch, value, size);
 
       if (scc_wr[ch][9] & WR9_MIE) {
 	if ((scc_ints[ch] & 0x80) == 0) {
-	  printf("scc%d: MIE enabled\n", ch);
+	  if (trace_scc) printf("scc%d: MIE enabled\n", ch);
 	  scc_ints[ch] |= 0x80;
 	}
       } else {
 	if (scc_ints[ch] & 0x80) {
-	  printf("scc%d: MIE disabled\n", ch);
+	  if (trace_scc) printf("scc%d: MIE disabled\n", ch);
 	  scc_ints[ch] &= ~0x80;
 	}
       }
@@ -232,24 +233,24 @@ void scc_wr_ctl(int ch, int value, int size)
 
     if (scc_wr[ch][1] & WR1_TX_INT_EN) {
       if ((scc_ints[ch] & 0x01) == 0) {
-	  printf("scc%d: TX int enabled\n", ch);
+	  if (trace_scc) printf("scc%d: TX int enabled\n", ch);
 	  scc_ints[ch] |= 0x01;
       }
     } else {
       if (scc_ints[ch] & 0x01) {
-	printf("scc%d: TX int disabled\n", ch);
+	if (trace_scc) printf("scc%d: TX int disabled\n", ch);
 	scc_ints[ch] &= ~0x01;
       }
     }
 
     if (scc_wr[ch][1] & (WR1_RX_INT_EN0|WR1_RX_INT_EN1)) {
       if ((scc_ints[ch] & 0x02) == 0) {
-	  printf("scc%d: RX int enabled\n", ch);
+	  if (trace_scc) printf("scc%d: RX int enabled\n", ch);
 	  scc_ints[ch] |= 0x02;
       }
     } else {
       if (scc_ints[ch] & 0x02) {
-	printf("scc%d: RX int disabled\n", ch);
+	if (trace_scc) printf("scc%d: RX int disabled\n", ch);
 	scc_ints[ch] &= ~0x02;
       }
     }

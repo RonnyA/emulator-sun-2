@@ -14,7 +14,8 @@ So I wrote this to learn about the MMU and, well SCSI.  My goal is to
 eventually create an FPGA version of the Sun-2.
 
 It now boots SunOS 2.0, 3.2, and 3.5 cleanly.  You can install from the distribution tapes.
-The SCSI emulation code is still shakey for tapes, however.
+Tape boot through the standalone copy program is silent (no `st: short transfer`
+warnings) — see `Docs/sun-scsi-tpboot.md` for the controller-side rules.
 
 SunOS 2.0 will boot multiuser and works as you'd expect.
 
