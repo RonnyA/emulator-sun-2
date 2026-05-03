@@ -31,6 +31,8 @@
 struct net_iface_s {
     pcap_t *p;
     char    errbuf[PCAP_ERRBUF_SIZE];
+    uint8_t mac[6];   /* our MAC, used to drop self-echoes from promisc capture */
+    int     have_mac; /* mac[] was supplied at open time */
 };
 
 const char *net_backend_name(void) { return "pcap"; }
@@ -128,8 +130,6 @@ static char *resolve_iface(const char *user, char *errbuf)
 
 net_iface_t *net_open(const char *iface, const uint8_t mac[6], int promiscuous)
 {
-    (void)mac; /* pcap doesn't need the MAC; the 3c400 filters in software */
-
     char errbuf[PCAP_ERRBUF_SIZE];
     char *picked = resolve_iface(iface, errbuf);
     if (!picked) return NULL;
@@ -160,6 +160,10 @@ net_iface_t *net_open(const char *iface, const uint8_t mac[6], int promiscuous)
     net_iface_t *nh = calloc(1, sizeof(*nh));
     if (!nh) { pcap_close(p); return NULL; }
     nh->p = p;
+    if (mac) {
+        memcpy(nh->mac, mac, 6);
+        nh->have_mac = 1;
+    }
     return nh;
 }
 
@@ -176,9 +180,30 @@ int net_recv(net_iface_t *nh, void *buf, size_t maxlen)
 
     struct pcap_pkthdr *hdr;
     const u_char *data;
-    int r = pcap_next_ex(nh->p, &hdr, &data);
-    if (r == 0) return 0;          /* timeout / no packet */
-    if (r < 0)  return -1;         /* error */
+
+    /* Loop: drop self-echoes (pcap in promisc mode sees our own TX) and
+       try the next packet.  Bound the inner loop so an extremely chatty
+       host (our MAC spoofed back to us, weird capture loops, etc.)
+       can't stall the emulator's main loop. */
+    int got = 0;
+    for (int attempts = 0; attempts < 16; attempts++) {
+        int r = pcap_next_ex(nh->p, &hdr, &data);
+        if (r == 0) return 0;          /* timeout / no packet right now */
+        if (r < 0)  return -1;         /* error */
+
+        /* Anti-echo filter: drop frames whose source MAC is our own.
+           Frame layout: dst[0..5] | src[6..11] | ...  Need at least 12
+           bytes to even check. */
+        if (nh->have_mac && hdr->caplen >= 12 &&
+            data[6]  == nh->mac[0] && data[7]  == nh->mac[1] &&
+            data[8]  == nh->mac[2] && data[9]  == nh->mac[3] &&
+            data[10] == nh->mac[4] && data[11] == nh->mac[5]) {
+            continue;  /* our own TX; skip */
+        }
+        got = 1;
+        break;
+    }
+    if (!got) return 0;  /* every attempt was a self-echo; come back next tick */
 
     size_t copy = hdr->caplen;
     if (copy > maxlen) copy = maxlen;

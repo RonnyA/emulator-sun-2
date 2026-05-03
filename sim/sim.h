@@ -9,6 +9,25 @@
 
 #include <stdint.h>
 #include <fcntl.h>
+#include <stdio.h>
+
+/*
+ * Debug build flag: TRACE_PRINTF
+ *
+ * When -DTRACE_PRINTF is set at compile time, every `printf()` call
+ * in the sim/ tree gets prefixed with [file:line] so it's obvious
+ * which source line is firing.  Used for one-off "where is this spam
+ * coming from" investigations.
+ *
+ * Build with:   make TRACE_PRINTF=1
+ * Then run normally — every output line carries its origin tag.
+ */
+#ifdef TRACE_PRINTF
+extern int sun2_dprintf(const char *file, int line, const char *fmt, ...);
+#define printf(...) sun2_dprintf(__FILE__, __LINE__, __VA_ARGS__)
+extern void sun2_dperror(const char *file, int line, const char *s);
+#define perror(s) sun2_dperror(__FILE__, __LINE__, (s))
+#endif
 
 /* On Windows, open() defaults to TEXT mode — \r\n is translated to \n on
    read, \n becomes \r\n on write, and 0x1A is treated as EOF.  That
@@ -53,6 +72,19 @@ void sun2_mode_print_list(void);
    --net-iface=NAME command line option, or the SUN2_NET_IFACE
    environment variable, or NULL if neither is given. */
 extern const char *g_net_iface;
+
+/* If non-zero, dump every RX/TX frame the 3C400 sees (to stderr).
+   Useful for comparing what we hand SunOS vs. what RetroCore's
+   E3C400Chip writes when triaging "ec0: garbled packet". */
+extern int g_net_dump;
+
+/* If non-zero, the keyboard is "not attached" — sun2_kb_write
+   ignores keyboard reset/bell commands and the SDL key callback
+   discards keystrokes.  When the PROM sees no reply to its
+   keyboard reset on SCC channel 3 it falls back to ttya (SCC
+   channel 0) for console I/O.  Combined with --scc-tcp this gives
+   a fully serial-console session over TCP. */
+extern int g_no_kbd;
 /* Build the IDPROM bytes for a given machine type, recompute byte-15 checksum. */
 void idprom_setup(unsigned char machine_type);
 

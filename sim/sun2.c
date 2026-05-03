@@ -372,6 +372,11 @@ unsigned int sun2_video_ctl_write(unsigned int address, int size, unsigned int v
 
 void sun2_kb_write(int value, int size)
 {
+    /* --no-kbd: stay silent on every keyboard command so the PROM's
+       reset-and-wait-for-reply times out, declares "no keyboard",
+       and switches its console to ttya (SCC channel 0). */
+    if (g_no_kbd) return;
+
     switch (value) {
     case 0x01: /* reset */
       scc_in_push(3, 0xff);
@@ -400,6 +405,11 @@ unsigned int map_sdl_to_sun2kb[512];
 void sun2_sdl_key(SDL_Keycode sdl_code, uint16_t modifiers, SDL_Scancode scancode, int down)
 {
   unsigned int mapped, shifted;
+
+  /* --no-kbd: the keyboard is "not attached" — discard SDL keystrokes
+     so they don't show up on SCC channel 3.  Use --scc-tcp + a telnet
+     client for input instead (lands on channel 0). */
+  if (g_no_kbd) return;
 
   if (0) printf("sdl: %u %u %u %d\n", sdl_code, modifiers, scancode, down);
 

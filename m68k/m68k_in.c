@@ -6796,7 +6796,7 @@ M68KMAKE_OP(movec, 32, rc, .)
 				return;
 			case 0x801:			   /* VBR */
 				REG_VBR = REG_DA[(word2 >> 12) & 15];
-printf("XXX write VBR %x @ pc %x\n", REG_VBR, REG_PC);
+{ extern int quiet; if (!quiet) printf("XXX write VBR %x @ pc %x\n", REG_VBR, REG_PC); }
 				return;
 			case 0x802:			   /* CAAR */
 				if(CPU_TYPE_IS_EC020_PLUS(CPU_TYPE))
@@ -9253,7 +9253,7 @@ M68KMAKE_OP(stop, 0, ., .)
 		uint new_sr = OPER_I_16();
 		m68ki_trace_t0();			   /* auto-disable (see m68kcpu.h) */
 		CPU_STOPPED |= STOP_LEVEL_STOP;
-printf("CPU STOP!\n");
+{ extern int quiet; if (!quiet) printf("CPU STOP!\n"); }
 		m68ki_set_sr(new_sr);
 		m68ki_remaining_cycles = 0;
 		return;

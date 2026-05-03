@@ -109,7 +109,7 @@ endif
 # ---------------------------------------------------------------------
 # Object list
 # ---------------------------------------------------------------------
-OBJ = sim.o sim68k.o sun2.o scc.o am9513.o mm58167.o 3c400.o sc.o scsi.o utils.o \
+OBJ = sim.o sim68k.o sun2.o scc.o scc_tcp.o am9513.o mm58167.o 3c400.o sc.o scsi.o utils.o \
 	$(NET_OBJ) \
 	m68kcpu.o m68kops.o m68kopac.o m68kopdm.o m68kopnz.o m68kdasm.o
 
@@ -143,12 +143,12 @@ ifeq ($(IS_WINDOWS),1)
     # "-mconsole" so the trace prints actually reach the terminal.
     ifneq ($(wildcard $(VENDORED_SDL2_DIR)/include/SDL2),)
         EXTRA_INC := -I$(VENDORED_SDL2_DIR)/include -I$(VENDORED_SDL2_DIR)/include/SDL2 -Dmain=SDL_main
-        SYS_LIBS  := -L$(VENDORED_SDL2_DIR)/lib -lmingw32 -lSDL2main -lSDL2 -mconsole -lws2_32
+        SYS_LIBS  := -L$(VENDORED_SDL2_DIR)/lib -lmingw32 -lSDL2main -lSDL2 -mconsole -lws2_32 -lpthread
     else
         EXTRA_INC := $(shell sdl2-config --cflags)
         SDL_LIBS_RAW := $(shell sdl2-config --libs)
-        # ws2_32 supplies htonl/htons on Windows.
-        SYS_LIBS  := $(filter-out -mwindows,$(SDL_LIBS_RAW)) -mconsole -lws2_32
+        # ws2_32 supplies htonl/htons + sockets; pthread for the SCC TCP server thread.
+        SYS_LIBS  := $(filter-out -mwindows,$(SDL_LIBS_RAW)) -mconsole -lws2_32 -lpthread
     endif
 else ifeq ($(UNAME_S),Darwin)
     EXTRA_INC := $(shell sdl2-config --cflags)
@@ -159,6 +159,12 @@ else ifeq ($(UNAME_S),NetBSD)
 else
     EXTRA_INC := $(shell sdl2-config --cflags)
     SYS_LIBS  := $(shell sdl2-config --libs) -lpthread
+endif
+
+# Optional debug aid: prefix every printf with [file:line].  Build with
+# `make TRACE_PRINTF=1` when chasing "where is this spam coming from".
+ifdef TRACE_PRINTF
+    DEFS += -DTRACE_PRINTF
 endif
 
 # -fcommon restores pre-GCC-10 tentative-definition handling.  The
@@ -187,6 +193,9 @@ sim68k.o: sim68k.c
 	$(CC) -c $(CFLAGS) $<
 
 sun2.o: sun2.c
+	$(CC) -c $(CFLAGS) $<
+
+scc_tcp.o: scc_tcp.c scc_tcp.h
 	$(CC) -c $(CFLAGS) $<
 
 net_bpf.o: net_bpf.c net.h
@@ -220,6 +229,14 @@ m68kdasm.o: $(M68K_SRC)/m68kdasm.c
 sim_res.o: sim.rc sun.ico
 	windres -i sim.rc -O coff -o sim_res.o
 
+test-scc: test_scc$(EXE_EXT)
+	./test_scc$(EXE_EXT)
+
+# Unit-test build: strip SDL's -Dmain=SDL_main (we don't link SDL2main here)
+# and the SDL include flags we don't actually need for a no-display SCC test.
+test_scc$(EXE_EXT): test_scc.c scc.c scc_tcp.h sim.h sim68k.h
+	$(CC) -I. -I$(M68K_SRC) $(NET_INC) -fcommon -DM68K_V33 -o $@ test_scc.c -lws2_32 -lpthread
+
 clean:
 	rm -f *.o
-	rm -f sim sim.exe
+	rm -f sim sim.exe test_scc test_scc.exe

@@ -124,20 +124,28 @@ struct transmit_header {
 	uint8_t unused : 5;
 };
 
-struct receive_header {
-	// First free byte, 11 bits, essentially an offset into the first free byte of the buffer (MEBASE + 1000 + MEAHDR + packet)
-	uint16_t firstfree : 11;
-	//  Framing error bit, set to 1 if there's a frame error
-	uint8_t framingerror : 1;
-	// Address match bit, set to 0, if it's destined for our address, 1 otherwise
-	uint8_t addressmatch : 1;
-	//  Range error bit, set to 1 if there's a range error
-	uint8_t rangeerror : 1;
-	// Broadcast bit, set to 0 if this is a broadcast, 1, if it is not
-	uint8_t broadcast : 1;
-	// FCS error bit, set to 1 if there's an FCS error
-	uint8_t fcserror : 1;
-};
+/*
+ * Receive-header bit masks — explicit bit ops on a uint16_t.  This
+ * replaces the previous bitfield struct because gcc's mixed-type
+ * bitfield rules put the uint8_t flag bits in a separate byte that
+ * fell outside the union's uint16_t accessor — so SunOS read the
+ * firstfree word with all flag bits zeroed, computed a bogus length,
+ * and logged "ec0: garbled packet" for every received frame.
+ *
+ * Layout (matches RetroCore E3C400Chip):
+ *   bit 15  FCSERROR   1 = FCS / CRC error
+ *   bit 14  BROADCAST  1 = dst MAC is FF:FF:FF:FF:FF:FF
+ *   bit 13  RANGEERR   1 = range error
+ *   bit 12  ADDRMATCH  1 = dst MAC matches our station MAC
+ *   bit 11  FRAMINGERR 1 = framing error
+ *   bit 10..0  DOFF    offset of first free byte in the buffer (= 2 + frame_len + 4)
+ */
+#define RX_DOFF       0x07FFu
+#define RX_FRAMINGERR 0x0800u
+#define RX_ADDRMATCH  0x1000u
+#define RX_RANGEERR   0x2000u
+#define RX_BROADCAST  0x4000u
+#define RX_FCSERR     0x8000u
 
 struct mac_addr {
 	uint8_t o1;
@@ -166,10 +174,15 @@ union txhdr {
 	uint16_t header;
 };
 
-union rxhdr {
-	struct receive_header hdr;
-	uint16_t header;
-};
+/* Just a uint16_t now; was a bitfield+union but gcc x86 didn't lay
+   the uint8_t flag bitfields out where SunOS expects them. */
+typedef uint16_t rxhdr_t;
+
+static inline unsigned rxhdr_doff(const rxhdr_t *h)        { return *h & RX_DOFF; }
+static inline void     rxhdr_set_doff(rxhdr_t *h, unsigned v) { *h = (*h & ~RX_DOFF) | (v & RX_DOFF); }
+static inline void     rxhdr_add_doff(rxhdr_t *h, int n)   { rxhdr_set_doff(h, rxhdr_doff(h) + n); }
+static inline void     rxhdr_set_flag(rxhdr_t *h, uint16_t m, int v) { *h = v ? (*h | m) : (*h & ~m); }
+static inline int      rxhdr_get_flag(const rxhdr_t *h, uint16_t m) { return (*h & m) != 0; }
 
 // Variable for the status register
 union csr *mecsr;
@@ -193,8 +206,8 @@ union txhdr *mexhdr;
 unsigned char *mexbuffer;
 
 // Receive headers A and B
-union rxhdr *meahdr;
-union rxhdr *mebhdr;
+rxhdr_t *meahdr;
+rxhdr_t *mebhdr;
 
 // Receive buffers
 unsigned char *meabuffer;
@@ -207,6 +220,87 @@ int trace_3c400 = 0;
 // or the host couldn't be opened (e.g. permissions on /dev/bpf*,
 // missing libpcap, no Npcap driver, etc).
 static net_iface_t *netif = NULL;
+
+// Dump a single Ethernet frame to stderr in a one-line summary.  Caller
+// provides the leading "[3c400 ...]" tag so different sites can include
+// extra context (PA, buffer A/B, deliver/drop).  Used by --net-dump.
+//
+// Decodes:
+//   ARP (0x0806)            -> "ARP req/reply  sender=IP target=IP"
+//   IPv4 / TCP   (0x0800,6) -> "src.ip:port -> dst.ip:port  TCP [SYN|ACK|...]"
+//   IPv4 / UDP   (0x0800,17)-> "src.ip:port -> dst.ip:port  UDP"
+//   IPv4 / ICMP  (0x0800,1) -> "src.ip -> dst.ip  ICMP type=N code=N"
+//   anything else            -> just src/dst MAC + ethertype
+static void dump_frame(const char *tag, const unsigned char *f, int len)
+{
+	if (len < 14) {
+		fprintf(stderr, "%s runt frame, len=%d\n", tag, len);
+		return;
+	}
+	unsigned ethtype = (f[12] << 8) | f[13];
+
+	/* Common L2 prefix. */
+	fprintf(stderr,
+		"%s len=%d  %02x:%02x:%02x:%02x:%02x:%02x -> %02x:%02x:%02x:%02x:%02x:%02x  type=%04x",
+		tag, len,
+		f[6], f[7], f[8], f[9], f[10], f[11],          /* src first, more readable */
+		f[0], f[1], f[2], f[3], f[4], f[5],
+		ethtype);
+
+	/* IPv4 */
+	if (ethtype == 0x0800 && len >= 14 + 20) {
+		const unsigned char *ip = f + 14;
+		unsigned ihl = (ip[0] & 0x0f) * 4;
+		unsigned proto = ip[9];
+		unsigned tlen = (ip[2] << 8) | ip[3];
+		const char *pname =
+			proto == 1  ? "ICMP" :
+			proto == 6  ? "TCP"  :
+			proto == 17 ? "UDP"  : NULL;
+
+		fprintf(stderr, "  %u.%u.%u.%u",
+			ip[12], ip[13], ip[14], ip[15]);
+		fprintf(stderr, " -> %u.%u.%u.%u",
+			ip[16], ip[17], ip[18], ip[19]);
+		if (pname) fprintf(stderr, "  %s", pname);
+		else       fprintf(stderr, "  proto=%u", proto);
+		fprintf(stderr, " tlen=%u", tlen);
+
+		const unsigned char *l4 = f + 14 + ihl;
+		int l4_avail = len - (14 + ihl);
+		if (proto == 6 && l4_avail >= 14) {       /* TCP */
+			unsigned sport = (l4[0] << 8) | l4[1];
+			unsigned dport = (l4[2] << 8) | l4[3];
+			unsigned char flags = l4[13];
+			fprintf(stderr, " %u->%u flags=", sport, dport);
+			if (flags & 0x01) fprintf(stderr, "F");
+			if (flags & 0x02) fprintf(stderr, "S");
+			if (flags & 0x04) fprintf(stderr, "R");
+			if (flags & 0x08) fprintf(stderr, "P");
+			if (flags & 0x10) fprintf(stderr, "A");
+			if (flags & 0x20) fprintf(stderr, "U");
+			if (!flags) fprintf(stderr, "-");
+		} else if (proto == 17 && l4_avail >= 4) { /* UDP */
+			unsigned sport = (l4[0] << 8) | l4[1];
+			unsigned dport = (l4[2] << 8) | l4[3];
+			fprintf(stderr, " %u->%u", sport, dport);
+		} else if (proto == 1 && l4_avail >= 4) {  /* ICMP */
+			fprintf(stderr, " icmp_type=%u code=%u", l4[0], l4[1]);
+		}
+	}
+	/* ARP */
+	else if (ethtype == 0x0806 && len >= 28 + 14) {
+		const unsigned char *a = f + 14;
+		unsigned op = (a[6] << 8) | a[7];
+		const char *opn = op == 1 ? "req" : op == 2 ? "reply" : "?";
+		fprintf(stderr, "  ARP %s  sender %u.%u.%u.%u  target %u.%u.%u.%u",
+			opn,
+			a[14], a[15], a[16], a[17],
+			a[24], a[25], a[26], a[27]);
+	}
+
+	fprintf(stderr, "\n");
+}
 // Slowdown counter which prevents the network read code from running
 // on every I/O iteration since it slows down the emulator significantly.
 uint32_t bpfscan = 0;
@@ -256,87 +350,66 @@ int32_t e3c400_device_ack() {
 // The alternative is to run the emulator as root, which is A VERY BAD IDEA(TM)
 // You should also set the bpf device and network device (near the top of this file)
 
-// Check whether this packet is desirable, depending on the adapter mode, and PA settings
+// Check whether this packet is desirable, depending on the adapter mode, and PA settings.
+//
+// Receive header bit polarity (matches RetroCore's E3C400Chip and what
+// the SunOS if_ec driver expects):
+//   broadcast    = 1  -> dst MAC is FF:FF:FF:FF:FF:FF (broadcast)
+//   addressmatch = 1  -> dst MAC matches our station MAC
+// (The previous "reversed" convention had these inverted, which made
+// SunOS log "ec0: garbled packet" on every received frame.)
 uint8_t is_mypacket(unsigned char buffer) {
-	// Check which buffer we're checking
 	if(buffer == 'A') {
-		//  Check if packet is broadcast packet
-		//  Note that this is reversed, bit is set, if packet is not a broadcast
 		if(meabuffer[0] == 0xff && meabuffer[1] == 0xff && meabuffer[2] == 0xff && meabuffer[3] == 0xff && meabuffer[4] == 0xff && meabuffer[5] == 0xff) {
-			meahdr->hdr.broadcast = 0;
-			if(trace_3c400)
-				printf("Incoming packet is destined to buffer A and is a broadcast packet\n");
+			rxhdr_set_flag(meahdr, RX_BROADCAST, 1);
+			if(trace_3c400) printf("buffer A: broadcast packet\n");
 		} else {
-			meahdr->hdr.broadcast = 1;
-			if(trace_3c400)
-				printf("Incoming packet is destined to buffer A and is a regular packet\n");
+			rxhdr_set_flag(meahdr, RX_BROADCAST, 0);
+			if(trace_3c400) printf("buffer A: regular packet\n");
 		}
-		// Check if destined to us, this again is reversed, bit is set if packet is not addressed to us
-		if(meabuffer[0] == macaddr[0] && meabuffer[1] == macaddr[1] && meabuffer[2] == macaddr[2] && 
-	           meabuffer[3] == macaddr[3] && meabuffer[4] == macaddr[4] && meabuffer[5] == macaddr[5]) {
-			meahdr->hdr.addressmatch = 0;
-			if(trace_3c400)
-				printf("Incoming packet is destined to buffer A and is destined to us\n");
+		if(meabuffer[0] == macaddr[0] && meabuffer[1] == macaddr[1] && meabuffer[2] == macaddr[2] &&
+		   meabuffer[3] == macaddr[3] && meabuffer[4] == macaddr[4] && meabuffer[5] == macaddr[5]) {
+			rxhdr_set_flag(meahdr, RX_ADDRMATCH, 1);
+			if(trace_3c400) printf("buffer A: destined to us\n");
 		} else {
-			meahdr->hdr.addressmatch = 1;
-			if(trace_3c400)
-				printf("Incoming packet was destined to buffer A but does not belong to us\n");
+			rxhdr_set_flag(meahdr, RX_ADDRMATCH, 0);
+			if(trace_3c400) printf("buffer A: not for us\n");
 		}
-		//  Any setting of all packets means every packet will be delivered, error packets won't make it to us anyway
+		// PA 0/1/2 = promiscuous; everything is delivered.
 		if(mecsr->csr.pa == 0 || mecsr->csr.pa == 1 || mecsr->csr.pa == 2) {
-			if(trace_3c400)
-				printf("Promiscious mode, all packets should be delivered to CPU\n");
+			if(trace_3c400) printf("Promiscuous mode, deliver\n");
 			return 1;
-		// Any other setting means delivering all packets destined to us, and all broadcast packets, the multicast settings are ignored..
-		} else {
-			// If addressed to us, or broadcast
-			if(meahdr->hdr.addressmatch == 0 || meahdr->hdr.broadcast == 0) {
-				if(trace_3c400)
-					printf("Packet should be delivered to CPU\n");
-				return 1;
-			}
-			
-		} 
+		}
+		// Otherwise deliver only frames addressed to us or broadcast.
+		if(rxhdr_get_flag(meahdr, RX_ADDRMATCH) || rxhdr_get_flag(meahdr, RX_BROADCAST)) {
+			if(trace_3c400) printf("Deliver to CPU\n");
+			return 1;
+		}
 	} else if(buffer == 'B') {
-		//  Check if packet is broadcast packet
-		//  Note that this is reversed, bit is set, if packet is not a broadcast
 		if(mebbuffer[0] == 0xff && mebbuffer[1] == 0xff && mebbuffer[2] == 0xff && mebbuffer[3] == 0xff && mebbuffer[4] == 0xff && mebbuffer[5] == 0xff) {
-			mebhdr->hdr.broadcast = 0;
-			if(trace_3c400)
-				printf("Incoming packet is destined to buffer B and is a broadcast packet\n");
+			rxhdr_set_flag(mebhdr, RX_BROADCAST, 1);
+			if(trace_3c400) printf("buffer B: broadcast packet\n");
 		} else {
-			mebhdr->hdr.broadcast = 1;
-			if(trace_3c400)
-				printf("Incoming packet is destined to buffer B and is a regular packet\n");
+			rxhdr_set_flag(mebhdr, RX_BROADCAST, 0);
+			if(trace_3c400) printf("buffer B: regular packet\n");
 		}
-		// Check if destined to us, this again is reversed, bit is set if packet is not addressed to us
-		if(mebbuffer[0] == macaddr[0] && mebbuffer[1] == macaddr[1] && mebbuffer[2] == macaddr[2] && 
-	           mebbuffer[3] == macaddr[3] && mebbuffer[4] == macaddr[4] && mebbuffer[5] == macaddr[5]) {
-			mebhdr->hdr.addressmatch = 0;
-			if(trace_3c400)
-				printf("Incoming packet is destined to buffer B and is destined to us\n");
+		if(mebbuffer[0] == macaddr[0] && mebbuffer[1] == macaddr[1] && mebbuffer[2] == macaddr[2] &&
+		   mebbuffer[3] == macaddr[3] && mebbuffer[4] == macaddr[4] && mebbuffer[5] == macaddr[5]) {
+			rxhdr_set_flag(mebhdr, RX_ADDRMATCH, 1);
+			if(trace_3c400) printf("buffer B: destined to us\n");
 		} else {
-			mebhdr->hdr.addressmatch = 1;
-			if(trace_3c400)
-				printf("Incoming packet was destined to buffer B but does not belong to us\n");
+			rxhdr_set_flag(mebhdr, RX_ADDRMATCH, 0);
+			if(trace_3c400) printf("buffer B: not for us\n");
 		}
-		//  Any setting of all packets means every packet will be delivered, error packets won't make it to us anyway
 		if(mecsr->csr.pa == 0 || mecsr->csr.pa == 1 || mecsr->csr.pa == 2) {
-			if(trace_3c400)
-				printf("Promiscious mode, all packets should be delivered to CPU\n");
+			if(trace_3c400) printf("Promiscuous mode, deliver\n");
 			return 1;
-		// Any other setting means delivering all packets destined to us, and all broadcast packets, the multicast settings are ignored..
-		} else {
-			// If addressed to us, or broadcast
-			if(mebhdr->hdr.addressmatch == 0 || mebhdr->hdr.broadcast == 0) {
-				if(trace_3c400)
-					printf("Packet should be delivered to CPU\n");
-				return 1;
-			}
-			
-		} 
+		}
+		if(rxhdr_get_flag(mebhdr, RX_ADDRMATCH) || rxhdr_get_flag(mebhdr, RX_BROADCAST)) {
+			if(trace_3c400) printf("Deliver to CPU\n");
+			return 1;
+		}
 	}
-	// we never reach here
 	return 0;
 }
 
@@ -388,7 +461,10 @@ void handle_outgoing_packets() {
 			printf("\n");
 		// Send packet through whichever backend is active.
 		if(netif) {
-			int byteswritten = net_send(netif, &mexbuffer[firstbyte], 2048-firstbyte);
+			int sendlen = 2048 - firstbyte;
+			if (g_net_dump)
+				dump_frame("[3c400 TX]", &mexbuffer[firstbyte], sendlen);
+			int byteswritten = net_send(netif, &mexbuffer[firstbyte], sendlen);
 			if(trace_3c400)
 				printf("Bytes written to net(%s): %d\n", net_backend_name(), byteswritten);
 		}
@@ -414,13 +490,13 @@ void handle_incoming_packet() {
 				if(trace_3c400) {
 					printf("Packet delivered to buffer B, trace follows\n");
 					// Print it all out if we're tracing
-					for(p=0;p<mebhdr->hdr.firstfree;p++) {
+					for(p=0;p<rxhdr_doff(mebhdr);p++) {
 						if(trace_3c400) 
 							printf("%02x ",mebbuffer[p]);
 					}
 				}
 				// Increase firstfree by 6 since the OS skips the last 6 bytes of the packet in the buffer
-				mebhdr->hdr.firstfree += 6;
+				rxhdr_add_doff(mebhdr, 6);
 				// Set BBSW to zero to indicate we have a packet
 				mecsr->csr.bbsw = 0;
 				// Clear RBBA bit to indicate the most recent packet is in B
@@ -436,14 +512,14 @@ void handle_incoming_packet() {
 				if(trace_3c400) {
 					printf("Packet delivered to buffer A, trace follows\n");
 					// Print it all out if we're tracing
-					for(p=0;p<meahdr->hdr.firstfree;p++) {
+					for(p=0;p<rxhdr_doff(meahdr);p++) {
 						if(trace_3c400) 
 							printf("%02x ",meabuffer[p]);
 					}
-					printf("\nMeaHDR firstfree: %u\n",meahdr->hdr.firstfree);
+					printf("\nMeaHDR firstfree: %u\n",rxhdr_doff(meahdr));
 				}
 				// Increase firstfree by 6 since the OS skips the last 6 bytes of the packet in the buffer
-				meahdr->hdr.firstfree += 6;
+				rxhdr_add_doff(meahdr, 6);
 				// Set ABSW to zero to indicate we have a packet
 				mecsr->csr.absw = 0;
 				// Set RBBA bit to indicate that most recent packet is in A
@@ -461,13 +537,13 @@ void handle_incoming_packet() {
 			if(trace_3c400) {
 				printf("Packet delivered to buffer A, trace follows\n");
 				// Print it all out if we're tracing
-				for(p=0;p<meahdr->hdr.firstfree;p++) {
+				for(p=0;p<rxhdr_doff(meahdr);p++) {
 					if(trace_3c400) 
 						printf("%02x ",meabuffer[p]);
 				}
 			}
 			// Increase firstfree by 6 since the OS skips the last 6 bytes of the packet in the buffer
-			meahdr->hdr.firstfree += 6;
+			rxhdr_add_doff(meahdr, 6);
 			// Set ABSW to zero to indicate we have a packet
 			mecsr->csr.absw = 0;
 			// Set RBBA to 1 to indicate most recent packet is in A
@@ -484,13 +560,13 @@ void handle_incoming_packet() {
 			if(trace_3c400) {
 				printf("Packet delivered to buffer A, trace follows\n");
 				// Print it all out if we're tracing
-				for(p=0;p<meahdr->hdr.firstfree;p++) {
+				for(p=0;p<rxhdr_doff(meahdr);p++) {
 					if(trace_3c400) 
 						printf("%02x ",meabuffer[p]);
 				}
 			}
 			// Increase firstfree by 6 since the OS skips the last 6 bytes of the packet in the buffer
-			mebhdr->hdr.firstfree += 6;
+			rxhdr_add_doff(mebhdr, 6);
 			// Set BBSW to zero to indicate we have a packet
 			mecsr->csr.bbsw = 0;
 			// Clear RBBA bit to indicate the most recent packet is in B
@@ -536,8 +612,8 @@ void e3c400_init(void) {
 	mexbuffer = malloc(2048*sizeof(char *));
 
 	// Receive headers A and B
-	meahdr = malloc(sizeof(union rxhdr));
-	mebhdr = malloc(sizeof(union rxhdr));
+	meahdr = malloc(sizeof(rxhdr_t));
+	mebhdr = malloc(sizeof(rxhdr_t));
 
 	// Receive buffers
 	meabuffer = malloc(2048*sizeof(char *));
@@ -573,27 +649,28 @@ void e3c400_init(void) {
 	for(p=0;p<2046;p++)	
 		mexbuffer[p] = 0;
 
-	// Receive buffer A hdr
-	meahdr->hdr.firstfree=16;
-	meahdr->hdr.framingerror=0;
-	meahdr->hdr.addressmatch=1;
-	meahdr->hdr.rangeerror=0;
-	meahdr->hdr.broadcast=1;
-	meahdr->hdr.broadcast=1;
-	meahdr->hdr.fcserror=0;
+	// Receive buffer A hdr — initial values (overwritten when a real
+	// packet lands, so semantically just "no packet here yet").
+	// Bit polarity matches RetroCore E3C400Chip and SunOS if_ec:
+	//   broadcast / addressmatch = 1 means "yes, this packet is".
+	rxhdr_set_doff(meahdr, 16);
+	rxhdr_set_flag(meahdr, RX_FRAMINGERR, 0);
+	rxhdr_set_flag(meahdr, RX_ADDRMATCH, 0);
+	rxhdr_set_flag(meahdr, RX_RANGEERR, 0);
+	rxhdr_set_flag(meahdr, RX_BROADCAST, 0);
+	rxhdr_set_flag(meahdr, RX_FCSERR, 0);
 	//  Fill in the receive buffer itself with zeros
 	for(p=0;p<2046;p++)	
 		meabuffer[p] = 0;
 
 	
-	// Receive buffer B hdr
-	mebhdr->hdr.firstfree=16;
-	mebhdr->hdr.framingerror=0;
-	mebhdr->hdr.addressmatch=1;
-	mebhdr->hdr.rangeerror=0;
-	mebhdr->hdr.broadcast=1;
-	mebhdr->hdr.broadcast=1;
-	mebhdr->hdr.fcserror=0;
+	// Receive buffer B hdr — initial values (see receive buffer A above).
+	rxhdr_set_doff(mebhdr, 16);
+	rxhdr_set_flag(mebhdr, RX_FRAMINGERR, 0);
+	rxhdr_set_flag(mebhdr, RX_ADDRMATCH, 0);
+	rxhdr_set_flag(mebhdr, RX_RANGEERR, 0);
+	rxhdr_set_flag(mebhdr, RX_BROADCAST, 0);
+	rxhdr_set_flag(mebhdr, RX_FCSERR, 0);
 	//  Fill in the receive buffer itself with zeros
 	for(p=0;p<2046;p++)	
 		mebbuffer[p] = 0;
@@ -690,35 +767,92 @@ void e3c400_update(void) {
 				printf("3C400: %d bytes received from net(%s)\n",
 				       framelen, net_backend_name());
 
+			/* Match RetroCore E3C400Chip.ReceivePacket():
+			   - clamp the copy to 2046 bytes (the physical buffer
+			     size minus the 2-byte status word the real card
+			     prepends)
+			   - pad short frames up to the 60-byte Ethernet runt
+			     minimum; the kernel driver expects to see at least
+			     a full minimum-size frame */
+			int copy_len = (framelen > 2046) ? 2046 : framelen;
+			int reported_len = (copy_len < 60) ? 60 : copy_len;
+
+			/* Snapshot ABSW/BBSW so we can tell after handle_incoming_packet
+			   whether SunOS actually got this frame (=card released the
+			   buffer to host) or is_mypacket dropped it (=card kept it). */
+			unsigned char absw_before = mecsr->csr.absw;
+			unsigned char bbsw_before = mecsr->csr.bbsw;
+			unsigned char pa_at_rx    = mecsr->csr.pa;
+
 			whichbuffer = find_buffer();
-			if (whichbuffer == 'A') {
-				if (framelen < 2046) {
-					memcpy(&meabuffer[0], framebuf, framelen);
-					meahdr->hdr.firstfree = framelen;
-					handle_incoming_packet();
-				} else if (trace_3c400) {
-					/* Real 3C400 hardware drops oversized frames
-					   silently; pcap/Npcap can occasionally hand
-					   us a frame larger than the 2046-byte slot
-					   (jumbo frames, loopback, etc).  Don't spam
-					   under normal traffic. */
-					printf("3C400: rx frame %d > 2046, dropped (A)\n", framelen);
-				}
-			} else if (whichbuffer == 'B') {
-				if (framelen < 2046) {
-					memcpy(&mebbuffer[0], framebuf, framelen);
-					mebhdr->hdr.firstfree = framelen;
-					handle_incoming_packet();
-				} else if (trace_3c400) {
-					printf("3C400: rx frame %d > 2046, dropped (B)\n", framelen);
-				}
+			if (whichbuffer == 'A' || whichbuffer == 'B') {
+				unsigned char *rxbuf = (whichbuffer == 'A') ? meabuffer : mebbuffer;
+				rxhdr_t       *rxhdr = (whichbuffer == 'A') ? meahdr    : mebhdr;
+
+				/* Copy frame bytes; zero-pad short frames to the 60-byte
+				   Ethernet runt minimum so length math downstream matches
+				   what a real NIC would have padded. */
+				memcpy(rxbuf, framebuf, copy_len);
+				if (reported_len > copy_len)
+					memset(rxbuf + copy_len, 0, reported_len - copy_len);
+
+				/* pcap strips the 4-byte Ethernet FCS before delivering
+				   the frame (per tcpdump.org / Wireshark wiki: "Most
+				   Ethernet interfaces don't supply the FCS").  The 3C400
+				   delivers the FCS in its rx ring and SunOS's if_ec
+				   driver validates it — that's what the original "+6"
+				   comment "OS skips last 6 bytes" meant: 2-byte rxhdr +
+				   4-byte FCS.  Without a valid FCS appended, SunOS sees
+				   zeros at that offset, validation fails, and it logs
+				   "ec0: garbled packet" for every frame.
+
+				   Recompute the CRC32 over the frame data we just copied
+				   (post-padding so the FCS covers the whole 60-byte
+				   minimum) and append it in little-endian wire order. */
+				uint32_t fcs = crc32(rxbuf, reported_len);
+				rxbuf[reported_len + 0] = (uint8_t)(fcs       & 0xff);
+				rxbuf[reported_len + 1] = (uint8_t)(fcs >> 8  & 0xff);
+				rxbuf[reported_len + 2] = (uint8_t)(fcs >> 16 & 0xff);
+				rxbuf[reported_len + 3] = (uint8_t)(fcs >> 24 & 0xff);
+
+				rxhdr_set_doff(rxhdr, reported_len);
+				handle_incoming_packet();
 			} else {
 				/* Both rx slots full — kernel hasn't drained yet.
 				   This is normal under load; the real card just
 				   loses the frame. */
 				if (trace_3c400)
 					printf("3C400: no rx buffer free, frame dropped\n");
+				if (g_net_dump) {
+					char tag[64];
+					snprintf(tag, sizeof(tag), "[3c400 RX-NOBUF pa=%d]", pa_at_rx);
+					dump_frame(tag, framebuf, framelen);
+				}
 				return;
+			}
+
+			/* Decide whether handle_incoming_packet actually released
+			   the buffer to SunOS (=accepted) or kept it (=is_mypacket
+			   said not for us). */
+			int delivered = 0;
+			if (whichbuffer == 'A' && absw_before && !mecsr->csr.absw) delivered = 1;
+			if (whichbuffer == 'B' && bbsw_before && !mecsr->csr.bbsw) delivered = 1;
+
+			if (g_net_dump) {
+				/* For DELIVER lines, also show the 16-bit rxhdr value
+				   SunOS will read: bit 14=broadcast, bit 12=addrmatch,
+				   bit 15=fcserr, bits 0-10=firstfree.  Mismatch with
+				   what the driver expects = "ec0: garbled". */
+				unsigned hdr_val = (whichbuffer == 'A')
+				                 ? (*meahdr)
+				                 : (whichbuffer == 'B' ? (*mebhdr) : 0);
+				char tag[96];
+				snprintf(tag, sizeof(tag),
+				         "[3c400 %s pa=%d buf=%c hdr=%04x ff=%u]",
+				         delivered ? "DELIVER" : "DROP   ",
+				         pa_at_rx, whichbuffer,
+				         hdr_val, hdr_val & 0x07FF);
+				dump_frame(tag, framebuf, framelen);
 			}
 		}
 	}
@@ -762,11 +896,11 @@ uint32_t e3c400_read(uint32_t addr, int32_t size) {
 		}
 		if(trace_3c400) {
 			if(size == 4)
-				printf("Inside receive buffer A total length: %u, read addr: %x offset: %u value: %08x\n",meahdr->hdr.firstfree,addr,offset,retvalue);
+				printf("Inside receive buffer A total length: %u, read addr: %x offset: %u value: %08x\n",rxhdr_doff(meahdr),addr,offset,retvalue);
 			if(size == 2)
-				printf("Inside receive buffer A total length: %u, read addr: %x offset: %u value: %04x\n",meahdr->hdr.firstfree,addr,offset,retvalue);
+				printf("Inside receive buffer A total length: %u, read addr: %x offset: %u value: %04x\n",rxhdr_doff(meahdr),addr,offset,retvalue);
 			if(size == 1)
-				printf("Inside receive buffer A total length: %u, read addr: %x offset: %u value: %02x\n",meahdr->hdr.firstfree,addr,offset,retvalue);
+				printf("Inside receive buffer A total length: %u, read addr: %x offset: %u value: %02x\n",rxhdr_doff(meahdr),addr,offset,retvalue);
 		}
 		// Return the value
 		return retvalue;
@@ -914,7 +1048,7 @@ uint32_t e3c400_read(uint32_t addr, int32_t size) {
 			case 0xe1000:
 				// Reading the entire header
 				if(size==2)
-					return meahdr->header;
+					return (*meahdr);
 				else
 					printf("3C400: Uncaught Fetching of %u bytes from receive header A\n",size);
 				return -1;
@@ -923,7 +1057,7 @@ uint32_t e3c400_read(uint32_t addr, int32_t size) {
 			case 0xe1800:
 				// Reading the entire header
 				if(size==2)
-					return mebhdr->header;
+					return (*mebhdr);
 				else
 					printf("3C400: Uncaught Fetching of %u bytes from receive header B\n",size);
 				return -1;
@@ -947,10 +1081,15 @@ void e3c400_write(uint32_t addr, uint32_t size, uint32_t value) {
 		printf("3C400 Write addr: %x, value: %u, size: %d\n",addr,value,size);
 
 	if(addr == 0xe0000 && size==2) {
-		// The PA is the first 4 bits
-		mecsr->csr.pa = (value & 0xf)<<4;
+		// PA is a 4-bit field at bits 0-3 of the CSR.  Previously this
+		// did `(value & 0xf) << 4` which shifted the bits into 4-7;
+		// after bitfield truncation `pa` was always 0 → permanent
+		// promiscuous mode → SunOS saw every packet on the host LAN
+		// and logged "ec0: garbled" for each one not addressed to it.
+		// Matches RetroCore E3C400Chip CSR_PA = 0x000F.
+		mecsr->csr.pa = value & 0xf;
 		if(trace_3c400)
-			printf("3C400 Setting PA to %u\n",(value&0xf)<<4);
+			printf("3C400 Setting PA to %u\n", value & 0xf);
 		// Interrupt settings for jam, a/b receive buffers, transmit bufffer
 		mecsr->csr.jinten = (value & (1 << 4))>>4;
 		if(trace_3c400)

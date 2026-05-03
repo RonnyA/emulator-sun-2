@@ -26,6 +26,7 @@
 #include "sim68k.h"
 #include "m68k.h"
 #include "sim.h"
+#include "scc_tcp.h"
 
 
 /* Read/write macros */
@@ -690,6 +691,18 @@ unsigned int cpu_read_mbmem(unsigned int address, int size)
   // 3c400 board takes up 8k from e0000 to e2000, the address is dip settable but this is afaik the default and sufficient for our needs
   } else if(address >= 0xe0000 && address < 0xe2000) {
     value = e3c400_read(address, size);
+  } else if (address >= 0x80800 && address <= 0x80807) {
+    /* MBMEM 0x80800 is the GENERIC config slot for zs2, an OPTIONAL
+       Multibus serial expansion card.  Our scc.c only models ONE
+       chip (channels 0/1 for ttya/ttyb), and routing 0x80800 here
+       would alias zs2 onto zs0's state -- meaning SunOS's zsattach
+       for zs2 issues RESET_WORLD on the chip that's holding ttya
+       open as the console, clobbering its MIE/TIE/RIE state and
+       hanging interrupt-driven console output after the first
+       byte.  Bus-error the access so zs2's probe fails and SunOS
+       doesn't attach it. */
+    pending_buserr();
+    value = 0xffffffff;
   } else
     switch (address) {
 #if 0
@@ -698,6 +711,17 @@ unsigned int cpu_read_mbmem(unsigned int address, int size)
     break;
 #endif
   default:
+    {
+      static int probed = 0, enabled = 0;
+      if (!probed) {
+        probed = 1;
+        const char *e = getenv("MBMEM_TRACE");
+        enabled = (e && *e && *e != '0');
+      }
+      if (enabled)
+        fprintf(stderr, "mbmem unhandled read  %06x (%d)         pc=%06x\n",
+                address, size, (unsigned)m68k_get_reg(NULL, M68K_REG_PC));
+    }
     pending_buserr();
     break;
   }
@@ -717,9 +741,23 @@ void cpu_write_mbmem(unsigned int address, int size, unsigned int value)
     sc_write(address, size, value);
   } else if(address >= 0xe0000 && address <= 0xe2000) {
     e3c400_write(address, size, value);
+  } else if (address >= 0x80800 && address <= 0x80807) {
+    /* zs2 (Multibus expansion) is not modelled -- see cpu_read_mbmem. */
+    pending_buserr();
   } else
   switch (address) {
   default:
+    {
+      static int probed = 0, enabled = 0;
+      if (!probed) {
+        probed = 1;
+        const char *e = getenv("MBMEM_TRACE");
+        enabled = (e && *e && *e != '0');
+      }
+      if (enabled)
+        fprintf(stderr, "mbmem unhandled write %06x (%d) <- %x  pc=%06x\n",
+                address, size, value, (unsigned)m68k_get_reg(NULL, M68K_REG_PC));
+    }
     pending_buserr();
     break;
   }
@@ -729,6 +767,30 @@ unsigned int cpu_read_obmem(unsigned int address, int size)
 {
   if (0) printf("cpu_read_obmem address %x (%d)\n", address, size);
 
+  /* --no-kbd: simulate "no video card plugged in" so the PROM's
+     detect_keyboard probe at 0xEC0000 (= OBMEM 0x700000) fails and
+     the boot path falls back to RS232 A as console.  We only nuke
+     the FIRST WORD of video memory; the rest of the framebuffer
+     stays writable so the SDL display still shows whatever the PROM
+     or SunOS draws (banner, X11, etc.).
+     Mechanism: each read of the first word returns a counter that
+     increments per access.  detect_keyboard (in 1.0f / multi-rev-R
+     PROMs) does two reads and compares; with a counter the reads
+     never match -> probe returns 0 -> PROM picks RS232 A.
+     Writes to the first word are dropped silently (otherwise the
+     probe's "write NOT(saved), read back" check would succeed). */
+  if (g_no_kbd && address >= 0x700000 && address < 0x700004) {
+    static unsigned int probe_counter = 0;
+    return (probe_counter++) & 0xffff;
+  }
+
+  /* The kbd/mouse SCC also lives on the video board; without the
+     card, accesses must fault. */
+  if (g_no_kbd && address >= 0x780000 && address < 0x780100) {
+    pending_buserr();
+    return 0xffffffff;
+  }
+
   if (address >= 0x700000 && address < 0x780000) {
     return sun2_video_read(address, size);
   }
@@ -737,16 +799,49 @@ unsigned int cpu_read_obmem(unsigned int address, int size)
     return sun2_kbm_read(address, size);
   }
 
+  /* Sun-2/120 SCC2 (serial port = ttya/ttyb) lives at OBMEM
+     0x7F_2000 - 0x7F_200F per RetroCore MachineSun2Memory.cs.
+     Forward to scc_read with the in-chip register offset preserved
+     in the low 4 bits — channels come out as 0=ttya, 1=ttyb (the
+     pa & 0xffff00 == 0x780000 check inside scc_read is for SCC1
+     keyboard/mouse and won't match here). */
+  if (address >= 0x7F2000 && address < 0x7F2010) {
+    return scc_read(address, size);
+  }
+
   if (address >= 0x781800 && address < 0x781900) {
     return sun2_video_ctl_read(address, size);
   }
 
+  {
+    static int probed = 0, enabled = 0;
+    if (!probed) {
+      probed = 1;
+      const char *e = getenv("OBMEM_TRACE");
+      enabled = (e && *e && *e != '0');
+    }
+    if (enabled)
+      fprintf(stderr, "obmem unhandled read  %06x (%d)         pc=%06x\n",
+              address, size, (unsigned)m68k_get_reg(NULL, M68K_REG_PC));
+  }
   return 0xffffffff;
 }
 
 void cpu_write_obmem(unsigned int address, int size, unsigned int value)
 {
   if (0) printf("cpu_write_obmem address %x (%d) <- %x\n", address, size, value);
+
+  /* --no-kbd: silently drop writes to the first word of video memory
+     (matches the read-side "no card" simulation -- see cpu_read_obmem
+     for full rationale).  The rest of the framebuffer stays writable. */
+  if (g_no_kbd && address >= 0x700000 && address < 0x700004) {
+    return;
+  }
+  /* Kbd/mouse SCC also bus-errors when the card is absent. */
+  if (g_no_kbd && address >= 0x780000 && address < 0x780100) {
+    pending_buserr();
+    return;
+  }
 
   if (address >= 0x700000 && address < 0x780000) {
     sun2_video_write(address, size, value);
@@ -755,10 +850,30 @@ void cpu_write_obmem(unsigned int address, int size, unsigned int value)
 
   if (address >= 0x780000 && address < 0x780100) {
     sun2_kbm_write(address, size, value);
+    return;
+  }
+
+  /* Sun-2/120 SCC2 (serial port = ttya/ttyb) — see cpu_read_obmem. */
+  if (address >= 0x7F2000 && address < 0x7F2010) {
+    scc_write(address, value, size);
+    return;
   }
 
   if (address >= 0x781800 && address < 0x781900) {
     sun2_video_ctl_write(address, size, value);
+    return;
+  }
+
+  {
+    static int probed = 0, enabled = 0;
+    if (!probed) {
+      probed = 1;
+      const char *e = getenv("OBMEM_TRACE");
+      enabled = (e && *e && *e != '0');
+    }
+    if (enabled)
+      fprintf(stderr, "obmem unhandled write %06x (%d) <- %x  pc=%06x\n",
+              address, size, value, (unsigned)m68k_get_reg(NULL, M68K_REG_PC));
   }
 }
 
@@ -988,6 +1103,7 @@ void io_update(void)
   mm58167_update();
   scc_update();
   e3c400_update();
+  scc_tcp_poll();   /* drain bytes from any connected TCP client */
 
   if (sdl_poll_delay++ == 10000) {
     sdl_poll_delay = 0;
@@ -995,10 +1111,17 @@ void io_update(void)
   }
 }
 
+extern void scc_init_traces(void);
+
 void io_init(void)
 {
   e3c400_init();
   sun2_init();
+  scc_init_traces();
+  /* Start the SCC-TCP server if --scc-tcp[=PORT] was given. */
+  extern int g_scc_tcp_port;
+  if (g_scc_tcp_port > 0)
+    scc_tcp_start(g_scc_tcp_port);
 }
 
 /* Implementation for the interrupt controller */

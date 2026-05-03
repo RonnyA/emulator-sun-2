@@ -31,7 +31,7 @@ SIM = sim/sim$(EXE_EXT)
 # things like `make run 7 RUN_VERSION=20` (variable assignments are
 # not in MAKECMDGOALS so they don't get captured).
 # ---------------------------------------------------------------------
-RUN_TARGETS := run run-trace
+RUN_TARGETS := run run-trace run-tcp run-serial
 ifneq (,$(filter $(RUN_TARGETS),$(MAKECMDGOALS)))
     RUN_ARGS := $(wordlist 2,$(words $(MAKECMDGOALS)),$(MAKECMDGOALS))
     ifneq (,$(RUN_ARGS))
@@ -40,7 +40,22 @@ ifneq (,$(filter $(RUN_TARGETS),$(MAKECMDGOALS)))
     endif
 endif
 
-.PHONY: all release sunos20 sunos32 sunos35 run run-trace net-list clean help fetch-sdl2 fetch-npcap-sdk
+# Optional SCC-over-TCP console.  Two ways to enable:
+#   make run TCP=9900    -> sim --scc-tcp=9900
+#   make run-tcp         -> shortcut for the default port 9900
+# Then connect with:  telnet localhost 9900   or   nc localhost 9900
+ifdef TCP
+    SCC_TCP_FLAG := --scc-tcp=$(TCP)
+endif
+
+# Pretend no keyboard is attached so the PROM uses ttya (= SCC ch 0)
+# as console.  Combined with TCP=PORT this gives a fully serial-only
+# session over telnet/nc.  Set NOKBD=1 on the make line.
+ifdef NOKBD
+    NO_KBD_FLAG := --no-kbd
+endif
+
+.PHONY: all release sunos20 sunos32 sunos35 run run-trace run-tcp run-serial net-list clean help fetch-sdl2 fetch-npcap-sdk
 
 all:
 	$(MAKE) -C m68k all
@@ -90,7 +105,7 @@ define stage_and_run
     $(MAKE) sunos$(RUN_VERSION); \
 fi
 $(if $(filter .exe,$(EXE_EXT)),@if [ -f external/SDL2/x86_64-w64-mingw32/bin/SDL2.dll ] && [ ! -f sim/SDL2.dll ]; then cp external/SDL2/x86_64-w64-mingw32/bin/SDL2.dll sim/SDL2.dll; fi)
-$(SIM) $(1) $(NET_IFACE_FLAG) --prom=$(PROM) --disk=$(DISK) --tape=media/tape/tape
+$(SIM) $(1) $(NET_IFACE_FLAG) $(SCC_TCP_FLAG) $(NO_KBD_FLAG) --prom=$(PROM) --disk=$(DISK) --tape=media/tape/tape
 endef
 
 run: all
@@ -98,6 +113,17 @@ run: all
 
 run-trace: all
 	$(call stage_and_run,)
+
+# Same as `make run` but with --scc-tcp on default port 9900.
+# Connect with:  telnet localhost 9900   or   nc localhost 9900
+run-tcp: all
+	@$(MAKE) --no-print-directory run TCP=9900 $(filter-out run-tcp,$(RUN_ARGS))
+
+# Headless serial console: pretend no keyboard, expose ttya on 9900.
+# The PROM falls back to ttya for I/O, so banner / boot prompt / kernel
+# messages all flow through telnet.  No SDL window interaction needed.
+run-serial: all
+	@$(MAKE) --no-print-directory run TCP=9900 NOKBD=1 $(filter-out run-serial,$(RUN_ARGS))
 
 # List host network interfaces visible to the active backend.  Useful
 # for picking what to pass to --net-iface or SUN2_NET_IFACE.
@@ -134,6 +160,13 @@ help:
 	@echo "  make run         Build, stage default disk, and run (quiet)"
 	@echo "  make run N       Same, with --net-iface=N (index from --net-list,"
 	@echo "                   or a literal interface name like eth0)"
+	@echo "  make run TCP=N   Same as run but expose SCC console on TCP port N"
+	@echo "                   (connect with: telnet localhost N  or  nc localhost N)"
+	@echo "  make run-tcp     Shortcut for run with TCP=9900"
+	@echo "  make run-tcp N   run-tcp + --net-iface=N"
+	@echo "  make run-serial  Headless: TCP=9900 + --no-kbd  (PROM uses ttya;"
+	@echo "                   all boot output flows through telnet, no SDL needed)"
+	@echo "  make run-serial N  run-serial + --net-iface=N"
 	@echo "  make run-trace   Same as run but with full bus-error / vector trace"
 	@echo "  make run-trace N Trace mode with --net-iface=N"
 	@echo "  make net-list    Print available host network interfaces"

@@ -40,8 +40,12 @@
 
 #include "sim.h"
 #include "net.h"
+#include "scc_tcp.h"
 
 const char *g_net_iface = NULL;
+int g_net_dump = 0;
+int g_scc_tcp_port = 0;   /* 0 = disabled; otherwise listen on this port */
+int g_no_kbd = 0;         /* --no-kbd: pretend no keyboard, so PROM uses ttya */
 
 #include "scsi.h"
 
@@ -285,6 +289,11 @@ void usage(void)
   fprintf(stderr, "                    --net-list (1-based).\n");
   fprintf(stderr, "                    (env: SUN2_NET_IFACE; default: backend auto-picks)\n");
   fprintf(stderr, " --net-list         list available host interfaces and exit\n");
+  fprintf(stderr, " --net-dump         dump every 3C400 RX/TX frame to stderr\n");
+  fprintf(stderr, " --scc-tcp[=PORT]   expose SCC channel-A console on TCP (default 9900)\n");
+  fprintf(stderr, "                    connect with: telnet host PORT   (or: nc host PORT)\n");
+  fprintf(stderr, " --no-kbd           pretend no keyboard is attached; the PROM falls back\n");
+  fprintf(stderr, "                    to ttya as console.  Useful with --scc-tcp.\n");
   fprintf(stderr, " -q                 quiet (suppress bus-error/vector trace)\n");
   exit(1);
 }
@@ -332,10 +341,13 @@ int main(int argc, char **argv)
       {"mode",      required_argument, 0,  'm' },
       {"net-iface", required_argument, 0,  'i' },
       {"net-list",  no_argument,       0,  'L' },
+      {"net-dump",  no_argument,       0,  'D' },
+      {"scc-tcp",   optional_argument, 0,  'S' },
+      {"no-kbd",    no_argument,       0,  'K' },
       {0,           0,                 0,   0  }
     };
 
-    c = getopt_long(argc, argv, "d:k:p:t:m:i:qL", long_options, &option_index);
+    c = getopt_long(argc, argv, "d:k:p:t:m:i:qLDS::K", long_options, &option_index);
     if (c == -1)
       break;
 
@@ -391,6 +403,24 @@ int main(int argc, char **argv)
     case 'L':
       net_list_interfaces();
       exit(0);
+
+    case 'D':
+      g_net_dump = 1;
+      break;
+
+    case 'S':
+      /* --scc-tcp        (no arg)   -> default port 9900
+         --scc-tcp=9912   (with arg) -> explicit port */
+      g_scc_tcp_port = optarg ? atoi(optarg) : 9900;
+      if (g_scc_tcp_port <= 0 || g_scc_tcp_port > 65535) {
+        fprintf(stderr, "--scc-tcp: invalid port '%s'\n", optarg ? optarg : "");
+        exit(1);
+      }
+      break;
+
+    case 'K':
+      g_no_kbd = 1;
+      break;
 
     case '?':
       usage();
