@@ -696,19 +696,28 @@ void e3c400_update(void) {
 					memcpy(&meabuffer[0], framebuf, framelen);
 					meahdr->hdr.firstfree = framelen;
 					handle_incoming_packet();
-				} else {
-					printf("Packet length exceeds 3C400 ethernet buffer\n");
+				} else if (trace_3c400) {
+					/* Real 3C400 hardware drops oversized frames
+					   silently; pcap/Npcap can occasionally hand
+					   us a frame larger than the 2046-byte slot
+					   (jumbo frames, loopback, etc).  Don't spam
+					   under normal traffic. */
+					printf("3C400: rx frame %d > 2046, dropped (A)\n", framelen);
 				}
 			} else if (whichbuffer == 'B') {
 				if (framelen < 2046) {
 					memcpy(&mebbuffer[0], framebuf, framelen);
 					mebhdr->hdr.firstfree = framelen;
 					handle_incoming_packet();
-				} else {
-					printf("Packet length exceeds 3C400 ethernet buffer\n");
+				} else if (trace_3c400) {
+					printf("3C400: rx frame %d > 2046, dropped (B)\n", framelen);
 				}
 			} else {
-				printf("No buffers available for received ethernet packet, discarding\n");
+				/* Both rx slots full — kernel hasn't drained yet.
+				   This is normal under load; the real card just
+				   loses the frame. */
+				if (trace_3c400)
+					printf("3C400: no rx buffer free, frame dropped\n");
 				return;
 			}
 		}

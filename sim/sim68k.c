@@ -213,7 +213,8 @@ pending_buserr();
     break;
 
   default:
-    printf("io: read %x -> %x (%d) pc %x\n", pa, value, size, m68k_get_reg(NULL, M68K_REG_PC));
+    if (!quiet)
+      printf("io: read %x -> %x (%d) pc %x\n", pa, value, size, m68k_get_reg(NULL, M68K_REG_PC));
     break;
   }
 
@@ -257,7 +258,8 @@ void io_write(int size, unsigned int pa, unsigned int value)
     break;
 
   default:
-    printf("io: write %x <- %x (%d)\n", pa, value, size);
+    if (!quiet)
+      printf("io: write %x <- %x (%d)\n", pa, value, size);
     break;
   }
 }

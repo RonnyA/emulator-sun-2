@@ -2,6 +2,8 @@
 
 #include <stdio.h>
 
+extern int quiet;
+
 static unsigned counter[8];
 static unsigned ms;
 static unsigned delay;
@@ -37,7 +39,8 @@ void mm58167_update(void)
 
 void mm58167_write(unsigned pa, unsigned value, int size)
 {
-    printf("io: write %x <- %x (%d) tod?\n", pa, value, size);
+    if (!quiet)
+        printf("io: write %x <- %x (%d) tod?\n", pa, value, size);
 }
 
 
@@ -61,7 +64,8 @@ unsigned mm58167_read(unsigned pa, int size)
 	    break;
     }
 
-    printf("io: read %x -> %x (%d) tod?\n", pa, v, size);
+    if (!quiet)
+        printf("io: read %x -> %x (%d) tod?\n", pa, v, size);
 
     return v;
 }

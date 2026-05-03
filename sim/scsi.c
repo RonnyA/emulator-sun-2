@@ -9,6 +9,7 @@
 extern int trace_scsi;
 extern int trace_sc;
 extern int trace_armed;
+extern int quiet;
 
 int scsi_bus_phase;
 unsigned int scsi_bus_state;
@@ -51,7 +52,7 @@ int _scsi_test_unit_ready(int id, unsigned char *cmd, int cmd_size, unsigned cha
 
   u = &scsi_units[id];
 
-  printf("_scsi_test_unit_ready(id=%d)\n", id);
+  if (!quiet) printf("_scsi_test_unit_ready(id=%d)\n", id);
 
   xfer_size = 16;
   memset(&u->data, 0, 512);
@@ -73,7 +74,7 @@ int _scsi_inquiry(int id, unsigned char *cmd, int cmd_size, unsigned char **pbuf
   spagecode = (cmd[2] << 8) | cmd[3];
   sallocationlen = (cmd[3] << 8) | cmd[4];
 
-  printf("_scsi_inquiry(id=%d) spagecode %x, sallocationlen %x\n", id, spagecode, sallocationlen);
+  if (!quiet) printf("_scsi_inquiry(id=%d) spagecode %x, sallocationlen %x\n", id, spagecode, sallocationlen);
 
   xfer_size = 96;
   memset(&u->data, 0, 512);
@@ -295,7 +296,7 @@ int _scsi_request_sense(int id, unsigned char *cmd, int cmd_size, unsigned char 
   off_t offset;
   int spagecode, sallocationlen, xfer_size;
 
-  printf("_scsi_request_sense()\n");
+  if (!quiet) printf("_scsi_request_sense()\n");
 
   u = &scsi_units[id];
   xfer_size = 16;
@@ -440,7 +441,7 @@ if (trace_scsi && id_selected >= 0) printf("scsi: PHASE_BUS_FREE (last select %d
 	  id_selected = 4;
       } else {
         int x;
-	for (x = 0; x < 8; x++) if (scsi_bus_data & (1 << x)) { id_selected = x; printf("scsi: target id%d\n", x); break; }
+	for (x = 0; x < 8; x++) if (scsi_bus_data & (1 << x)) { id_selected = x; if (!quiet) printf("scsi: target id%d\n", x); break; }
 	scsi_bus_state &= ~SCSI_BUS_BSY;
 scsi_bus_state = 0;
 //	if (trace_scsi) printf("scsi: ~id0&~id4, remove BSY\n");
