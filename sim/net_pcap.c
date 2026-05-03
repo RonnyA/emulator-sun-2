@@ -15,6 +15,15 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _WIN32
+#  include <winsock2.h>
+#  include <ws2tcpip.h>      /* inet_ntop */
+#else
+#  include <arpa/inet.h>
+#  include <netinet/in.h>
+#  include <sys/socket.h>
+#endif
+
 #include <pcap.h>
 
 #include "net.h"
@@ -121,6 +130,52 @@ void net_close(net_iface_t *nh)
     free(nh);
 }
 
+/* Count the number of leading 1-bits in a 32-bit netmask, e.g.
+   0xffffff00 -> 24.  Used to render IPv4 netmasks as CIDR. */
+static int netmask_to_cidr(uint32_t mask_host_order)
+{
+    int bits = 0;
+    while (mask_host_order & 0x80000000u) {
+        bits++;
+        mask_host_order <<= 1;
+    }
+    return bits;
+}
+
+static void print_iface_address(const struct pcap_addr *a)
+{
+    if (!a || !a->addr) return;
+
+    char addr_str[INET6_ADDRSTRLEN] = "?";
+
+    if (a->addr->sa_family == AF_INET) {
+        struct sockaddr_in *sin = (struct sockaddr_in *)a->addr;
+        inet_ntop(AF_INET, &sin->sin_addr, addr_str, sizeof(addr_str));
+
+        if (a->netmask) {
+            struct sockaddr_in *m = (struct sockaddr_in *)a->netmask;
+            uint32_t mask = ntohl(m->sin_addr.s_addr);
+            int cidr = netmask_to_cidr(mask);
+
+            /* Compute the network address: IP & netmask. */
+            uint32_t ip_h = ntohl(sin->sin_addr.s_addr);
+            uint32_t net = ip_h & mask;
+            uint8_t b0 = (net >> 24) & 0xff;
+            uint8_t b1 = (net >> 16) & 0xff;
+            uint8_t b2 = (net >>  8) & 0xff;
+            uint8_t b3 =  net        & 0xff;
+            printf("     IPv4: %s/%d  (network %u.%u.%u.%u/%d)\n",
+                   addr_str, cidr, b0, b1, b2, b3, cidr);
+        } else {
+            printf("     IPv4: %s\n", addr_str);
+        }
+    } else if (a->addr->sa_family == AF_INET6) {
+        struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)a->addr;
+        inet_ntop(AF_INET6, &sin6->sin6_addr, addr_str, sizeof(addr_str));
+        printf("     IPv6: %s\n", addr_str);
+    }
+}
+
 void net_list_interfaces(void)
 {
     char errbuf[PCAP_ERRBUF_SIZE];
@@ -137,6 +192,13 @@ void net_list_interfaces(void)
         printf("  %d. %s%s\n", n, d->name, flags);
         if (d->description && d->description[0])
             printf("     %s\n", d->description);
+
+        /* libpcap attaches every IPv4 / IPv6 / link-layer address the
+           OS knows about for this device.  Print the IP-level ones so
+           the user can match adapter names to a network. */
+        for (pcap_addr_t *a = d->addresses; a != NULL; a = a->next) {
+            print_iface_address(a);
+        }
     }
     if (n == 0)
         fprintf(stderr, "  (none — on Windows, install Npcap; on Linux, "
