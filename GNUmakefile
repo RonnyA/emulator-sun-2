@@ -19,7 +19,7 @@ endif
 
 SIM = sim/sim$(EXE_EXT)
 
-.PHONY: all release sunos20 sunos32 sunos35 run run-trace clean help fetch-sdl2 fetch-npcap-sdk
+.PHONY: all release sunos20 sunos32 sunos35 run run-trace net-list clean help fetch-sdl2 fetch-npcap-sdk
 
 all:
 	$(MAKE) -C m68k all
@@ -78,6 +78,16 @@ run: all
 run-trace: all
 	$(call stage_and_run,)
 
+# List host network interfaces visible to the active backend.  Useful
+# for picking what to pass to --net-iface or SUN2_NET_IFACE.
+net-list: all
+ifeq ($(EXE_EXT),.exe)
+	@if [ -f external/SDL2/x86_64-w64-mingw32/bin/SDL2.dll ] && [ ! -f sim/SDL2.dll ]; then \
+	    cp external/SDL2/x86_64-w64-mingw32/bin/SDL2.dll sim/SDL2.dll; \
+	fi
+endif
+	$(SIM) --net-list
+
 clean:
 	$(MAKE) -C m68k clean
 	$(MAKE) -C sim  clean
@@ -102,6 +112,9 @@ help:
 	@echo "  make clean       Remove build artifacts"
 	@echo "  make run         Build, stage default disk, and run (quiet)"
 	@echo "  make run-trace   Same as run but with full bus-error / vector trace"
+	@echo "  make net-list    Print available host network interfaces"
+	@echo "                   (then pass one with --net-iface=NAME or"
+	@echo "                    SUN2_NET_IFACE=NAME)"
 	@echo "  make run RUN_VERSION=20|32|35"
 	@echo "                   Stage that SunOS image instead of the default 3.2"
 	@echo "  make sunos20     Stage SunOS 2.0 disk + tape (no run)"

@@ -44,3 +44,11 @@ void net_close(net_iface_t *nh)
 {
     free(nh);
 }
+
+void net_list_interfaces(void)
+{
+    fprintf(stderr,
+            "net(stub): networking is disabled in this build.\n"
+            "  Rebuild with NET_BACKEND=pcap (after `make fetch-npcap-sdk` on Windows)\n"
+            "  or NET_BACKEND=bpf (macOS/BSD) to enumerate interfaces.\n");
+}

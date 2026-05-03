@@ -76,27 +76,25 @@ make fetch-sdl2     # downloads SDL2 MinGW devel into external/SDL2/
 make
 ```
 
-For ethernet on Windows, also install the
-[Npcap runtime](https://npcap.com/) (with "WinPcap API compatible"
-mode enabled) and the Npcap SDK, then build with:
+For ethernet on Windows, see [Networking on Windows](#networking-on-windows)
+below. The short version:
 
 ```sh
-NPCAP_SDK=/path/to/npcap-sdk make NET_BACKEND=pcap
+# install Npcap runtime once: https://npcap.com/  (enable WinPcap API compat)
+make fetch-npcap-sdk     # downloads Npcap SDK into external/npcap-sdk/
+make                     # auto-detects the SDK and builds with NET_BACKEND=pcap
 ```
-
-Without the SDK the build defaults to `NET_BACKEND=stub` (the 3C400
-appears to the guest but no packets flow).
 
 ## Networking
 
 The 3C400 ethernet card is wired to a backend abstraction
 (`sim/net.h`) with three implementations:
 
-| Backend | Default on | Host requirement |
+| Backend | Default on        | Host requirement       |
 |---|---|---|
-| `bpf`   | macOS / *BSD       | `/dev/bpf*` access |
-| `pcap`  | Linux / Windows    | libpcap / Npcap    |
-| `stub`  | (manual override)  | none — no networking |
+| `bpf`   | macOS / *BSD      | `/dev/bpf*` access     |
+| `pcap`  | Linux / WSL / Windows | libpcap / Npcap    |
+| `stub`  | (manual override) | none — no networking   |
 
 Override per-build:
 
@@ -106,10 +104,84 @@ make NET_BACKEND=pcap      # force libpcap / Npcap
 make NET_BACKEND=stub      # disable networking entirely
 ```
 
-Caveats from the original 3C400 driver still apply: it sets
-promiscuous mode on the host interface, the MAC and host interface
-name are configured at the top of `sim/3c400.c`, and the alpha-quality
-warning stands. Don't run the emulator as root.
+### Picking a host interface
+
+The emulated 3C400 has to be bound to one of your physical or virtual
+host interfaces. Three ways to choose:
+
+```sh
+make net-list                          # list available interfaces
+./sim/sim --net-list                   # same, ran directly
+./sim/sim --net-iface=eth0 ...         # CLI flag
+SUN2_NET_IFACE=eth0 make run           # env var
+```
+
+If neither flag nor env var is given, the active backend auto-picks:
+`pcap` takes the first non-loopback adapter; `bpf` falls back to
+`en0`.
+
+Windows interface names from `--net-list` look like
+`\Device\NPF_{4B014404-...}`. The accompanying description (e.g.
+"Intel(R) Wi-Fi 6 AX201") tells you which physical adapter that is.
+
+### Networking on Windows
+
+Two pieces are needed:
+
+1. **Npcap runtime** — the user-visible driver and `wpcap.dll`. Install
+   from [https://npcap.com/#download](https://npcap.com/#download).
+   During install, **check "Install Npcap in WinPcap API-compatible
+   mode"** so the standard `wpcap.dll` exports are available. This
+   is what makes ethernet actually work at runtime.
+
+2. **Npcap SDK** — `pcap.h` and `wpcap.lib`, only needed at
+   *compile* time. The simplest path:
+
+   ```sh
+   make fetch-npcap-sdk
+   ```
+
+   That downloads the official SDK zip from npcap.com into
+   `external/npcap-sdk/` and the Makefile picks it up automatically.
+   Alternatively, install the Npcap SDK manually anywhere and point
+   `NPCAP_SDK=/path/to/sdk` before `make`.
+
+If the runtime is missing at run time, `sim.exe` will fail to start
+with "wpcap.dll not found". If the SDK is missing at build time, the
+Makefile defaults to `NET_BACKEND=stub` so the build still succeeds —
+just without working ethernet.
+
+The pre-built Windows release on GitHub ships **two** zip artifacts:
+
+- `emulator-sun-2-windows-x64-pcap.zip` — full ethernet via Npcap.
+  Requires the Npcap runtime to be installed on the user's machine.
+- `emulator-sun-2-windows-x64-stub.zip` — no ethernet, runs anywhere.
+
+### Networking on Linux / WSL
+
+```sh
+sudo apt install libpcap-dev
+make
+```
+
+libpcap usually needs `CAP_NET_RAW` to open raw sockets. Either run
+the emulator with `sudo`, or grant the capability once:
+
+```sh
+sudo setcap cap_net_raw,cap_net_admin=eip ./sim/sim
+```
+
+WSL2 has limited raw-socket support compared to a real Linux box.
+Some WSL2 distributions cannot open `eth0` for raw I/O at all; in
+that case build with `NET_BACKEND=stub`.
+
+### Caveats (from the original 3C400 driver)
+
+The driver puts the host interface in promiscuous mode and was
+written as alpha-quality. Don't run the emulator as root: on macOS
+add yourself to the group that owns `/dev/bpf*`, on Linux use
+`setcap` as above, on Windows just install Npcap as a normal user
+and the runtime handles privilege.
 
 ## Files and layout
 

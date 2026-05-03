@@ -46,6 +46,13 @@ typedef struct sun2_mode_s {
 extern const sun2_mode_t *g_mode;
 const sun2_mode_t *sun2_mode_lookup(const char *name);
 void sun2_mode_print_list(void);
+
+/* Host network interface name to bind the 3C400 ethernet to.
+   NULL means "let the active backend pick a default" (pcap auto-picks
+   the first non-loopback adapter; BPF uses en0).  Set from the
+   --net-iface=NAME command line option, or the SUN2_NET_IFACE
+   environment variable, or NULL if neither is given. */
+extern const char *g_net_iface;
 /* Build the IDPROM bytes for a given machine type, recompute byte-15 checksum. */
 void idprom_setup(unsigned char machine_type);
 

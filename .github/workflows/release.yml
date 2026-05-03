@@ -20,8 +20,17 @@ jobs:
   # Windows x64 (MSYS2 MinGW-w64)
   # -------------------------------------------------------------------
   build-windows:
-    name: Build windows-x64
+    # Build two Windows variants:
+    #   - pcap : full 3C400 ethernet via Npcap.  Requires the Npcap
+    #            *runtime* on the user's machine; without it sim.exe
+    #            will fail to start because wpcap.dll won't load.
+    #   - stub : no ethernet, runs on any Windows box without extras.
+    name: Build windows-x64-${{ matrix.net }}
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        net: [pcap, stub]
     defaults:
       run:
         shell: msys2 {0}
@@ -51,48 +60,72 @@ jobs:
           pkg-config --modversion sdl2
 
       - name: Download Npcap SDK
+        if: matrix.net == 'pcap'
         run: |
           set -e
-          # Npcap SDK gives us wpcap.lib + headers compatible with libpcap.
-          # The runtime DLL ships separately as the Npcap installer.
           curl -fsSL -o npcap-sdk.zip https://npcap.com/dist/npcap-sdk-1.13.zip
           mkdir -p npcap-sdk
           unzip -q npcap-sdk.zip -d npcap-sdk
 
-      - name: Build release
+      - name: Build release (NET_BACKEND=${{ matrix.net }})
         env:
           NPCAP_SDK: ${{ github.workspace }}\npcap-sdk
         run: |
           set -e
-          # MSYS2 sees the path with backslashes; convert.
-          export NPCAP_SDK="$(cygpath -u "$NPCAP_SDK")"
-          make NET_BACKEND=pcap release
+          if [ "${{ matrix.net }}" = "pcap" ]; then
+            export NPCAP_SDK="$(cygpath -u "$NPCAP_SDK")"
+          else
+            unset NPCAP_SDK
+          fi
+          make NET_BACKEND=${{ matrix.net }} release
 
       - name: Stage release artifacts
         run: |
           set -e
-          STAGE="dist/emulator-sun-2-windows-x64"
+          STAGE="dist/emulator-sun-2-windows-x64-${{ matrix.net }}"
           mkdir -p "$STAGE"
           cp sim/sim.exe "$STAGE/"
           cp /mingw64/bin/SDL2.dll "$STAGE/SDL2.dll"
           cp README.md "$STAGE/" 2>/dev/null || true
           cp COPYING "$STAGE/" 2>/dev/null || true
-          # Note about Npcap runtime requirement.
-          cat > "$STAGE/NETWORKING.txt" <<'EOF'
-          The 3C400 Ethernet emulation in this build uses Npcap.
-          To get a working emulated network you must install the Npcap
-          runtime separately from https://npcap.com/ (with "WinPcap API
-          compatible" mode enabled).
+          if [ "${{ matrix.net }}" = "pcap" ]; then
+            cat > "$STAGE/NETWORKING.txt" <<'EOF'
+          This build links against Npcap for 3C400 ethernet emulation.
 
-          Without Npcap installed, the emulator still runs but no
-          packets will flow through the 3C400.
+          REQUIRED: install the Npcap runtime from https://npcap.com/
+          (enable "WinPcap API compatible" mode during installation).
+          Without Npcap, sim.exe will fail to start because wpcap.dll
+          cannot be loaded.
+
+          To pick a specific host adapter (Wi-Fi, Ethernet, vmnet,
+          etc.), run sim.exe with --net-list to see the available
+          interfaces, then pass --net-iface=NAME or set the env var
+          SUN2_NET_IFACE=NAME.  By default the first non-loopback
+          adapter is used.
+
+          If you don't need network emulation, use the
+          emulator-sun-2-windows-x64-stub build instead — it runs on
+          any Windows box without extra installs.
           EOF
+          else
+            cat > "$STAGE/NETWORKING.txt" <<'EOF'
+          This build has 3C400 ethernet DISABLED (NET_BACKEND=stub).
+
+          The emulator runs on any Windows box without needing Npcap or
+          any other network library.  The 3C400 device still appears
+          to the guest, but no packets flow.
+
+          For working ethernet emulation, use the
+          emulator-sun-2-windows-x64-pcap build — that variant requires
+          the Npcap runtime from https://npcap.com/ to be installed.
+          EOF
+          fi
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: emulator-sun-2-windows-x64
-          path: dist/emulator-sun-2-windows-x64/
+          name: emulator-sun-2-windows-x64-${{ matrix.net }}
+          path: dist/emulator-sun-2-windows-x64-${{ matrix.net }}/
           if-no-files-found: error
 
   # -------------------------------------------------------------------

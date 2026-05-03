@@ -39,6 +39,9 @@
 #endif
 
 #include "sim.h"
+#include "net.h"
+
+const char *g_net_iface = NULL;
 
 #include "scsi.h"
 
@@ -267,7 +270,7 @@ void sun2_mode_print_list(void)
 
 void usage(void)
 {
-  fprintf(stderr, "sun-2 emulator\n");
+  fprintf(stderr, "sun-2 emulator (network backend: %s)\n", net_backend_name());
   fprintf(stderr, "usage:\n");
   fprintf(stderr, " --prom=FILE\n");
   fprintf(stderr, " --disk=FILE\n");
@@ -276,6 +279,10 @@ void usage(void)
   sun2_mode_print_list();
   fprintf(stderr, "optionally:\n");
   fprintf(stderr, " --kernel=FILE  --boot=FILE\n");
+  fprintf(stderr, " --net-iface=NAME   bind the 3C400 to this host interface\n");
+  fprintf(stderr, "                    (env: SUN2_NET_IFACE; default: backend auto-picks)\n");
+  fprintf(stderr, " --net-list         list available host interfaces and exit\n");
+  fprintf(stderr, " -q                 quiet (suppress bus-error/vector trace)\n");
   exit(1);
 }
 
@@ -314,16 +321,18 @@ int main(int argc, char **argv)
     int this_option_optind = optind ? optind : 1;
     int option_index = 0;
     static struct option long_options[] = {
-      {"prom",   optional_argument, 0,  'p' },
-      {"disk",   optional_argument, 0,  'd' },
-      {"tape",   optional_argument, 0,  't' },
-      {"kernel", optional_argument, 0,  'k' },
-      {"boot",   optional_argument, 0,  'b' },
-      {"mode",   required_argument, 0,  'm' },
-      {0,        0,                 0,  0 }
+      {"prom",      optional_argument, 0,  'p' },
+      {"disk",      optional_argument, 0,  'd' },
+      {"tape",      optional_argument, 0,  't' },
+      {"kernel",    optional_argument, 0,  'k' },
+      {"boot",      optional_argument, 0,  'b' },
+      {"mode",      required_argument, 0,  'm' },
+      {"net-iface", required_argument, 0,  'i' },
+      {"net-list",  no_argument,       0,  'L' },
+      {0,           0,                 0,   0  }
     };
 
-    c = getopt_long(argc, argv, "d:k:p:t:m:q", long_options, &option_index);
+    c = getopt_long(argc, argv, "d:k:p:t:m:i:qL", long_options, &option_index);
     if (c == -1)
       break;
 
@@ -372,6 +381,14 @@ int main(int argc, char **argv)
       quiet++;
       break;
 
+    case 'i':
+      g_net_iface = strdup(optarg);
+      break;
+
+    case 'L':
+      net_list_interfaces();
+      exit(0);
+
     case '?':
       usage();
       break;
@@ -387,6 +404,12 @@ int main(int argc, char **argv)
       printf("%s ", argv[optind++]);
     printf("\n");
     usage();
+  }
+
+  /* Fall back to SUN2_NET_IFACE env var if --net-iface wasn't given. */
+  if (g_net_iface == NULL) {
+    const char *e = getenv("SUN2_NET_IFACE");
+    if (e && e[0]) g_net_iface = strdup(e);
   }
 
   printf("mode: %s (idprom_machine=0x%02x, hires_jumper=%d, fb=%dx%d) — %s\n",

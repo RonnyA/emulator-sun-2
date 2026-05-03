@@ -54,9 +54,12 @@
 #define MAC5 0x06;
 #define MAC6 0xe0;
 
-// Default host interface for the network backend (override at runtime
-// when the host config supports it).  Used by net_open().
-#define BPFINTERFACE "vmnet8"
+// Legacy fallback host interface (sigurbjornl's macOS+VMWare default).
+// Only used when the user neither passes --net-iface nor sets the
+// SUN2_NET_IFACE env var AND we're on a host where the backend can't
+// auto-pick.  Pass NULL to net_open() to let the backend auto-pick:
+// pcap picks the first non-loopback adapter, BPF uses en0.
+#define BPFINTERFACE_LEGACY "vmnet8"
 
 // Try to make sure struct is correctly represented
 #pragma pack(1)
@@ -598,14 +601,27 @@ void e3c400_init(void) {
 	// Open the host network interface through whichever backend was
 	// linked in (BPF on macOS/BSD, libpcap on Linux, Npcap on Windows,
 	// or stub when networking is disabled at build time).
+	//
+	// Interface selection priority (highest first):
+	//   1. --net-iface=NAME on the command line  (sets g_net_iface)
+	//   2. SUN2_NET_IFACE env var                (also lands in g_net_iface)
+	//   3. NULL → backend picks a default
+	//      pcap: first non-loopback adapter
+	//      bpf:  "en0"
+	//
+	// The legacy "vmnet8" hardcode is gone — it was a sigurbjornl
+	// convention from a specific macOS+VMWare setup, not a portable
+	// default.  Use --net-list to see what's available on this host.
 	uint8_t mac[6] = { romaddr->addr.o1, romaddr->addr.o2, romaddr->addr.o3,
 	                   romaddr->addr.o4, romaddr->addr.o5, romaddr->addr.o6 };
-	netif = net_open(BPFINTERFACE, mac, /*promiscuous=*/1);
+	const char *iface = g_net_iface;  /* may be NULL → backend default */
+	netif = net_open(iface, mac, /*promiscuous=*/1);
 	if (!netif)
 		printf("3C400: networking disabled (net(%s) open failed for '%s')\n",
-		       net_backend_name(), BPFINTERFACE);
+		       net_backend_name(), iface ? iface : "<auto>");
 	else
-		printf("3C400: net(%s) bound to %s\n", net_backend_name(), BPFINTERFACE);
+		printf("3C400: net(%s) bound to %s\n",
+		       net_backend_name(), iface ? iface : "<auto>");
 }
 
 

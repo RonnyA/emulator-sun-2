@@ -67,6 +67,17 @@ void net_close(net_iface_t *nh);
  */
 const char *net_backend_name(void);
 
+/*
+ * Print a list of host network interfaces the active backend can
+ * see, to stdout.  Used by `--net-list` so the user can pick an
+ * interface name to pass to `--net-iface`.
+ *
+ * On pcap (Linux + Windows) this calls pcap_findalldevs.  On BPF
+ * it prints a hint to use the host's ifconfig/ip-link tool.  On
+ * stub it just notes that networking is disabled.
+ */
+void net_list_interfaces(void);
+
 #ifdef __cplusplus
 }
 #endif

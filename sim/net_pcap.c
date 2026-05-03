@@ -120,3 +120,26 @@ void net_close(net_iface_t *nh)
     if (nh->p) pcap_close(nh->p);
     free(nh);
 }
+
+void net_list_interfaces(void)
+{
+    char errbuf[PCAP_ERRBUF_SIZE];
+    pcap_if_t *all = NULL;
+    if (pcap_findalldevs(&all, errbuf) != 0 || !all) {
+        fprintf(stderr, "net(pcap): pcap_findalldevs: %s\n", errbuf);
+        return;
+    }
+    printf("Available network interfaces (pass to --net-iface):\n");
+    int n = 0;
+    for (pcap_if_t *d = all; d != NULL; d = d->next) {
+        n++;
+        const char *flags = (d->flags & PCAP_IF_LOOPBACK) ? " [loopback]" : "";
+        printf("  %d. %s%s\n", n, d->name, flags);
+        if (d->description && d->description[0])
+            printf("     %s\n", d->description);
+    }
+    if (n == 0)
+        fprintf(stderr, "  (none — on Windows, install Npcap; on Linux, "
+                        "libpcap usually needs CAP_NET_RAW or root)\n");
+    pcap_freealldevs(all);
+}

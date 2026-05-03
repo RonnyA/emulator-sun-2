@@ -170,3 +170,15 @@ void net_close(net_iface_t *nh)
     if (nh->rxbuf) free(nh->rxbuf);
     free(nh);
 }
+
+void net_list_interfaces(void)
+{
+    /* The BPF backend doesn't enumerate interfaces itself — host tools
+       are better at it.  Tell the user to run ifconfig / ip link. */
+    fprintf(stderr,
+            "net(bpf): the BPF backend doesn't enumerate host interfaces.\n"
+            "  Use one of:\n"
+            "    ifconfig -a       (macOS / *BSD)\n"
+            "    ip -o link show   (Linux, but Linux uses NET_BACKEND=pcap by default)\n"
+            "  ...then pass the chosen name with --net-iface=NAME .\n");
+}
