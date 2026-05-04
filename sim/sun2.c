@@ -155,8 +155,10 @@ void sdl_init(void)
 
     SDL_RendererInfo info;
     SDL_GetRendererInfo(renderer, &info);
-    printf("sdl_init: logical fb %dx%d, window %dx%d (resizable), renderer=%s\n",
-           cols, rows, win_w, win_h, info.name);
+    extern int quiet;
+    if (!quiet)
+        printf("sdl_init: logical fb %dx%d, window %dx%d (resizable), renderer=%s\n",
+               cols, rows, win_w, win_h, info.name);
 }
 
 //void sun2_sdl_key(int sdl_code, int modifiers, unsigned int unicode, int down);
@@ -441,19 +443,6 @@ void sun2_sdl_key(SDL_Keycode sdl_code, uint16_t modifiers, SDL_Scancode scancod
     printf("4: %02x%02x%02x%02x\n", p[0], p[1], p[2], p[3]); p += 4;
     printf("8: %02x%02x%02x%02x\n", p[0], p[1], p[2], p[3]); p += 4;
     printf("c: %02x%02x%02x%02x\n", p[0], p[1], p[2], p[3]);
-  }
-#endif
-
-#if 1
-  if (sdl_code == SDLK_QUOTE && down) {
-    extern int trace_armed;
-    if (trace_armed == 0) {
-      trace_armed = 1;
-      printf("TRACE ARMED!\n");
-    } else {
-      trace_armed = 0;
-      printf("TRACE unarmed!\n");
-    }
   }
 #endif
 

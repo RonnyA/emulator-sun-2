@@ -216,6 +216,9 @@ unsigned char *mebbuffer;
 //  Trace positive means outputting lots of debug information on the lowlevel processing of the emulation, best enabled by using the e3c400_enable_trace function...
 int trace_3c400 = 0;
 
+// `-q` on the cli; gates the noisier always-on diagnostics.
+extern int quiet;
+
 // Active network backend handle.  NULL when networking is disabled
 // or the host couldn't be opened (e.g. permissions on /dev/bpf*,
 // missing libpcap, no Npcap driver, etc).
@@ -1155,7 +1158,7 @@ void e3c400_write(uint32_t addr, uint32_t size, uint32_t value) {
 	} else if(addr >= 0xe0802 & addr <0xe1000 && size <=4) {
 		// Initial offset calculated
 		offset= addr - 0xe0800;
-	
+
 		switch(size) {
 			case 4:
 				mexbuffer[offset]   = (value & 0xFFFFFFFF)>>24;;
@@ -1174,7 +1177,59 @@ void e3c400_write(uint32_t addr, uint32_t size, uint32_t value) {
 				printf("3C400: tx buffer, unmatched size %d at addr: %x \n",size,addr);
 				break;
 		}
-	}  else {
+	// Receive buffer A header (mirror of the read at 0xe1000)
+	} else if(addr == 0xe1000 && size == 2) {
+		(*meahdr) = value;
+	// Receive buffer A data (mirror of the read at 0xe1002..0xe17ff).
+	// SunOS's ec0 driver clears this region on init and after consuming
+	// each frame; without these write handlers, the buffer retained
+	// stack-uninit data and a later read confused the driver into
+	// kernel panic.
+	} else if(addr >= 0xe1002 & addr <0xe1800 && size <=4) {
+		offset = addr - 0xe1002;
+		switch(size) {
+			case 4:
+				meabuffer[offset]   = (value >> 24) & 0xff;
+				meabuffer[offset+1] = (value >> 16) & 0xff;
+				meabuffer[offset+2] = (value >>  8) & 0xff;
+				meabuffer[offset+3] =  value        & 0xff;
+				break;
+			case 2:
+				meabuffer[offset]   = (value >> 8) & 0xff;
+				meabuffer[offset+1] =  value       & 0xff;
+				break;
+			case 1:
+				meabuffer[offset]   =  value       & 0xff;
+				break;
+			default:
+				printf("3C400: rx buffer A, unmatched size %d at addr: %x\n",size,addr);
+				break;
+		}
+	// Receive buffer B header (mirror of the read at 0xe1800)
+	} else if(addr == 0xe1800 && size == 2) {
+		(*mebhdr) = value;
+	// Receive buffer B data (mirror of the read at 0xe1802..0xe1fff)
+	} else if(addr >= 0xe1802 & addr <0xe2000 && size <=4) {
+		offset = addr - 0xe1802;
+		switch(size) {
+			case 4:
+				mebbuffer[offset]   = (value >> 24) & 0xff;
+				mebbuffer[offset+1] = (value >> 16) & 0xff;
+				mebbuffer[offset+2] = (value >>  8) & 0xff;
+				mebbuffer[offset+3] =  value        & 0xff;
+				break;
+			case 2:
+				mebbuffer[offset]   = (value >> 8) & 0xff;
+				mebbuffer[offset+1] =  value       & 0xff;
+				break;
+			case 1:
+				mebbuffer[offset]   =  value       & 0xff;
+				break;
+			default:
+				printf("3C400: rx buffer B, unmatched size %d at addr: %x\n",size,addr);
+				break;
+		}
+	}  else if(!quiet) {
 		printf("3C400: Uncaught write to addr %x, size %u\n",addr,size);
 	}
 }

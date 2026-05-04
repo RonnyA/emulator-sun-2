@@ -8,7 +8,6 @@
 
 extern int trace_scsi;
 extern int trace_sc;
-extern int trace_armed;
 extern int quiet;
 
 int scsi_bus_phase;
@@ -521,9 +520,9 @@ scsi_bus_data = 0;
 	    _scsi_set_phase(PHASE_STATUS, 0);
 	    break;
 	  case 0x08: /* READ */
-	    if (trace_scsi || trace_armed) 
+	    if (trace_scsi)
 	      printf("scsi: command READ %02x %02x %02x %02x %02x %02x %02x %02x\n",
-		     scsi_cmd_buf[0], scsi_cmd_buf[1], scsi_cmd_buf[2], scsi_cmd_buf[3], 
+		     scsi_cmd_buf[0], scsi_cmd_buf[1], scsi_cmd_buf[2], scsi_cmd_buf[3],
 		     scsi_cmd_buf[4], scsi_cmd_buf[5], scsi_cmd_buf[6], scsi_cmd_buf[7]);
 	    if (_scsi_read_block(id_selected, scsi_cmd_buf, 6, &pbuf, &psiz)) {
 	      abortf("scsi: read failed from disk image\n");
@@ -727,6 +726,14 @@ int _scsi_set_filenum(int unit, int num)
   }
 
   fname = u->fname[num];
+  if (fname == NULL) {
+    /* SunOS asked us to seek to a file slot we never configured (e.g.
+       no tape mounted, or the boot loader iterated past the last tape
+       file).  Return failure quietly -- perror() with a NULL fname is
+       UB and used to print "perror((null)): Invalid argument" once
+       per such request. */
+    return -1;
+  }
   fd = open(fname, (u->ro ? O_RDONLY : O_RDWR) | O_BINARY);
   if (fd < 0) {
     perror(fname);

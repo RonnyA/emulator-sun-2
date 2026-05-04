@@ -16,7 +16,6 @@
 extern int trace_mmu;
 extern int trace_sc;
 extern int trace_irq;
-extern int trace_armed;
 
 static unsigned short sc_dma_count;
 static unsigned int sc_dma_addr;
@@ -238,14 +237,6 @@ void sc_dma_read_data(unsigned char *buf, int bufsiz)
 {
   int i;
   extern unsigned char g_ram[];
-
-  if (trace_armed) {
-    unsigned int va, pa, mtype, fault, pte;
-
-    va = 0xf00000 + sc_dma_addr;
-    pa = cpu_map_address(va, 5, 1, &mtype, &fault, &pte);
-    printf("sc: dma %d bytes to 0x%x; va %x pa %x mtype %d\n", bufsiz, sc_dma_addr, va, pa, mtype);
-  }
 
 #if 0
   if (0) {

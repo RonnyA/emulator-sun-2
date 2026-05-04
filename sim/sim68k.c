@@ -106,7 +106,6 @@ int trace_mmu_rw;
 int trace_mem_bin;
 int trace_sc;
 int trace_scsi;
-int trace_armed;
 int trace_irq;
 
 extern int quiet;
@@ -335,7 +334,8 @@ void idprom_setup(unsigned char machine_type)
 
     for (int i = 16; i < 32; i++) id_prom[i] = 0xff;
 
-    printf("idprom: machine_type=0x%02x checksum=0x%02x\n", machine_type, xor_sum);
+    if (!quiet)
+        printf("idprom: machine_type=0x%02x checksum=0x%02x\n", machine_type, xor_sum);
 }
 unsigned int pgmap[4096];
 unsigned char segmap[4096];
@@ -537,12 +537,14 @@ void sysenable_write(unsigned int address, unsigned int value, int size)
   switch (size) {
   case 2:
     if ((sysen_reg & SUN2_SYSENABLE_EN_INT) && !(value & SUN2_SYSENABLE_EN_INT)) {
-      printf("sim68k: sysen_reg ints off; pending 0x%x, highest %d\n",
-	     g_int_controller_pending, g_int_controller_highest_int);
+      if (!quiet)
+        printf("sim68k: sysen_reg ints off; pending 0x%x, highest %d\n",
+	       g_int_controller_pending, g_int_controller_highest_int);
     }
     if (!(sysen_reg & SUN2_SYSENABLE_EN_INT) && (value & SUN2_SYSENABLE_EN_INT)) {
-      printf("sim68k: sysen_reg ints on; pending 0x%x, highest %d\n",
-	     g_int_controller_pending, g_int_controller_highest_int);
+      if (!quiet)
+        printf("sim68k: sysen_reg ints on; pending 0x%x, highest %d\n",
+	       g_int_controller_pending, g_int_controller_highest_int);
       replay = 1;
     }
 
@@ -933,45 +935,6 @@ unsigned int cpu_read_long(unsigned int address)
 }
 
 
-// debug - check if r/w address is mapped into context 3 (the next user proc)
-void _check_write(unsigned pa, unsigned b, int size)
-{
-  int i, j;
-
-  if (!trace_armed)
-    return;
-
-  if ((m68k_get_reg(NULL, M68K_REG_PC) & 0xff0000) == 0xef0000)
-    return;
-
-  for (i = 0; i < 0x20; i++) {
-    unsigned int segindex, pmeg_number, pgmapindex, pte, mapped_pa;
-    segindex = (i << 3) | 3;
-    pmeg_number = segmap[segindex];
-    pmeg_number = ((pmeg_number << 1) & 0xfe) | (pmeg_number & 0x80 ? 0x01 : 0x00);
-
-    if (pmeg_number == 0)
-      continue;
-
-    for (j = 0; j < 16; j++) {
-      pgmapindex = (pmeg_number << 4) | j;
-      pte = pgmap[pgmapindex];
-      if ((pte & 0x80000000) == 0)
-	continue;
-      mapped_pa = (pte & 0x00fff) << 11;
-      mapped_pa &= 0x00ffffff;
-      if (mapped_pa == (pa & ~0x7ff)) {
-	unsigned va;
-	va =  (i << 15) | (j << 11);
-	printf("write to mapped context3 space; pa %08x, v %02x, s %d (va %06x); sr %04x, pc %06x\n",
-	       pa, b, size, va, 
-	       m68k_get_reg(NULL, M68K_REG_SR), m68k_get_reg(NULL, M68K_REG_PC));
-	break;
-      }
-    }
-  }
-}
-
 /* Write data to RAM or a device */
 void cpu_write_byte(unsigned int address, unsigned int value)
 {
@@ -979,7 +942,6 @@ void cpu_write_byte(unsigned int address, unsigned int value)
     printf("cpu_write_byte fc=%x %x <- %x @ %x\n", g_fc, address, value, m68k_get_reg(NULL, M68K_REG_PC));
 
   { extern unsigned int m68ki_fault_pending; if (m68ki_fault_pending) printf("PENDING FAULT! cpu_write_byte %08x\n", address); }
-  //_check_write(address, value, 1);
 
   WRITE_BYTE(g_ram, address, value);
 }
@@ -990,7 +952,6 @@ void cpu_write_word(unsigned int address, unsigned int value)
     printf("cpu_write_word fc=%x %x <- %x @ %x\n", g_fc, address, value, m68k_get_reg(NULL, M68K_REG_PC));
 
   { extern unsigned int m68ki_fault_pending; if (m68ki_fault_pending) printf("PENDING FAULT! cpu_write_word %08x\n", address); }
-  //_check_write(address, value, 2);
 
   WRITE_WORD(g_ram, address, value);
 }
@@ -1001,7 +962,6 @@ void cpu_write_long(unsigned int address, unsigned int value)
     printf("cpu_write_long fc=%x %x <- %x @ %x\n", g_fc, address, value, m68k_get_reg(NULL, M68K_REG_PC));
 
   { extern unsigned int m68ki_fault_pending; if (m68ki_fault_pending) printf("PENDING FAULT! cpu_write_long %08x\n", address); }
-  //_check_write(address, value, 4);
 
   if (address < MAX_RAM) {
     WRITE_LONG(g_ram, address, value);
@@ -1956,12 +1916,6 @@ g_trace = 1;
 	enable_trace(2);
       } else {
 	enable_trace(0);
-      }
-#endif
-
-#if 0
-      if (trace_armed && (m68k_get_reg(NULL, M68K_REG_SR) & 0x2000) == 0) {
-	enable_trace(2);
       }
 #endif
 

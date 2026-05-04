@@ -160,7 +160,7 @@ int
 setup_eeprom(char *ef)
 {
   strcpy(eprom_filename, ef);
-  printf("eprom: %s\n", eprom_filename);
+  if (!quiet) printf("eprom: %s\n", eprom_filename);
   read_eprom();
   return 0;
 }
@@ -169,7 +169,7 @@ int
 setup_disk(char *df)
 {
   strcpy(disk_filename, df);
-  printf("disk: %s\n", disk_filename);
+  if (!quiet) printf("disk: %s\n", disk_filename);
   if (scsi_set_disk_image(0, disk_filename))
     return -1;
   return 0;
@@ -221,7 +221,7 @@ setup_tape(char *tf)
 
   for (i = 0; i < n; i++) {
     sprintf(filename, "%s/%s", tape_filename, tapefilename[i]);
-    printf("tape: file%d %s\n", i, filename);
+    if (!quiet) printf("tape: file%d %s\n", i, filename);
     if (scsi_set_tape_image(4, i, filename)) {
       printf("tape: can't setup tape image %s\n", filename);
       return -1;
@@ -477,9 +477,10 @@ int main(int argc, char **argv)
     }
   }
 
-  printf("mode: %s (idprom_machine=0x%02x, hires_jumper=%d, fb=%dx%d) — %s\n",
-         g_mode->name, g_mode->idprom_machine, g_mode->hires_jumper,
-         g_mode->width, g_mode->height, g_mode->desc);
+  if (!quiet)
+    printf("mode: %s (idprom_machine=0x%02x, hires_jumper=%d, fb=%dx%d) — %s\n",
+           g_mode->name, g_mode->idprom_machine, g_mode->hires_jumper,
+           g_mode->width, g_mode->height, g_mode->desc);
   idprom_setup(g_mode->idprom_machine);
 
   if (kernel_arg && boot_arg) {
