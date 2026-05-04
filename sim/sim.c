@@ -28,8 +28,28 @@
 #include <getopt.h>
 #include <dirent.h>
 #include <ctype.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+
+/* htonl/htons live in winsock2.h on Windows and arpa/inet.h on POSIX. */
+#ifdef _WIN32
+#  include <winsock2.h>
+#else
+#  include <arpa/inet.h>
+#endif
 
 #include "sim.h"
+#include "net.h"
+#include "scc_tcp.h"
+
+const char *g_net_iface = NULL;
+int g_net_dump = 0;
+int g_scc_tcp_port = 0;   /* 0 = disabled; otherwise listen on this port */
+int g_no_kbd = 0;         /* --no-kbd: pretend no keyboard, so PROM uses ttya */
+int g_scc_boards = 0;     /* --scc-boards=N: number of MULTIBUS expansion SCCs
+                             (zs2..zs5).  Default 0 = on-board zs0 + zs1 only.
+                             1 = +zs2 (ttye/f); 2 = +zs3 (ttyg/h); 3 = +zs4
+                             (ttyi/j); 4 = +zs5 (ttyk/l). */
 
 #include "scsi.h"
 
@@ -89,7 +109,7 @@ read_kernel(void)
 {
 	int fd;
 
-	fd = open(kernel_filename, O_RDONLY);
+	fd = open(kernel_filename, O_RDONLY | O_BINARY);
 	if (fd < 0) {
 		perror(kernel_filename);
 		exit(1);
@@ -116,7 +136,7 @@ read_eprom(void)
 {
 	int fd;
 
-	fd = open(eprom_filename, O_RDONLY);
+	fd = open(eprom_filename, O_RDONLY | O_BINARY);
 	if (fd < 0) {
 		perror(eprom_filename);
 		exit(1);
@@ -141,7 +161,7 @@ int
 setup_eeprom(char *ef)
 {
   strcpy(eprom_filename, ef);
-  printf("eprom: %s\n", eprom_filename);
+  if (!quiet) printf("eprom: %s\n", eprom_filename);
   read_eprom();
   return 0;
 }
@@ -150,7 +170,7 @@ int
 setup_disk(char *df)
 {
   strcpy(disk_filename, df);
-  printf("disk: %s\n", disk_filename);
+  if (!quiet) printf("disk: %s\n", disk_filename);
   if (scsi_set_disk_image(0, disk_filename))
     return -1;
   return 0;
@@ -179,11 +199,20 @@ setup_tape(char *tf)
 
   if (dir) {
     while ((d = readdir(dir))) {
-      if (d->d_type == DT_REG || d->d_type == DT_LNK) {
-	/* only take tape files named "xx" where "xx" is two digits */
-	if (strlen(d->d_name) == 2 && isdigit(d->d_name[0])) {
-	  tapefilename[n++] = strdup(d->d_name);
-	}
+      /* Some libc/dirent implementations (e.g. older w64devkit MinGW)
+         don't expose d_type at all; use stat() unconditionally. */
+      char probe[1024];
+      struct stat st;
+      snprintf(probe, sizeof(probe), "%s/%s", tape_filename, d->d_name);
+      if (stat(probe, &st) != 0) continue;
+      if (!S_ISREG(st.st_mode)
+#ifdef S_ISLNK
+          && !S_ISLNK(st.st_mode)
+#endif
+         ) continue;
+      /* only take tape files named "xx" where "xx" is two digits */
+      if (strlen(d->d_name) == 2 && isdigit(d->d_name[0])) {
+        tapefilename[n++] = strdup(d->d_name);
       }
     }
 
@@ -193,7 +222,7 @@ setup_tape(char *tf)
 
   for (i = 0; i < n; i++) {
     sprintf(filename, "%s/%s", tape_filename, tapefilename[i]);
-    printf("tape: file%d %s\n", i, filename);
+    if (!quiet) printf("tape: file%d %s\n", i, filename);
     if (scsi_set_tape_image(4, i, filename)) {
       printf("tape: can't setup tape image %s\n", filename);
       return -1;
@@ -251,7 +280,7 @@ void sun2_mode_print_list(void)
 
 void usage(void)
 {
-  fprintf(stderr, "sun-2 emulator\n");
+  fprintf(stderr, "sun-2 emulator (network backend: %s)\n", net_backend_name());
   fprintf(stderr, "usage:\n");
   fprintf(stderr, " --prom=FILE\n");
   fprintf(stderr, " --disk=FILE\n");
@@ -260,7 +289,27 @@ void usage(void)
   sun2_mode_print_list();
   fprintf(stderr, "optionally:\n");
   fprintf(stderr, " --kernel=FILE  --boot=FILE\n");
-  fprintf(stderr, " --auto-abort   send L1-A on first PROM bell-off (drops to monitor)\n");
+  fprintf(stderr, " --auto-abort       send L1-A on first PROM bell-off (drops to monitor)\n");
+  fprintf(stderr, " --trace-ring=N     keep last N MMU traces; dump on bus error\n");
+  fprintf(stderr, " --trace-ring-addr=ADDR  only dump trace ring for bus errors at ADDR (0=any)\n");
+  fprintf(stderr, " --net-iface=NAME|N bind the 3C400 to this host interface.\n");
+  fprintf(stderr, "                    NAME is a literal name (e.g. eth0 or a Windows\n");
+  fprintf(stderr, "                    \\Device\\NPF_{...} GUID).  N is an index into\n");
+  fprintf(stderr, "                    --net-list (1-based).\n");
+  fprintf(stderr, "                    (env: SUN2_NET_IFACE; default: backend auto-picks)\n");
+  fprintf(stderr, " --net-list         list available host interfaces and exit\n");
+  fprintf(stderr, " --net-dump         dump every 3C400 RX/TX frame to stderr\n");
+  fprintf(stderr, " --scc-tcp[=PORT]   expose SCC tty consoles on TCP (default port 9900).\n");
+  fprintf(stderr, "                    connect with: telnet host PORT   (or: nc host PORT)\n");
+  fprintf(stderr, "                    On connect a menu lists configured ttys; pick one.\n");
+  fprintf(stderr, " --scc-boards=N     attach N Multibus SCC expansion cards (0..4, default 0).\n");
+  fprintf(stderr, "                    Each card adds 2 ttys: 1=>ttye/f, 2=>+ttyg/h, 3=>+ttyi/j,\n");
+  fprintf(stderr, "                    4=>+ttyk/l.  SunOS GENERIC has zs2..zs5 compiled in.\n");
+  fprintf(stderr, "                    NOTE: the kbd/mouse chip is zs1 (Sun-2 conventions);\n");
+  fprintf(stderr, "                    there is no ttyc/ttyd on a Sun-2.\n");
+  fprintf(stderr, " --no-kbd           pretend no keyboard is attached; the PROM falls back\n");
+  fprintf(stderr, "                    to ttya as console.  Useful with --scc-tcp.\n");
+  fprintf(stderr, " -q                 quiet (suppress bus-error/vector trace)\n");
   exit(1);
 }
 
@@ -282,6 +331,15 @@ int main(int argc, char **argv)
   int c;
   int digit_optind = 0;
 
+  /* Disable stdio buffering so trace output reaches the terminal (or
+     a tee/redirect) immediately.  MSVC/MinGW's CRT treats _IOLBF as
+     _IOFBF for non-tty handles, so even line-buffered stdout would
+     hide startup banners and perror() messages until the process
+     exits — which made it look like the SCSI disk wasn't opening
+     when in fact the printfs were just stuck in the FILE buffer. */
+  setvbuf(stdout, NULL, _IONBF, 0);
+  setvbuf(stderr, NULL, _IONBF, 0);
+
   if (argc <= 1) {
     usage();
   }
@@ -290,20 +348,26 @@ int main(int argc, char **argv)
     int this_option_optind = optind ? optind : 1;
     int option_index = 0;
     static struct option long_options[] = {
-      {"prom",       optional_argument, 0,  'p' },
-      {"disk",       optional_argument, 0,  'd' },
-      {"tape",       optional_argument, 0,  't' },
-      {"kernel",     optional_argument, 0,  'k' },
-      {"boot",       optional_argument, 0,  'b' },
-      {"mode",       required_argument, 0,  'm' },
-      {"type",       required_argument, 0,  'T' },
-      {"auto-abort", no_argument,       0,  'A' },
-      {"trace-ring", required_argument, 0,  'R' },
-      {"trace-ring-addr", required_argument, 0, 'X' },
-      {0,            0,                 0,  0 }
+      {"prom",            optional_argument, 0,  'p' },
+      {"disk",            optional_argument, 0,  'd' },
+      {"tape",            optional_argument, 0,  't' },
+      {"kernel",          optional_argument, 0,  'k' },
+      {"boot",            optional_argument, 0,  'b' },
+      {"mode",            required_argument, 0,  'm' },
+      {"type",            required_argument, 0,  'T' },
+      {"auto-abort",      no_argument,       0,  'A' },
+      {"trace-ring",      required_argument, 0,  'R' },
+      {"trace-ring-addr", required_argument, 0,  'X' },
+      {"net-iface",       required_argument, 0,  'i' },
+      {"net-list",        no_argument,       0,  'L' },
+      {"net-dump",        no_argument,       0,  'D' },
+      {"scc-tcp",         optional_argument, 0,  'S' },
+      {"scc-boards",      required_argument, 0,  'B' },
+      {"no-kbd",          no_argument,       0,  'K' },
+      {0,                 0,                 0,   0  }
     };
 
-    c = getopt_long(argc, argv, "d:k:p:t:m:T:qAR:X:", long_options, &option_index);
+    c = getopt_long(argc, argv, "d:k:p:t:m:T:i:qAR:X:LDS::KB:", long_options, &option_index);
     if (c == -1)
       break;
 
@@ -377,6 +441,40 @@ int main(int argc, char **argv)
       break;
     }
 
+    case 'i':
+      g_net_iface = strdup(optarg);
+      break;
+
+    case 'L':
+      net_list_interfaces();
+      exit(0);
+
+    case 'D':
+      g_net_dump = 1;
+      break;
+
+    case 'S':
+      /* --scc-tcp        (no arg)   -> default port 9900
+         --scc-tcp=9912   (with arg) -> explicit port */
+      g_scc_tcp_port = optarg ? atoi(optarg) : 9900;
+      if (g_scc_tcp_port <= 0 || g_scc_tcp_port > 65535) {
+        fprintf(stderr, "--scc-tcp: invalid port '%s'\n", optarg ? optarg : "");
+        exit(1);
+      }
+      break;
+
+    case 'K':
+      g_no_kbd = 1;
+      break;
+
+    case 'B':
+      g_scc_boards = atoi(optarg);
+      if (g_scc_boards < 0 || g_scc_boards > 4) {
+        fprintf(stderr, "--scc-boards: must be 0..4 (got '%s')\n", optarg);
+        exit(1);
+      }
+      break;
+
     case '?':
       usage();
       break;
@@ -394,9 +492,29 @@ int main(int argc, char **argv)
     usage();
   }
 
-  printf("mode: %s (idprom_machine=0x%02x, hires_jumper=%d, fb=%dx%d) — %s\n",
-         g_mode->name, g_mode->idprom_machine, g_mode->hires_jumper,
-         g_mode->width, g_mode->height, g_mode->desc);
+  /* Fall back to SUN2_NET_IFACE env var if --net-iface wasn't given.
+     Strip leading/trailing whitespace — a stray space (e.g. from
+     `SUN2_NET_IFACE=7 ` in a shell) would otherwise be passed to
+     pcap_open_live and turn into "no such adapter '7 '". */
+  if (g_net_iface == NULL) {
+    const char *e = getenv("SUN2_NET_IFACE");
+    if (e) {
+      while (*e == ' ' || *e == '\t' || *e == '\n' || *e == '\r') e++;
+      if (*e) {
+        char *dup = strdup(e);
+        char *end = dup + strlen(dup);
+        while (end > dup && (end[-1] == ' ' || end[-1] == '\t' ||
+                             end[-1] == '\n' || end[-1] == '\r'))
+          *--end = '\0';
+        if (dup[0]) g_net_iface = dup; else free(dup);
+      }
+    }
+  }
+
+  if (!quiet)
+    printf("mode: %s (idprom_machine=0x%02x, hires_jumper=%d, fb=%dx%d) — %s\n",
+           g_mode->name, g_mode->idprom_machine, g_mode->hires_jumper,
+           g_mode->width, g_mode->height, g_mode->desc);
   idprom_setup(g_mode->idprom_machine);
 
   if (kernel_arg && boot_arg) {

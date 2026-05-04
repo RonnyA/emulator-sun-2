@@ -10,7 +10,7 @@
 
 extern int trace_scsi;
 extern int trace_sc;
-extern int trace_armed;
+extern int quiet;
 
 int scsi_bus_phase;
 unsigned int scsi_bus_state;
@@ -598,7 +598,7 @@ if (trace_scsi && id_selected >= 0) printf("scsi: PHASE_BUS_FREE (last select %d
 	  id_selected = 4;
       } else {
         int x;
-	for (x = 0; x < 8; x++) if (scsi_bus_data & (1 << x)) { id_selected = x; printf("scsi: target id%d\n", x); break; }
+	for (x = 0; x < 8; x++) if (scsi_bus_data & (1 << x)) { id_selected = x; if (!quiet) printf("scsi: target id%d\n", x); break; }
 	scsi_bus_state &= ~SCSI_BUS_BSY;
 scsi_bus_state = 0;
 //	if (trace_scsi) printf("scsi: ~id0&~id4, remove BSY\n");
@@ -687,9 +687,9 @@ scsi_bus_data = 0;
 	    _scsi_set_phase(PHASE_STATUS, 0);
 	    break;
 	  case 0x08: /* READ */
-	    if (trace_scsi || trace_armed) 
+	    if (trace_scsi)
 	      printf("scsi: command READ %02x %02x %02x %02x %02x %02x %02x %02x\n",
-		     scsi_cmd_buf[0], scsi_cmd_buf[1], scsi_cmd_buf[2], scsi_cmd_buf[3], 
+		     scsi_cmd_buf[0], scsi_cmd_buf[1], scsi_cmd_buf[2], scsi_cmd_buf[3],
 		     scsi_cmd_buf[4], scsi_cmd_buf[5], scsi_cmd_buf[6], scsi_cmd_buf[7]);
 	    if (_scsi_read_block(id_selected, scsi_cmd_buf, 6, &pbuf, &psiz)) {
 	      abortf("scsi: read failed from disk image\n");
@@ -911,12 +911,15 @@ int _scsi_set_filenum(int unit, int num)
   }
 
   fname = u->fname[num];
-  if (!fname) {
-    printf("scsi%d: set file %d: NO FILENAME REGISTERED — open skipped\n", unit, num);
+  if (fname == NULL) {
+    /* SunOS asked us to seek to a file slot we never configured (e.g.
+       no tape mounted, or the boot loader iterated past the last tape
+       file).  Return failure quietly -- perror() with a NULL fname is
+       UB and used to print "perror((null)): Invalid argument" once
+       per such request. */
     return -1;
   }
-
-  fd = open(fname, u->ro ? O_RDONLY : O_RDWR);
+  fd = open(fname, (u->ro ? O_RDONLY : O_RDWR) | O_BINARY);
   if (fd < 0) {
     printf("scsi%d: open('%s', %s) FAILED: %s\n",
            unit, fname, u->ro ? "O_RDONLY" : "O_RDWR", strerror(errno));

@@ -32,6 +32,7 @@
 #endif
 
 #include "sim.h"
+#include "icon_data.h"
 
 #define debug 0
 
@@ -114,6 +115,20 @@ void sdl_init(void)
         return;
     }
 
+    /* Set the SDL window icon from the embedded RGBA pixel array.  The
+       array in icon_data.h is 64x64 RGBA top-to-bottom, byte order R,G,B,A.
+       The .ico embedded via sim.rc covers the taskbar / Alt-Tab / file
+       explorer use; this call covers the in-window decoration. */
+    {
+        SDL_Surface *icon = SDL_CreateRGBSurfaceFrom(
+            (void *)icon_data, ICON_WIDTH, ICON_HEIGHT, 32, ICON_WIDTH * 4,
+            0x000000ff, 0x0000ff00, 0x00ff0000, 0xff000000);
+        if (icon) {
+            SDL_SetWindowIcon(screen, icon);
+            SDL_FreeSurface(icon);
+        }
+    }
+
     renderer = SDL_CreateRenderer(screen, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     if (!renderer) {
         renderer = SDL_CreateRenderer(screen, -1, 0);
@@ -140,8 +155,10 @@ void sdl_init(void)
 
     SDL_RendererInfo info;
     SDL_GetRendererInfo(renderer, &info);
-    printf("sdl_init: logical fb %dx%d, window %dx%d (resizable), renderer=%s\n",
-           cols, rows, win_w, win_h, info.name);
+    extern int quiet;
+    if (!quiet)
+        printf("sdl_init: logical fb %dx%d, window %dx%d (resizable), renderer=%s\n",
+               cols, rows, win_w, win_h, info.name);
 }
 
 //void sun2_sdl_key(int sdl_code, int modifiers, unsigned int unicode, int down);
@@ -509,6 +526,12 @@ void sun2_kb_write(int value, int size)
        the SCC RX FIFO.  Bell on/off produce no SCC response on real hw
        (only drive the beeper); we hijack the FIRST bell-off as the
        auto-abort trigger, then become inert. */
+
+    /* --no-kbd: stay silent on every keyboard command so the PROM's
+       reset-and-wait-for-reply times out, declares "no keyboard",
+       and switches its console to ttya (SCC channel 0). */
+    if (g_no_kbd) return;
+
     switch (value) {
     case 0x01: /* RESET */
       scc_in_push(3, 0xff);   /* reset done */
@@ -536,7 +559,28 @@ void sun2_sdl_key(SDL_Keycode sdl_code, uint16_t modifiers, SDL_Scancode scancod
 {
   unsigned int mapped, shifted;
 
-  if (0) printf("sdl: %u %u %u %d\n", sdl_code, modifiers, scancode, down);
+  /* --no-kbd: the keyboard is "not attached" — discard SDL keystrokes
+     so they don't show up on SCC channel 3.  Use --scc-tcp + a telnet
+     client for input instead (lands on channel 0). */
+  if (g_no_kbd) return;
+
+  /* Set SUN2_KEY_TRACE=1 in the environment to print what SDL hands
+     us on every key event.  Useful for figuring out which scancode +
+     keycode a non-US-layout key produces. */
+  {
+    static int probed = 0, enabled = 0;
+    if (!probed) {
+      probed = 1;
+      const char *e = getenv("SUN2_KEY_TRACE");
+      enabled = (e && *e && *e != '0');
+    }
+    if (enabled)
+      fprintf(stderr,
+              "sun2-key: keycode=0x%x scancode=%u (%s) mod=0x%x down=%d\n",
+              (unsigned)sdl_code, (unsigned)scancode,
+              SDL_GetScancodeName(scancode),
+              (unsigned)modifiers, down);
+  }
 
   /* F12 → L1-A (Stop-A) abort burst, matching RetroCore
      SunKeyboardMapper.IsAbortKey().  Press once on key-down only. */
@@ -552,8 +596,62 @@ void sun2_sdl_key(SDL_Keycode sdl_code, uint16_t modifiers, SDL_Scancode scancod
   if(sdl_code >= 255)
 	sdl_code = scancode;
 
-  // This should still work, just with slightly different values
-  mapped = map_sdl_to_sun2kb[sdl_code];
+  /* Numeric keypad: SDL keypad Keycodes are all > 255 (e.g.
+     SDLK_KP_0 = 0x40000059), so the scancode-fallback path below
+     would index a flat 512-int map and collide with SDLK_* values
+     for main-keyboard keys (SDL_SCANCODE_KP_3 = 91 = SDLK_LEFTBRACKET).
+     Handle keypad keys explicitly by scancode here.
+
+     Sun-2 keyboard keypad layout (from SunOS keytables.c):
+        KP digits 7/8/9 -> keypos 45/46/47
+        KP digits 4/5/6 -> keypos 68/69/70
+        KP digits 1/2/3 -> keypos 91/92/93
+        KP digit  0     -> keypos 114
+        KP '.'          -> keypos 116
+        KP '+'          -> keypos 22
+        KP '-'          -> keypos 23
+     The Sun-2 keyboard has no separate keypad Enter, '/', or '*',
+     so we alias KP_ENTER to the main Enter (pos 89) and KP_DIVIDE
+     to the main '/' (pos 109).  KP_MULTIPLY has no clean mapping --
+     the only '*' producing key on a Sun-2 is shift+':' (pos 87 with
+     shift held); synthesising shift around a single keypress is
+     fragile, so leave it unmapped (use shift+; on the main row to
+     get '*'). */
+  mapped = 0;
+  switch (scancode) {
+    case SDL_SCANCODE_KP_0:      mapped = 114; break;
+    case SDL_SCANCODE_KP_1:      mapped = 91;  break;
+    case SDL_SCANCODE_KP_2:      mapped = 92;  break;
+    case SDL_SCANCODE_KP_3:      mapped = 93;  break;
+    case SDL_SCANCODE_KP_4:      mapped = 68;  break;
+    case SDL_SCANCODE_KP_5:      mapped = 69;  break;
+    case SDL_SCANCODE_KP_6:      mapped = 70;  break;
+    case SDL_SCANCODE_KP_7:      mapped = 45;  break;
+    case SDL_SCANCODE_KP_8:      mapped = 46;  break;
+    case SDL_SCANCODE_KP_9:      mapped = 47;  break;
+    case SDL_SCANCODE_KP_PERIOD: mapped = 116; break;
+    case SDL_SCANCODE_KP_PLUS:   mapped = 22;  break;
+    case SDL_SCANCODE_KP_MINUS:  mapped = 23;  break;
+    case SDL_SCANCODE_KP_ENTER:  mapped = 89;  break;  /* alias main Enter */
+    case SDL_SCANCODE_KP_DIVIDE: mapped = 109; break;  /* alias main '/'   */
+    /* Layout-independent fallbacks for keys whose Keycode varies by
+       OS keyboard layout.  SDL_SCANCODE_* is the physical key position
+       (US-keyboard reference), so on a Norwegian/German/... layout the
+       physical "next to right-Shift" key still sends Sun '/' (pos 109)
+       even though its Keycode might be SDLK_MINUS or whatever.  Add
+       more keys here as we test other layouts. */
+    case SDL_SCANCODE_SLASH:     mapped = 109; break;
+    default: break;
+  }
+
+  if (mapped == 0) {
+    // If the keycode is over 128 use the scancode instead
+    if(sdl_code >= 255)
+      sdl_code = scancode;
+
+    // This should still work, just with slightly different values
+    mapped = map_sdl_to_sun2kb[sdl_code];
+  }
   if (0) printf("sdl: %u %u %u %u %d \n", sdl_code, modifiers, scancode, mapped, down);
 //  shifted = mapped & SHIFTED;
 
@@ -576,19 +674,6 @@ void sun2_sdl_key(SDL_Keycode sdl_code, uint16_t modifiers, SDL_Scancode scancod
     printf("4: %02x%02x%02x%02x\n", p[0], p[1], p[2], p[3]); p += 4;
     printf("8: %02x%02x%02x%02x\n", p[0], p[1], p[2], p[3]); p += 4;
     printf("c: %02x%02x%02x%02x\n", p[0], p[1], p[2], p[3]);
-  }
-#endif
-
-#if 1
-  if (sdl_code == SDLK_QUOTE && down) {
-    extern int trace_armed;
-    if (trace_armed == 0) {
-      trace_armed = 1;
-      printf("TRACE ARMED!\n");
-    } else {
-      trace_armed = 0;
-      printf("TRACE unarmed!\n");
-    }
   }
 #endif
 

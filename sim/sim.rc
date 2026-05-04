@@ -1,0 +1,5 @@
+// Windows resource file — embeds sun.ico into sim.exe so the taskbar,
+// file explorer, and Alt-Tab show the application icon.  The runtime
+// SDL_SetWindowIcon() call in sun2.c additionally sets the icon in
+// the SDL window's title bar from icon_data.h.
+IDI_ICON1 ICON "sun.ico"

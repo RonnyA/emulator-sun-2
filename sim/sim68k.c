@@ -26,6 +26,8 @@
 #include "sim68k.h"
 #include "m68k.h"
 #include "sim.h"
+#include "scc.h"
+#include "scc_tcp.h"
 
 
 /* Read/write macros */
@@ -418,7 +420,8 @@ void idprom_setup(unsigned char machine_type)
 
     for (int i = 16; i < 32; i++) id_prom[i] = 0xff;
 
-    printf("idprom: machine_type=0x%02x checksum=0x%02x\n", machine_type, xor_sum);
+    if (!quiet)
+        printf("idprom: machine_type=0x%02x checksum=0x%02x\n", machine_type, xor_sum);
 }
 unsigned int pgmap[4096];
 unsigned char segmap[4096];
@@ -839,6 +842,22 @@ unsigned int cpu_read_mbmem(unsigned int address, int size)
   // 3c400 board takes up 8k from e0000 to e2000, the address is dip settable but this is afaik the default and sufficient for our needs
   } else if(address >= 0xe0000 && address < 0xe2000) {
     value = e3c400_read(address, size);
+  } else if ((address >= 0x80800 && address <= 0x80807) ||  /* zs2 */
+             (address >= 0x81000 && address <= 0x81007) ||  /* zs3 */
+             (address >= 0x84800 && address <= 0x84807) ||  /* zs4 */
+             (address >= 0x85000 && address <= 0x85007)) {  /* zs5 */
+    /* SunOS Sun-2 GENERIC has 4 optional Multibus expansion SCC slots.
+       Route to the matching scc_chip_t if --scc-boards configured it,
+       otherwise bus-error so SunOS's zsprobe fails for that slot.  The
+       low 3 address bits are the in-chip register offset (ctlB/dataB/
+       ctlA/dataA), which scc_chip_read/write decode. */
+    scc_chip_t *chip = scc_lookup_mb(address);
+    if (chip)
+      value = scc_chip_read(chip, address & 0x7);
+    else {
+      pending_buserr();
+      value = 0xffffffff;
+    }
   } else
     switch (address) {
 #if 0
@@ -847,6 +866,17 @@ unsigned int cpu_read_mbmem(unsigned int address, int size)
     break;
 #endif
   default:
+    {
+      static int probed = 0, enabled = 0;
+      if (!probed) {
+        probed = 1;
+        const char *e = getenv("MBMEM_TRACE");
+        enabled = (e && *e && *e != '0');
+      }
+      if (enabled)
+        fprintf(stderr, "mbmem unhandled read  %06x (%d)         pc=%06x\n",
+                address, size, (unsigned)m68k_get_reg(NULL, M68K_REG_PC));
+    }
     pending_buserr();
     break;
   }
@@ -866,9 +896,29 @@ void cpu_write_mbmem(unsigned int address, int size, unsigned int value)
     sc_write(address, size, value);
   } else if(address >= 0xe0000 && address <= 0xe2000) {
     e3c400_write(address, size, value);
+  } else if ((address >= 0x80800 && address <= 0x80807) ||  /* zs2 */
+             (address >= 0x81000 && address <= 0x81007) ||  /* zs3 */
+             (address >= 0x84800 && address <= 0x84807) ||  /* zs4 */
+             (address >= 0x85000 && address <= 0x85007)) {  /* zs5 */
+    scc_chip_t *chip = scc_lookup_mb(address);
+    if (chip)
+      scc_chip_write(chip, address & 0x7, value);
+    else
+      pending_buserr();
   } else
   switch (address) {
   default:
+    {
+      static int probed = 0, enabled = 0;
+      if (!probed) {
+        probed = 1;
+        const char *e = getenv("MBMEM_TRACE");
+        enabled = (e && *e && *e != '0');
+      }
+      if (enabled)
+        fprintf(stderr, "mbmem unhandled write %06x (%d) <- %x  pc=%06x\n",
+                address, size, value, (unsigned)m68k_get_reg(NULL, M68K_REG_PC));
+    }
     pending_buserr();
     break;
   }
@@ -878,6 +928,30 @@ unsigned int cpu_read_obmem(unsigned int address, int size)
 {
   if (0) printf("cpu_read_obmem address %x (%d)\n", address, size);
 
+  /* --no-kbd: simulate "no video card plugged in" so the PROM's
+     detect_keyboard probe at 0xEC0000 (= OBMEM 0x700000) fails and
+     the boot path falls back to RS232 A as console.  We only nuke
+     the FIRST WORD of video memory; the rest of the framebuffer
+     stays writable so the SDL display still shows whatever the PROM
+     or SunOS draws (banner, X11, etc.).
+     Mechanism: each read of the first word returns a counter that
+     increments per access.  detect_keyboard (in 1.0f / multi-rev-R
+     PROMs) does two reads and compares; with a counter the reads
+     never match -> probe returns 0 -> PROM picks RS232 A.
+     Writes to the first word are dropped silently (otherwise the
+     probe's "write NOT(saved), read back" check would succeed). */
+  if (g_no_kbd && address >= 0x700000 && address < 0x700004) {
+    static unsigned int probe_counter = 0;
+    return (probe_counter++) & 0xffff;
+  }
+
+  /* The kbd/mouse SCC also lives on the video board; without the
+     card, accesses must fault. */
+  if (g_no_kbd && address >= 0x780000 && address < 0x780100) {
+    pending_buserr();
+    return 0xffffffff;
+  }
+
   if (address >= 0x700000 && address < 0x780000) {
     return sun2_video_read(address, size);
   }
@@ -886,16 +960,49 @@ unsigned int cpu_read_obmem(unsigned int address, int size)
     return sun2_kbm_read(address, size);
   }
 
+  /* Sun-2/120 SCC2 (serial port = ttya/ttyb) lives at OBMEM
+     0x7F_2000 - 0x7F_200F per RetroCore MachineSun2Memory.cs.
+     Forward to scc_read with the in-chip register offset preserved
+     in the low 4 bits — channels come out as 0=ttya, 1=ttyb (the
+     pa & 0xffff00 == 0x780000 check inside scc_read is for SCC1
+     keyboard/mouse and won't match here). */
+  if (address >= 0x7F2000 && address < 0x7F2010) {
+    return scc_read(address, size);
+  }
+
   if (address >= 0x781800 && address < 0x781900) {
     return sun2_video_ctl_read(address, size);
   }
 
+  {
+    static int probed = 0, enabled = 0;
+    if (!probed) {
+      probed = 1;
+      const char *e = getenv("OBMEM_TRACE");
+      enabled = (e && *e && *e != '0');
+    }
+    if (enabled)
+      fprintf(stderr, "obmem unhandled read  %06x (%d)         pc=%06x\n",
+              address, size, (unsigned)m68k_get_reg(NULL, M68K_REG_PC));
+  }
   return 0xffffffff;
 }
 
 void cpu_write_obmem(unsigned int address, int size, unsigned int value)
 {
   if (0) printf("cpu_write_obmem address %x (%d) <- %x\n", address, size, value);
+
+  /* --no-kbd: silently drop writes to the first word of video memory
+     (matches the read-side "no card" simulation -- see cpu_read_obmem
+     for full rationale).  The rest of the framebuffer stays writable. */
+  if (g_no_kbd && address >= 0x700000 && address < 0x700004) {
+    return;
+  }
+  /* Kbd/mouse SCC also bus-errors when the card is absent. */
+  if (g_no_kbd && address >= 0x780000 && address < 0x780100) {
+    pending_buserr();
+    return;
+  }
 
   if (address >= 0x700000 && address < 0x780000) {
     sun2_video_write(address, size, value);
@@ -904,10 +1011,30 @@ void cpu_write_obmem(unsigned int address, int size, unsigned int value)
 
   if (address >= 0x780000 && address < 0x780100) {
     sun2_kbm_write(address, size, value);
+    return;
+  }
+
+  /* Sun-2/120 SCC2 (serial port = ttya/ttyb) — see cpu_read_obmem. */
+  if (address >= 0x7F2000 && address < 0x7F2010) {
+    scc_write(address, value, size);
+    return;
   }
 
   if (address >= 0x781800 && address < 0x781900) {
     sun2_video_ctl_write(address, size, value);
+    return;
+  }
+
+  {
+    static int probed = 0, enabled = 0;
+    if (!probed) {
+      probed = 1;
+      const char *e = getenv("OBMEM_TRACE");
+      enabled = (e && *e && *e != '0');
+    }
+    if (enabled)
+      fprintf(stderr, "obmem unhandled write %06x (%d) <- %x  pc=%06x\n",
+              address, size, value, (unsigned)m68k_get_reg(NULL, M68K_REG_PC));
   }
 }
 
@@ -986,7 +1113,7 @@ void _check_write(unsigned pa, unsigned b, int size)
 	unsigned va;
 	va =  (i << 15) | (j << 11);
 	printf("write to mapped context3 space; pa %08x, v %02x, s %d (va %06x); sr %04x, pc %06x\n",
-	       pa, b, size, va, 
+	       pa, b, size, va,
 	       m68k_get_reg(NULL, M68K_REG_SR), m68k_get_reg(NULL, M68K_REG_PC));
 	break;
       }
@@ -1000,8 +1127,7 @@ void cpu_write_byte(unsigned int address, unsigned int value)
   if (trace_cpu_rw)
     printf("cpu_write_byte fc=%x %x <- %x @ %x\n", g_fc, address, value, m68k_get_reg(NULL, M68K_REG_PC));
 
-  { extern uint m68ki_fault_pending; if (m68ki_fault_pending) printf("PENDING FAULT! cpu_write_byte %08x\n", address); }
-  //_check_write(address, value, 1);
+  { extern unsigned int m68ki_fault_pending; if (m68ki_fault_pending) printf("PENDING FAULT! cpu_write_byte %08x\n", address); }
 
   WRITE_BYTE(g_ram, address, value);
 }
@@ -1011,8 +1137,7 @@ void cpu_write_word(unsigned int address, unsigned int value)
   if (trace_cpu_rw)
     printf("cpu_write_word fc=%x %x <- %x @ %x\n", g_fc, address, value, m68k_get_reg(NULL, M68K_REG_PC));
 
-  { extern uint m68ki_fault_pending; if (m68ki_fault_pending) printf("PENDING FAULT! cpu_write_word %08x\n", address); }
-  //_check_write(address, value, 2);
+  { extern unsigned int m68ki_fault_pending; if (m68ki_fault_pending) printf("PENDING FAULT! cpu_write_word %08x\n", address); }
 
   WRITE_WORD(g_ram, address, value);
 }
@@ -1022,8 +1147,7 @@ void cpu_write_long(unsigned int address, unsigned int value)
   if (trace_cpu_rw)
     printf("cpu_write_long fc=%x %x <- %x @ %x\n", g_fc, address, value, m68k_get_reg(NULL, M68K_REG_PC));
 
-  { extern uint m68ki_fault_pending; if (m68ki_fault_pending) printf("PENDING FAULT! cpu_write_long %08x\n", address); }
-  //_check_write(address, value, 4);
+  { extern unsigned int m68ki_fault_pending; if (m68ki_fault_pending) printf("PENDING FAULT! cpu_write_long %08x\n", address); }
 
   if (address < MAX_RAM) {
     WRITE_LONG(g_ram, address, value);
@@ -1137,6 +1261,7 @@ void io_update(void)
   scc_update();
   e3c400_update();
   sun2_autotype_tick();
+  scc_tcp_poll();   /* drain bytes from any connected TCP client */
 
   if (sdl_poll_delay++ == 10000) {
     sdl_poll_delay = 0;
@@ -1144,10 +1269,37 @@ void io_update(void)
   }
 }
 
+extern void scc_init_traces(void);
+
 void io_init(void)
 {
   e3c400_init();
   sun2_init();
+  scc_init_traces();
+  /* Start the SCC-TCP server if --scc-tcp[=PORT] was given.  If bind
+     fails (e.g. another sim.exe is already holding the port -- common
+     on Windows where taskkill of the previous sim leaves the FD in
+     LISTENING for a moment), exit the sim immediately instead of
+     running silently with no listener.  Otherwise the user's next
+     `telnet localhost 9900` either gets refused or connects to the
+     stale sim, which is hard to diagnose. */
+  extern int g_scc_tcp_port;
+  if (g_scc_tcp_port > 0) {
+    if (scc_tcp_start(g_scc_tcp_port) < 0) {
+      fprintf(stderr,
+              "scc-tcp: aborting -- the listener could not be started.\n"
+              "  Likely another sim.exe is still bound to port %d;\n"
+              "  kill it (Windows: `taskkill /F /IM sim.exe`) and retry.\n",
+              g_scc_tcp_port);
+      exit(1);
+    }
+    /* atexit hook so the listen socket and client sockets get closed
+       on every normal exit path (SDL_QUIT, SIGINT/TERM/HUP, abortf,
+       etc).  Without this, a fast restart of the sim hits "bind:
+       address already in use" because the previous instance's listen
+       FD lingers a few seconds. */
+    atexit(scc_tcp_stop);
+  }
 }
 
 /* Implementation for the interrupt controller */
@@ -1715,9 +1867,9 @@ void trace_file_entry(int what, unsigned int *record, int size)
 
   if (trace_bin_fd == 0) {
 #ifdef __linux__
-    int flags = O_CREAT | O_TRUNC | O_LARGEFILE | O_WRONLY;
+    int flags = O_CREAT | O_TRUNC | O_LARGEFILE | O_WRONLY | O_BINARY;
 #else
-    int flags = O_CREAT | O_TRUNC | O_WRONLY;
+    int flags = O_CREAT | O_TRUNC | O_WRONLY | O_BINARY;
 #endif
 
     trace_bin_fd = open("trace.bin", flags, 0666);
@@ -1915,8 +2067,11 @@ void sim68k(void)
    */
   if (signal (SIGINT, termination_handler) == SIG_IGN)
     signal (SIGINT, SIG_IGN);
+#ifdef SIGHUP
+  /* SIGHUP doesn't exist on Windows. */
   if (signal (SIGHUP, termination_handler) == SIG_IGN)
     signal (SIGHUP, SIG_IGN);
+#endif
   if (signal (SIGTERM, termination_handler) == SIG_IGN)
     signal (SIGTERM, SIG_IGN);
 
@@ -2026,12 +2181,6 @@ g_trace = 1;
 	enable_trace(2);
       } else {
 	enable_trace(0);
-      }
-#endif
-
-#if 0
-      if (trace_armed && (m68k_get_reg(NULL, M68K_REG_SR) & 0x2000) == 0) {
-	enable_trace(2);
       }
 #endif
 

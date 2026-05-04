@@ -16,7 +16,6 @@
 extern int trace_mmu;
 extern int trace_sc;
 extern int trace_irq;
-extern int trace_armed;
 
 static unsigned short sc_dma_count;
 static unsigned int sc_dma_addr;
@@ -239,6 +238,7 @@ void sc_dma_read_data(unsigned char *buf, int bufsiz)
   int i;
   extern unsigned char g_ram[];
 
+  extern int trace_armed;
   unsigned short dc_before = sc_dma_count;
   if (trace_sc && bufsiz <= 32)
     printf("sc: dma_read enter bufsiz=%d dma_count=%04x\n", bufsiz, dc_before);

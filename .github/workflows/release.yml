@@ -1,0 +1,263 @@
+name: Release builds
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag name for the release (e.g. v0.2.0). Leave empty to build without publishing.'
+        required: false
+        default: ''
+
+env:
+  PKG_NAME: emulator-sun-2
+  PKG_DESCRIPTION: "Sun-2 workstation emulator (68010 + bwtwo + SCSI)"
+
+jobs:
+  # -------------------------------------------------------------------
+  # Windows x64 (MSYS2 MinGW-w64)
+  # -------------------------------------------------------------------
+  build-windows:
+    # Build two Windows variants:
+    #   - pcap : full 3C400 ethernet via Npcap.  Requires the Npcap
+    #            *runtime* on the user's machine; without it sim.exe
+    #            will fail to start because wpcap.dll won't load.
+    #   - stub : no ethernet, runs on any Windows box without extras.
+    name: Build windows-x64-${{ matrix.net }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        net: [pcap, stub]
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2 (MINGW64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            base-devel
+            git
+            unzip
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-make
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-SDL2
+
+      - name: Show toolchain versions
+        run: |
+          gcc --version | head -1
+          make --version | head -1
+          pkg-config --modversion sdl2
+
+      - name: Download Npcap SDK
+        if: matrix.net == 'pcap'
+        run: |
+          set -e
+          curl -fsSL -o npcap-sdk.zip https://npcap.com/dist/npcap-sdk-1.13.zip
+          mkdir -p npcap-sdk
+          unzip -q npcap-sdk.zip -d npcap-sdk
+
+      - name: Build release (NET_BACKEND=${{ matrix.net }})
+        env:
+          NPCAP_SDK: ${{ github.workspace }}\npcap-sdk
+        run: |
+          set -e
+          if [ "${{ matrix.net }}" = "pcap" ]; then
+            export NPCAP_SDK="$(cygpath -u "$NPCAP_SDK")"
+          else
+            unset NPCAP_SDK
+          fi
+          make NET_BACKEND=${{ matrix.net }} release
+
+      - name: Stage release artifacts
+        run: |
+          set -e
+          STAGE="dist/emulator-sun-2-windows-x64-${{ matrix.net }}"
+          mkdir -p "$STAGE"
+          cp sim/sim.exe "$STAGE/"
+          cp /mingw64/bin/SDL2.dll "$STAGE/SDL2.dll"
+          cp README.md "$STAGE/" 2>/dev/null || true
+          cp COPYING "$STAGE/" 2>/dev/null || true
+          if [ "${{ matrix.net }}" = "pcap" ]; then
+            cat > "$STAGE/NETWORKING.txt" <<'EOF'
+          This build links against Npcap for 3C400 ethernet emulation.
+
+          REQUIRED: install the Npcap runtime from https://npcap.com/
+          (enable "WinPcap API compatible" mode during installation).
+          Without Npcap, sim.exe will fail to start because wpcap.dll
+          cannot be loaded.
+
+          To pick a specific host adapter (Wi-Fi, Ethernet, vmnet,
+          etc.), run sim.exe with --net-list to see the available
+          interfaces, then pass --net-iface=NAME or set the env var
+          SUN2_NET_IFACE=NAME.  By default the first non-loopback
+          adapter is used.
+
+          If you don't need network emulation, use the
+          emulator-sun-2-windows-x64-stub build instead — it runs on
+          any Windows box without extra installs.
+          EOF
+          else
+            cat > "$STAGE/NETWORKING.txt" <<'EOF'
+          This build has 3C400 ethernet DISABLED (NET_BACKEND=stub).
+
+          The emulator runs on any Windows box without needing Npcap or
+          any other network library.  The 3C400 device still appears
+          to the guest, but no packets flow.
+
+          For working ethernet emulation, use the
+          emulator-sun-2-windows-x64-pcap build — that variant requires
+          the Npcap runtime from https://npcap.com/ to be installed.
+          EOF
+          fi
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: emulator-sun-2-windows-x64-${{ matrix.net }}
+          path: dist/emulator-sun-2-windows-x64-${{ matrix.net }}/
+          if-no-files-found: error
+
+  # -------------------------------------------------------------------
+  # Linux x64
+  # -------------------------------------------------------------------
+  build-linux:
+    name: Build linux-x64
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libsdl2-dev libpcap-dev
+
+      - name: Show toolchain versions
+        run: |
+          gcc --version | head -1
+          make --version | head -1
+          pkg-config --modversion sdl2
+          pkg-config --modversion libpcap || true
+
+      - name: Build release
+        run: make NET_BACKEND=pcap release
+
+      - name: Stage release artifacts
+        run: |
+          set -e
+          STAGE="dist/emulator-sun-2-linux-x64"
+          mkdir -p "$STAGE"
+          cp sim/sim "$STAGE/"
+          cp README.md "$STAGE/" 2>/dev/null || true
+          cp COPYING "$STAGE/" 2>/dev/null || true
+          cat > "$STAGE/NETWORKING.txt" <<'EOF'
+          The 3C400 Ethernet uses libpcap.  Make sure libpcap is
+          installed at runtime (apt: libpcap0.8) and that the user
+          running the emulator has CAP_NET_RAW or has been added to
+          a group that can open raw sockets via pcap_open_live().
+          EOF
+          cd dist
+          tar czf emulator-sun-2-linux-x64.tar.gz emulator-sun-2-linux-x64
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: emulator-sun-2-linux-x64
+          path: dist/emulator-sun-2-linux-x64.tar.gz
+          if-no-files-found: error
+
+  # -------------------------------------------------------------------
+  # macOS arm64 (Apple Silicon)
+  # -------------------------------------------------------------------
+  build-macos:
+    name: Build macos-arm64
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install SDL2
+        run: brew install sdl2
+
+      - name: Build release
+        # macOS uses the BPF backend by default; libpcap is preinstalled
+        # in /usr/lib but we don't need it for the BPF build.
+        run: make release
+
+      - name: Stage release artifacts
+        run: |
+          set -e
+          STAGE="dist/emulator-sun-2-macos-arm64"
+          mkdir -p "$STAGE"
+          cp sim/sim "$STAGE/"
+          cp README.md "$STAGE/" 2>/dev/null || true
+          cp COPYING "$STAGE/" 2>/dev/null || true
+          cat > "$STAGE/NETWORKING.txt" <<'EOF'
+          The 3C400 Ethernet uses /dev/bpf*.  You'll need read/write
+          access to a /dev/bpf* node — typically by chmod'ing it or
+          adding your user to the 'access_bpf' group.  Do NOT run the
+          emulator as root.
+          EOF
+          cd dist
+          tar czf emulator-sun-2-macos-arm64.tar.gz emulator-sun-2-macos-arm64
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: emulator-sun-2-macos-arm64
+          path: dist/emulator-sun-2-macos-arm64.tar.gz
+          if-no-files-found: error
+
+  # -------------------------------------------------------------------
+  # Publish a GitHub Release on tag push
+  # -------------------------------------------------------------------
+  publish-release:
+    name: Publish GitHub Release
+    needs: [build-windows, build-linux, build-macos]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Re-zip Windows artifact directory
+        # Windows is uploaded as a directory (to avoid double-zipping by
+        # actions/upload-artifact); rebuild a clean .zip for the release.
+        run: |
+          set -e
+          cd dist
+          for d in */; do
+            name="${d%/}"
+            if ls "$d"*.exe >/dev/null 2>&1; then
+              zip -r "${name}.zip" "$name"
+            fi
+          done
+
+      - name: List artifacts
+        run: find dist -maxdepth 2 -type f \( -name '*.zip' -o -name '*.tar.gz' \) -print
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.zip
+            dist/**/*.tar.gz
+          generate_release_notes: true
+          draft: false
+          prerelease: false

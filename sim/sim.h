@@ -4,6 +4,40 @@
  * 10/2014  Brad Parker <brad@heeltoe.com>
  */
 
+#ifndef SUN2_SIM_H
+#define SUN2_SIM_H
+
+#include <stdint.h>
+#include <fcntl.h>
+#include <stdio.h>
+
+/*
+ * Debug build flag: TRACE_PRINTF
+ *
+ * When -DTRACE_PRINTF is set at compile time, every `printf()` call
+ * in the sim/ tree gets prefixed with [file:line] so it's obvious
+ * which source line is firing.  Used for one-off "where is this spam
+ * coming from" investigations.
+ *
+ * Build with:   make TRACE_PRINTF=1
+ * Then run normally — every output line carries its origin tag.
+ */
+#ifdef TRACE_PRINTF
+extern int sun2_dprintf(const char *file, int line, const char *fmt, ...);
+#define printf(...) sun2_dprintf(__FILE__, __LINE__, __VA_ARGS__)
+extern void sun2_dperror(const char *file, int line, const char *s);
+#define perror(s) sun2_dperror(__FILE__, __LINE__, (s))
+#endif
+
+/* On Windows, open() defaults to TEXT mode — \r\n is translated to \n on
+   read, \n becomes \r\n on write, and 0x1A is treated as EOF.  That
+   silently corrupts every binary image we open (PROM, disk, tape).
+   POSIX systems don't have an O_BINARY flag because they never had this
+   problem; provide a no-op so callers can always pass it. */
+#ifndef O_BINARY
+# define O_BINARY 0
+#endif
+
 /* IRQ connections */
 #define IRQ_9513_TIMER1	7
 #define IRQ_SCC         6
@@ -39,6 +73,30 @@ typedef struct sun2_mode_s {
 extern const sun2_mode_t *g_mode;
 const sun2_mode_t *sun2_mode_lookup(const char *name);
 void sun2_mode_print_list(void);
+
+/* Host network interface name to bind the 3C400 ethernet to.
+   NULL means "let the active backend pick a default" (pcap auto-picks
+   the first non-loopback adapter; BPF uses en0).  Set from the
+   --net-iface=NAME command line option, or the SUN2_NET_IFACE
+   environment variable, or NULL if neither is given. */
+extern const char *g_net_iface;
+
+/* If non-zero, dump every RX/TX frame the 3C400 sees (to stderr).
+   Useful for comparing what we hand SunOS vs. what RetroCore's
+   E3C400Chip writes when triaging "ec0: garbled packet". */
+extern int g_net_dump;
+
+/* If non-zero, the keyboard is "not attached" — sun2_kb_write
+   ignores keyboard reset/bell commands and the SDL key callback
+   discards keystrokes.  When the PROM sees no reply to its
+   keyboard reset on SCC channel 3 it falls back to ttya (SCC
+   channel 0) for console I/O.  Combined with --scc-tcp this gives
+   a fully serial-console session over TCP. */
+extern int g_no_kbd;
+/* Number of MULTIBUS SCC expansion cards (0..4).  Each adds 2 ttys.
+   See sim.c for the SunOS naming convention (no ttyc/d because zs1 is
+   the kbd/mouse chip). */
+extern int g_scc_boards;
 /* Build the IDPROM bytes for a given machine type, recompute byte-15 checksum. */
 void idprom_setup(unsigned char machine_type);
 
@@ -51,6 +109,16 @@ int scc_device_ack(int which);
 void scc_update(void);
 int scc_in_pop(int ch, unsigned int *pv);
 void scc_in_push(int ch, int v);
+
+/* tty-index API used by scc_tcp.c.  Indexing matches SunOS Sun-2 minor
+   numbers WITH the kbd/mouse gap removed: 0=ttya, 1=ttyb, 2=ttye,
+   3=ttyf, 4=ttyg, 5=ttyh, 6=ttyi, 7=ttyj, 8=ttyk, 9=ttyl. */
+int          scc_tty_count(void);
+const char  *scc_tty_name(int tty_idx);
+void         scc_tty_in_push(int tty_idx, uint8_t byte);
+/* Multibus expansion chip lookup -- used by sim68k.c for routing. */
+struct scc_chip_s;
+struct scc_chip_s *scc_lookup_mb(unsigned int mb_base);
 
 unsigned int am9513_read(unsigned int pa, int size);
 void am9513_write(unsigned int pa, unsigned int value, int size);
@@ -110,4 +178,6 @@ void abortf(const char *fmt, ...);
 
 unsigned int cpu_read(int size, unsigned int address);
 void cpu_write(int size, unsigned int address, unsigned int value);
+
+#endif /* SUN2_SIM_H */
 

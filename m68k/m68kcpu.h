@@ -1852,7 +1852,7 @@ INLINE void m68ki_exception_trace(void)
 
 	m68ki_jump_vector(EXCEPTION_TRACE);
 
-if (CPU_STOPPED && (CPU_STOPPED & ~STOP_LEVEL_STOP) == 0) printf("CPU UNSTOPPED!\n");
+{ extern int quiet; if (CPU_STOPPED && (CPU_STOPPED & ~STOP_LEVEL_STOP) == 0 && !quiet) printf("CPU UNSTOPPED!\n"); }
 	/* Trace nullifies a STOP instruction */
 	CPU_STOPPED &= ~STOP_LEVEL_STOP;
 
@@ -1955,7 +1955,7 @@ void m68ki_exception_interrupt(uint int_level)
 	uint sr;
 	uint new_pc;
 
-if (CPU_STOPPED && (CPU_STOPPED & ~STOP_LEVEL_STOP) == 0) printf("CPU UNSTOPPED!\n");
+{ extern int quiet; if (CPU_STOPPED && (CPU_STOPPED & ~STOP_LEVEL_STOP) == 0 && !quiet) printf("CPU UNSTOPPED!\n"); }
 
 	/* Turn off the stopped state */
 	CPU_STOPPED &= ~STOP_LEVEL_STOP;

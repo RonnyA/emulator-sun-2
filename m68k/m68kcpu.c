@@ -745,15 +745,9 @@ int m68k_execute(int num_cycles)
 		 * m68k_execute entry.  Real 68010 hardware leaves the registers
 		 * in their pre-instruction state when a bus error occurs. */
 		if (m68ki_fault_pending) {
-			extern int trace_mmu;
 			int i;
 			for (i = 0; i < 16; i++) {
 				if (m68ki_cpu.dar[i] != save_regs[i]) {
-					if (trace_mmu) {
-						printf("fault: %s%d changed; old %08x new %08x\n",
-							i < 8 ? "D" : "A", i & 7,
-							save_regs[i], m68ki_cpu.dar[i]);
-					}
 					m68ki_cpu.dar[i] = save_regs[i];
 				}
 			}

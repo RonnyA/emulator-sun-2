@@ -2,6 +2,8 @@
 
 #include <stdio.h>
 
+extern int quiet;
+
 static unsigned counter[8];
 static unsigned ms;
 static unsigned delay;
