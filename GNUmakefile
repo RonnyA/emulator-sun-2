@@ -31,7 +31,7 @@ SIM = sim/sim$(EXE_EXT)
 # things like `make run 7 RUN_VERSION=20` (variable assignments are
 # not in MAKECMDGOALS so they don't get captured).
 # ---------------------------------------------------------------------
-RUN_TARGETS := run run-trace run-tcp run-serial
+RUN_TARGETS := run run-trace run-tcp run-serial run-multi
 ifneq (,$(filter $(RUN_TARGETS),$(MAKECMDGOALS)))
     RUN_ARGS := $(wordlist 2,$(words $(MAKECMDGOALS)),$(MAKECMDGOALS))
     ifneq (,$(RUN_ARGS))
@@ -55,7 +55,13 @@ ifdef NOKBD
     NO_KBD_FLAG := --no-kbd
 endif
 
-.PHONY: all release sunos20 sunos32 sunos35 run run-trace run-tcp run-serial net-list clean help fetch-sdl2 fetch-npcap-sdk
+# Number of Multibus SCC expansion boards to attach (0..4).  Each adds
+# 2 ttys (zs2->ttye/f, zs3->ttyg/h, zs4->ttyi/j, zs5->ttyk/l).
+ifdef BOARDS
+    SCC_BOARDS_FLAG := --scc-boards=$(BOARDS)
+endif
+
+.PHONY: all release sunos20 sunos32 sunos35 run run-trace run-tcp run-serial run-multi net-list clean help fetch-sdl2 fetch-npcap-sdk
 
 all:
 	$(MAKE) -C m68k all
@@ -105,7 +111,7 @@ define stage_and_run
     $(MAKE) sunos$(RUN_VERSION); \
 fi
 $(if $(filter .exe,$(EXE_EXT)),@if [ -f external/SDL2/x86_64-w64-mingw32/bin/SDL2.dll ] && [ ! -f sim/SDL2.dll ]; then cp external/SDL2/x86_64-w64-mingw32/bin/SDL2.dll sim/SDL2.dll; fi)
-$(SIM) $(1) $(NET_IFACE_FLAG) $(SCC_TCP_FLAG) $(NO_KBD_FLAG) --prom=$(PROM) --disk=$(DISK) --tape=media/tape/tape
+$(SIM) $(1) $(NET_IFACE_FLAG) $(SCC_TCP_FLAG) $(SCC_BOARDS_FLAG) $(NO_KBD_FLAG) --prom=$(PROM) --disk=$(DISK) --tape=media/tape/tape
 endef
 
 run: all
@@ -124,6 +130,14 @@ run-tcp: all
 # messages all flow through telnet.  No SDL window interaction needed.
 run-serial: all
 	@$(MAKE) --no-print-directory run TCP=9900 NOKBD=1 $(filter-out run-serial,$(RUN_ARGS))
+
+# Full-fat: SDL window + keyboard/mouse + scc-tcp on 9900 + all four
+# Multibus expansion SCC boards.  Connect with `telnet localhost 9900`
+# and pick a tty from the menu (ttya/b/e/f/g/h/i/j/k/l).  See README's
+# "SCC consoles over TCP" section for the /etc/ttytab edit needed to
+# get login prompts on ttya/b once SunOS is booted.
+run-multi: all
+	@$(MAKE) --no-print-directory run TCP=9900 BOARDS=4 $(filter-out run-multi,$(RUN_ARGS))
 
 # List host network interfaces visible to the active backend.  Useful
 # for picking what to pass to --net-iface or SUN2_NET_IFACE.
@@ -167,6 +181,9 @@ help:
 	@echo "  make run-serial  Headless: TCP=9900 + --no-kbd  (PROM uses ttya;"
 	@echo "                   all boot output flows through telnet, no SDL needed)"
 	@echo "  make run-serial N  run-serial + --net-iface=N"
+	@echo "  make run-multi   GUI + TCP=9900 + --scc-boards=4 (10 ttys total:"
+	@echo "                   ttya/b plus ttye/f/g/h/i/j/k/l).  Pick from menu."
+	@echo "  make run BOARDS=N  Same as run with --scc-boards=N (0..4)"
 	@echo "  make run-trace   Same as run but with full bus-error / vector trace"
 	@echo "  make run-trace N Trace mode with --net-iface=N"
 	@echo "  make net-list    Print available host network interfaces"
