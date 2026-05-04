@@ -13,7 +13,6 @@
 #include "sim.h"
 
 int trace_am9513;
-extern int trace_irq;
 
 struct am9513_ctr_s {
   unsigned short mode;
@@ -120,7 +119,6 @@ void am9513_update(void)
 
   if (am9513_irq_t2) {
     am9513_irq_t2 = 0;
-    if (trace_irq) printf("am9513: irq t2\n");
     int_controller_set(IRQ_9513_TIMER2);
   }
 }

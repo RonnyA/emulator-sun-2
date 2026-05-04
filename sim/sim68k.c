@@ -107,7 +107,6 @@ int trace_mem_bin;
 int trace_sc;
 int trace_scsi;
 int trace_armed;
-int trace_irq;
 
 /* --- Instruction trace ring buffer ---
    Records the last N executed instructions with full register state.
@@ -649,7 +648,7 @@ void sysenable_read(unsigned int address, unsigned int *pvalue, int size)
 {
   unsigned int value;
   value = sysen_reg;
-  if (trace_mmu || trace_irq) printf("mmu: sysen read %x -> %x (%d)\n", address, value, size);
+  if (trace_mmu) printf("mmu: sysen read %x -> %x (%d)\n", address, value, size);
   *pvalue = value;
 }
 
@@ -660,7 +659,7 @@ void sysenable_write(unsigned int address, unsigned int value, int size)
   unsigned int new_val;
   int replay = 0;
 
-  if (trace_mmu || trace_irq) printf("mmu: sysen write %x <- %x (%d)\n", address, value, size);
+  if (trace_mmu) printf("mmu: sysen write %x <- %x (%d)\n", address, value, size);
 
   /* The Sun-2 system-enable register is 16-bit big-endian.  PROM rev 1.0F
      writes individual bytes via FC=3 byte access, where byte at offset 0x0e
@@ -684,17 +683,8 @@ void sysenable_write(unsigned int address, unsigned int value, int size)
     return;
   }
 
-  if ((sysen_reg & SUN2_SYSENABLE_EN_INT) && !(new_val & SUN2_SYSENABLE_EN_INT)) {
-    if (trace_irq)
-      printf("sim68k: sysen_reg ints off; pending 0x%x, highest %d\n",
-	     g_int_controller_pending, g_int_controller_highest_int);
-  }
-  if (!(sysen_reg & SUN2_SYSENABLE_EN_INT) && (new_val & SUN2_SYSENABLE_EN_INT)) {
-    if (trace_irq)
-      printf("sim68k: sysen_reg ints on; pending 0x%x, highest %d\n",
-	     g_int_controller_pending, g_int_controller_highest_int);
+  if (!(sysen_reg & SUN2_SYSENABLE_EN_INT) && (new_val & SUN2_SYSENABLE_EN_INT))
     replay = 1;
-  }
 
   sysen_reg = new_val;
   if (trace_mmu) printf("mmu: sysen %x\n", sysen_reg);
@@ -1169,7 +1159,6 @@ void cpu_set_fc(unsigned int fc)
 /* Called when the CPU acknowledges an interrupt */
 int cpu_irq_ack(int level)
 {
-  if (level != 7 && trace_irq) printf("cpu_irq_ack(%d)\n", level);
   switch(level)
     {
 //    case IRQ_NMI_DEVICE:
@@ -1195,7 +1184,6 @@ int cpu_irq_ack(int level)
 
 int sw_int_ack(int intr)
 {
-  if (trace_irq) printf("sysen: sw int ack\n");
   switch (intr) {
   case 1:
     int_controller_clear(IRQ_SW_INT1);
@@ -1213,7 +1201,6 @@ int sw_int_ack(int intr)
 
 void sw_int_throw(int intr)
 {
-  if (trace_irq) printf("sysen: sw int throw\n");
   switch (intr) {
   case 1:
     int_controller_set(IRQ_SW_INT1);
@@ -1307,9 +1294,6 @@ void int_controller_set(unsigned int value)
 {
   unsigned int old_pending = g_int_controller_pending;
 
-  if (value != 7 && trace_irq)
-    printf("sim68k: int_controller_set(%d) old_pending %d, INTS_ENABLED %d\n", value, old_pending, INTS_ENABLED);
-
   g_int_controller_pending |= (1<<value);
 
   /* Level 7 (NMI) is edge-triggered: every assertion is a fresh NMI
@@ -1325,42 +1309,27 @@ void int_controller_set(unsigned int value)
    * queue. */
   if (value == 7) {
     if (INTS_ENABLED) m68k_set_irq(7);
-    else if (trace_irq) printf("sim68k: ints not enabled; level 7 dropped\n");
     if (g_int_controller_highest_int < 7) g_int_controller_highest_int = 7;
     return;
   }
 
-  if(old_pending != g_int_controller_pending && value > g_int_controller_highest_int)
-    {
-      g_int_controller_highest_int = value;
-      if (INTS_ENABLED) {
-	m68k_set_irq(g_int_controller_highest_int);
-      } else if (trace_irq)
-	printf("sim68k: ints not enabled; set %d\n", value);
-    }
-  else if (trace_irq)
-    printf("sim68k: tried to set irq %d (old_pending 0x%x, controller_pending 0x%x. highest_int %d)\n",
-	      value, old_pending, g_int_controller_pending, g_int_controller_highest_int);
+  if (old_pending != g_int_controller_pending && value > g_int_controller_highest_int) {
+    g_int_controller_highest_int = value;
+    if (INTS_ENABLED)
+      m68k_set_irq(g_int_controller_highest_int);
+  }
 }
 
 void int_controller_clear(unsigned int value)
 {
-  if (value != 7 && trace_irq)
-    printf("sim68k: int_controller_clear(%d)\n", value);
-
   g_int_controller_pending &= ~(1<<value);
 
-  for(g_int_controller_highest_int = 7;g_int_controller_highest_int > 0;g_int_controller_highest_int--)
-    if(g_int_controller_pending & (1<<g_int_controller_highest_int))
+  for (g_int_controller_highest_int = 7; g_int_controller_highest_int > 0; g_int_controller_highest_int--)
+    if (g_int_controller_pending & (1<<g_int_controller_highest_int))
       break;
 
-  if (INTS_ENABLED) {
-    if (trace_irq)
-      printf("sim68k: int_controller_clear(%d) asserting lower int %d (sr %04x)\n",
-	     value, g_int_controller_highest_int, m68k_get_reg(NULL, M68K_REG_SR));
-
+  if (INTS_ENABLED)
     m68k_set_irq(g_int_controller_highest_int);
-  }
 }
 
 unsigned int m68k_read_disassembler_16(unsigned int address)

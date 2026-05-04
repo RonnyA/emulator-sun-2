@@ -172,11 +172,10 @@ ifdef TRACE_PRINTF
     DEFS += -DTRACE_PRINTF
 endif
 
-# -fcommon restores pre-GCC-10 tentative-definition handling.  The
-# original code declares e.g. `int trace_irq;` in both am9513.c and
-# sim68k.c without `extern`, which the modern default (-fno-common)
-# rejects as multiple definitions.
-CFLAGS = -I. -I$(M68K_SRC) $(EXTRA_INC) $(NET_INC) -g -O2 -fcommon $(DEFS)
+# -fno-common puts tentative defs in __bss instead of __common.  Without
+# this the linker bumps __common's alignment up to 32 KiB to fit g_ram
+# and warns "reducing alignment from 0x8000 to 0x4000".
+CFLAGS = -I. -I$(M68K_SRC) $(EXTRA_INC) $(NET_INC) -g -O2 -fno-common $(DEFS)
 LIBS   = $(NET_LIBS) $(SYS_LIBS)
 
 TARGET = sim$(EXE_EXT)

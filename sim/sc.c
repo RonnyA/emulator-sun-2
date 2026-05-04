@@ -15,7 +15,6 @@
 
 extern int trace_mmu;
 extern int trace_sc;
-extern int trace_irq;
 
 static unsigned short sc_dma_count;
 static unsigned int sc_dma_addr;
@@ -86,10 +85,8 @@ void _sc_scsi_update(void)
   if (irq) {
     sc_icr |= SC_ICR_INT_REQUEST;
     if (sc_icr & SC_ICR_INT_ENABLE) {
-      if ((old_icr & SC_ICR_INT_REQUEST) == 0) {
-	if (trace_irq) printf("sc: irq %d\n", IRQ_SC);
+      if ((old_icr & SC_ICR_INT_REQUEST) == 0)
 	int_controller_set(IRQ_SC);
-      }
     }
   }
 
