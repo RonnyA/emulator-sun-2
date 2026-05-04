@@ -204,7 +204,13 @@ void sdl_poll(void)
 	      break;
 
 	    case SDL_KEYDOWN:
+	      if (event.key.repeat)
+	        break; /* suppress SDL auto-repeat -- SunOS does software repeat */
 	      sun2_sdl_key(event.key.keysym.sym, event.key.keysym.mod, event.key.keysym.scancode, 1);
+	      break;
+
+	    case SDL_TEXTINPUT:
+	      /* Sun-2 keyboard uses make/break scancodes only, discard SDL text events */
 	      break;
 
 	    case SDL_KEYUP:
@@ -656,41 +662,31 @@ void sun2_sdl_key(SDL_Keycode sdl_code, uint16_t modifiers, SDL_Scancode scancod
 //  shifted = mapped & SHIFTED;
 
   mapped &= 0xff;
-  if (down == 0)
-    mapped |= 0x80;
+  if (mapped == 0)
+    return;
 
-//  if (shifted) {
-//    scc_in_push(3, 0x84);
-//    scc_in_push(3, mapped);
-//    scc_in_push(3, 0x84);
-//    return;
-//  }
+  /* Sun-2 modifier scancodes — these need real keydown/keyup tracking
+     because SunOS reads the modifier state for combos. */
+  int is_modifier = (mapped == 99   /* LSHIFT */ ||
+                     mapped == 111  /* RSHIFT */ ||
+                     mapped == 76   /* CTRL   */ ||
+                     mapped == 119  /* CAPSLOCK */);
 
-#if 0
-  if (sdl_code == SDLK_SLASH && down) {
-    extern unsigned char g_ram[];
-    unsigned char *p = g_ram;
-    printf("0: %02x%02x%02x%02x\n", p[0], p[1], p[2], p[3]); p += 4;
-    printf("4: %02x%02x%02x%02x\n", p[0], p[1], p[2], p[3]); p += 4;
-    printf("8: %02x%02x%02x%02x\n", p[0], p[1], p[2], p[3]); p += 4;
-    printf("c: %02x%02x%02x%02x\n", p[0], p[1], p[2], p[3]);
-  }
-#endif
-
-#if 0
-  if (sdl_code == SDLK_SEMICOLON && down) {
-    toggle_trace = !toggle_trace;
-    if (toggle_trace) {
-      printf("TRACE ENABLED!\n");
-      enable_trace(1);
-    } else {
-      printf("TRACE DISABLED!\n");
-      enable_trace(0);
+  if (is_modifier) {
+    if (down == 0)
+      mapped |= 0x80;
+    scc_in_push(3, mapped);
+  } else {
+    /* Normal keys: send make+break atomically on keydown, ignore keyup.
+       The emulated CPU runs fast relative to SDL event timing, so a
+       separate break code from KEYUP arrives thousands of instructions
+       too late and the PROM/SunOS re-reads stale data (= duplicate
+       characters).  SunOS handles repeat in software. */
+    if (down) {
+      scc_in_push(3, mapped);          /* make code  */
+      scc_in_push(3, mapped | 0x80);   /* break code */
     }
   }
-#endif
-
-  scc_in_push(3, mapped);
 }
 
 #define m(f,t) map_sdl_to_sun2kb[(f)] = (t);

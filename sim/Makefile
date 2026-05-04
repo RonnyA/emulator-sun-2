@@ -102,8 +102,13 @@ else ifeq ($(NET_BACKEND),stub)
     NET_DEFS := -DNET_BACKEND_STUB
     NET_INC  :=
     NET_LIBS :=
+else ifeq ($(NET_BACKEND),tap)
+    NET_OBJ  := net_tap.o
+    NET_DEFS := -DNET_BACKEND_TAP
+    NET_INC  :=
+    NET_LIBS :=
 else
-    $(error Unknown NET_BACKEND='$(NET_BACKEND)' (expected bpf, pcap, or stub))
+    $(error Unknown NET_BACKEND='$(NET_BACKEND)' (expected bpf, pcap, stub, or tap))
 endif
 
 # ---------------------------------------------------------------------

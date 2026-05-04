@@ -13,7 +13,7 @@
 #include "sim.h"
 
 int trace_am9513;
-int trace_irq;
+extern int trace_irq;
 
 struct am9513_ctr_s {
   unsigned short mode;
