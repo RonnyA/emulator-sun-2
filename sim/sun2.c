@@ -413,14 +413,80 @@ void sun2_sdl_key(SDL_Keycode sdl_code, uint16_t modifiers, SDL_Scancode scancod
      client for input instead (lands on channel 0). */
   if (g_no_kbd) return;
 
-  if (0) printf("sdl: %u %u %u %d\n", sdl_code, modifiers, scancode, down);
+  /* Set SUN2_KEY_TRACE=1 in the environment to print what SDL hands
+     us on every key event.  Useful for figuring out which scancode +
+     keycode a non-US-layout key produces. */
+  {
+    static int probed = 0, enabled = 0;
+    if (!probed) {
+      probed = 1;
+      const char *e = getenv("SUN2_KEY_TRACE");
+      enabled = (e && *e && *e != '0');
+    }
+    if (enabled)
+      fprintf(stderr,
+              "sun2-key: keycode=0x%x scancode=%u (%s) mod=0x%x down=%d\n",
+              (unsigned)sdl_code, (unsigned)scancode,
+              SDL_GetScancodeName(scancode),
+              (unsigned)modifiers, down);
+  }
 
-  // If the keycode is over 128 use the scancode instead
-  if(sdl_code >= 255)
-	sdl_code = scancode;
+  /* Numeric keypad: SDL keypad Keycodes are all > 255 (e.g.
+     SDLK_KP_0 = 0x40000059), so the scancode-fallback path below
+     would index a flat 512-int map and collide with SDLK_* values
+     for main-keyboard keys (SDL_SCANCODE_KP_3 = 91 = SDLK_LEFTBRACKET).
+     Handle keypad keys explicitly by scancode here.
 
-  // This should still work, just with slightly different values
-  mapped = map_sdl_to_sun2kb[sdl_code];
+     Sun-2 keyboard keypad layout (from SunOS keytables.c):
+        KP digits 7/8/9 -> keypos 45/46/47
+        KP digits 4/5/6 -> keypos 68/69/70
+        KP digits 1/2/3 -> keypos 91/92/93
+        KP digit  0     -> keypos 114
+        KP '.'          -> keypos 116
+        KP '+'          -> keypos 22
+        KP '-'          -> keypos 23
+     The Sun-2 keyboard has no separate keypad Enter, '/', or '*',
+     so we alias KP_ENTER to the main Enter (pos 89) and KP_DIVIDE
+     to the main '/' (pos 109).  KP_MULTIPLY has no clean mapping --
+     the only '*' producing key on a Sun-2 is shift+':' (pos 87 with
+     shift held); synthesising shift around a single keypress is
+     fragile, so leave it unmapped (use shift+; on the main row to
+     get '*'). */
+  mapped = 0;
+  switch (scancode) {
+    case SDL_SCANCODE_KP_0:      mapped = 114; break;
+    case SDL_SCANCODE_KP_1:      mapped = 91;  break;
+    case SDL_SCANCODE_KP_2:      mapped = 92;  break;
+    case SDL_SCANCODE_KP_3:      mapped = 93;  break;
+    case SDL_SCANCODE_KP_4:      mapped = 68;  break;
+    case SDL_SCANCODE_KP_5:      mapped = 69;  break;
+    case SDL_SCANCODE_KP_6:      mapped = 70;  break;
+    case SDL_SCANCODE_KP_7:      mapped = 45;  break;
+    case SDL_SCANCODE_KP_8:      mapped = 46;  break;
+    case SDL_SCANCODE_KP_9:      mapped = 47;  break;
+    case SDL_SCANCODE_KP_PERIOD: mapped = 116; break;
+    case SDL_SCANCODE_KP_PLUS:   mapped = 22;  break;
+    case SDL_SCANCODE_KP_MINUS:  mapped = 23;  break;
+    case SDL_SCANCODE_KP_ENTER:  mapped = 89;  break;  /* alias main Enter */
+    case SDL_SCANCODE_KP_DIVIDE: mapped = 109; break;  /* alias main '/'   */
+    /* Layout-independent fallbacks for keys whose Keycode varies by
+       OS keyboard layout.  SDL_SCANCODE_* is the physical key position
+       (US-keyboard reference), so on a Norwegian/German/... layout the
+       physical "next to right-Shift" key still sends Sun '/' (pos 109)
+       even though its Keycode might be SDLK_MINUS or whatever.  Add
+       more keys here as we test other layouts. */
+    case SDL_SCANCODE_SLASH:     mapped = 109; break;
+    default: break;
+  }
+
+  if (mapped == 0) {
+    // If the keycode is over 128 use the scancode instead
+    if(sdl_code >= 255)
+      sdl_code = scancode;
+
+    // This should still work, just with slightly different values
+    mapped = map_sdl_to_sun2kb[sdl_code];
+  }
   if (0) printf("sdl: %u %u %u %u %d \n", sdl_code, modifiers, scancode, mapped, down);
 //  shifted = mapped & SHIFTED;
 
