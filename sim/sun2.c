@@ -24,6 +24,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #ifdef __APPLE__
 #include <SDL.h>
@@ -34,6 +35,176 @@
 #include "sim.h"
 
 #define debug 0
+
+/* Sun-2 modifier scancodes */
+#define SUN2_SC_LSHIFT  99
+#define SUN2_SC_RSHIFT  111
+#define SUN2_SC_CTRL    76
+#define SUN2_SC_CAPSLOCK 119
+
+/* Paste buffer for clipboard text injection */
+static char *paste_buf = NULL;
+static int paste_pos = 0;
+static int paste_len = 0;
+/* Delay counter - feed one char per N update cycles to avoid FIFO overflow */
+static int paste_delay = 0;
+#define PASTE_CHAR_DELAY 3
+
+/* ASCII to Sun-2 scancode mapping: {scancode, needs_shift} */
+struct ascii_to_sun2 {
+  unsigned char sc;
+  unsigned char shifted;
+};
+
+static struct ascii_to_sun2 ascii_map[128];
+
+static void init_ascii_map(void)
+{
+  int i;
+  for (i = 0; i < 128; i++) {
+    ascii_map[i].sc = 0;
+    ascii_map[i].shifted = 0;
+  }
+
+  /* lowercase letters */
+  ascii_map['a'].sc = 77;  ascii_map['b'].sc = 104;
+  ascii_map['c'].sc = 102; ascii_map['d'].sc = 79;
+  ascii_map['e'].sc = 56;  ascii_map['f'].sc = 80;
+  ascii_map['g'].sc = 81;  ascii_map['h'].sc = 82;
+  ascii_map['i'].sc = 61;  ascii_map['j'].sc = 83;
+  ascii_map['k'].sc = 84;  ascii_map['l'].sc = 85;
+  ascii_map['m'].sc = 106; ascii_map['n'].sc = 105;
+  ascii_map['o'].sc = 62;  ascii_map['p'].sc = 63;
+  ascii_map['q'].sc = 54;  ascii_map['r'].sc = 57;
+  ascii_map['s'].sc = 78;  ascii_map['t'].sc = 58;
+  ascii_map['u'].sc = 60;  ascii_map['v'].sc = 103;
+  ascii_map['w'].sc = 55;  ascii_map['x'].sc = 101;
+  ascii_map['y'].sc = 59;  ascii_map['z'].sc = 100;
+
+  /* uppercase = same scancode but shifted */
+  for (i = 'A'; i <= 'Z'; i++) {
+    ascii_map[i].sc = ascii_map[i + 32].sc;
+    ascii_map[i].shifted = 1;
+  }
+
+  /* digits */
+  ascii_map['1'].sc = 30;  ascii_map['2'].sc = 31;
+  ascii_map['3'].sc = 32;  ascii_map['4'].sc = 33;
+  ascii_map['5'].sc = 34;  ascii_map['6'].sc = 35;
+  ascii_map['7'].sc = 36;  ascii_map['8'].sc = 37;
+  ascii_map['9'].sc = 38;  ascii_map['0'].sc = 39;
+
+  /* shifted digits */
+  ascii_map['!'].sc = 30;  ascii_map['!'].shifted = 1;
+  ascii_map['@'].sc = 31;  ascii_map['@'].shifted = 1;
+  ascii_map['#'].sc = 32;  ascii_map['#'].shifted = 1;
+  ascii_map['$'].sc = 33;  ascii_map['$'].shifted = 1;
+  ascii_map['%'].sc = 34;  ascii_map['%'].shifted = 1;
+  ascii_map['^'].sc = 35;  ascii_map['^'].shifted = 1;
+  ascii_map['&'].sc = 36;  ascii_map['&'].shifted = 1;
+  ascii_map['*'].sc = 37;  ascii_map['*'].shifted = 1;
+  ascii_map['('].sc = 38;  ascii_map['('].shifted = 1;
+  ascii_map[')'].sc = 39;  ascii_map[')'].shifted = 1;
+
+  /* punctuation - unshifted */
+  ascii_map['-'].sc = 40;  ascii_map['='].sc = 41;
+  ascii_map['`'].sc = 42;  ascii_map['\t'].sc = 53;
+  ascii_map['['].sc = 64;  ascii_map[']'].sc = 65;
+  ascii_map[';'].sc = 86;  ascii_map['\''].sc = 87;
+  ascii_map['\\'].sc = 88; ascii_map['\r'].sc = 89;
+  ascii_map['\n'].sc = 89;
+  ascii_map[','].sc = 107; ascii_map['.'].sc = 108;
+  ascii_map['/'].sc = 109; ascii_map[' '].sc = 121;
+  ascii_map[27].sc = 29;   /* ESC */
+  ascii_map[8].sc = 43;    /* backspace */
+
+  /* punctuation - shifted */
+  ascii_map['_'].sc = 40;  ascii_map['_'].shifted = 1;
+  ascii_map['+'].sc = 41;  ascii_map['+'].shifted = 1;
+  ascii_map['~'].sc = 42;  ascii_map['~'].shifted = 1;
+  ascii_map['{'].sc = 64;  ascii_map['{'].shifted = 1;
+  ascii_map['}'].sc = 65;  ascii_map['}'].shifted = 1;
+  ascii_map[':'].sc = 86;  ascii_map[':'].shifted = 1;
+  ascii_map['"'].sc = 87;  ascii_map['"'].shifted = 1;
+  ascii_map['|'].sc = 88;  ascii_map['|'].shifted = 1;
+  ascii_map['<'].sc = 107; ascii_map['<'].shifted = 1;
+  ascii_map['>'].sc = 108; ascii_map['>'].shifted = 1;
+  ascii_map['?'].sc = 109; ascii_map['?'].shifted = 1;
+}
+
+static void paste_start(void)
+{
+  char *clip;
+
+  if (!SDL_HasClipboardText())
+    return;
+
+  clip = SDL_GetClipboardText();
+  if (clip == NULL || clip[0] == '\0') {
+    SDL_free(clip);
+    return;
+  }
+
+  /* Free any previous paste in progress */
+  if (paste_buf != NULL)
+    free(paste_buf);
+
+  paste_len = strlen(clip);
+  paste_buf = malloc(paste_len + 1);
+  memcpy(paste_buf, clip, paste_len + 1);
+  paste_pos = 0;
+  paste_delay = 0;
+  SDL_free(clip);
+
+  if (0) printf("paste: %d chars queued\n", paste_len);
+}
+
+/* Feed one character from paste buffer into SCC FIFO.
+ * Called from sdl_poll on each update cycle. */
+static void paste_feed(void)
+{
+  unsigned char ch, sc;
+
+  if (paste_buf == NULL || paste_pos >= paste_len)
+    return;
+
+  /* Throttle: wait a few cycles between characters */
+  if (paste_delay > 0) {
+    paste_delay--;
+    return;
+  }
+
+  ch = (unsigned char)paste_buf[paste_pos];
+
+  /* Skip characters we can't map */
+  if (ch >= 128 || ascii_map[ch].sc == 0) {
+    paste_pos++;
+    return;
+  }
+
+  sc = ascii_map[ch].sc;
+
+  if (ascii_map[ch].shifted) {
+    scc_in_push(3, SUN2_SC_LSHIFT);        /* shift make */
+    scc_in_push(3, sc);                     /* key make */
+    scc_in_push(3, sc | 0x80);             /* key break */
+    scc_in_push(3, SUN2_SC_LSHIFT | 0x80); /* shift break */
+  } else {
+    scc_in_push(3, sc);                     /* key make */
+    scc_in_push(3, sc | 0x80);             /* key break */
+  }
+
+  paste_pos++;
+  paste_delay = PASTE_CHAR_DELAY;
+
+  /* Done? */
+  if (paste_pos >= paste_len) {
+    free(paste_buf);
+    paste_buf = NULL;
+    paste_pos = 0;
+    paste_len = 0;
+  }
+}
 
 static unsigned char *fbmem;
 //static SDL_Surface *screen;
@@ -218,10 +389,17 @@ void sdl_poll(void)
 	    case SDL_MOUSEMOTION:
 	      break;
 	    case SDL_MOUSEBUTTONDOWN:
+	      /* Right-click pastes clipboard text */
+	      if (event.button.button == SDL_BUTTON_RIGHT)
+	        paste_start();
+	      break;
 	    case SDL_MOUSEBUTTONUP:
 	      break;
 	    }
   }
+
+  /* Drip-feed paste buffer into SCC FIFO */
+  paste_feed();
 }
 
 void sun2_fb_alloc(void)
@@ -352,12 +530,6 @@ void sun2_kb_write(int value, int size)
 
 unsigned int map_sdl_to_sun2kb[512];
 
-/* Sun-2 modifier scancodes */
-#define SUN2_SC_LSHIFT  99
-#define SUN2_SC_RSHIFT  111
-#define SUN2_SC_CTRL    76
-#define SUN2_SC_CAPSLOCK 119
-
 static int is_modifier(unsigned int sc)
 {
   return (sc == SUN2_SC_LSHIFT || sc == SUN2_SC_RSHIFT ||
@@ -404,6 +576,8 @@ void sun2_sdl_key(SDL_Keycode sdl_code, uint16_t modifiers, SDL_Scancode scancod
 
 void sun2_init(void)
 {
+  init_ascii_map();
+
   m(SDLK_ESCAPE, 29);
 
   m(SDLK_1, 30);
