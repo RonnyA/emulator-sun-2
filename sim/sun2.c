@@ -370,31 +370,182 @@ unsigned int sun2_video_ctl_write(unsigned int address, int size, unsigned int v
   return 0;
 }
 
+/* Sun keyboard L1-A (Stop-A) abort sequence.  Bound to F12 to match
+   RetroCore SunKeyboardMapper.IsAbortKey().  Real Sun keyboard scancodes:
+     L1 = 1, A = 77, idle = 0x7F.  Bit 7 of a scancode marks a key release. */
+#define SUN_KEY_L1   1
+#define SUN_KEY_A    77
+#define SUN_KEY_IDLE 0x7F
+
+/* Auto-abort: matches RetroCore SunVideoBoard.cs (ABORT_AUTO_BOOT path).
+   On the FIRST keyboard "bell off" command from the PROM, synthesise the
+   L1-A abort burst — drops the auto-boot to the PROM monitor command
+   prompt.  Subsequent bell-offs (e.g. test-acknowledgment beeps) are
+   no-op so commands like 'x' run normally. */
+static int auto_abort_enabled = 0;     /* default: off; --auto-abort turns it on */
+static int auto_abort_done = 0;
+
+void sun2_set_auto_abort(int enabled) { auto_abort_enabled = enabled; }
+
+static void sun2_send_abort(void)
+{
+  scc_in_push(3, SUN_KEY_L1);
+  scc_in_push(3, SUN_KEY_A);
+  scc_in_push(3, SUN_KEY_A   | 0x80);
+  scc_in_push(3, SUN_KEY_L1  | 0x80);
+  scc_in_push(3, SUN_KEY_IDLE);
+}
+
+/* ---- auto-typer (drives the PROM monitor non-interactively for trace
+   capture).  Uses the same SCC keyboard channel as physical keystrokes:
+   pushes the press scancode, waits, then pushes the release scancode.
+   Driven from io_update via sun2_autotype_tick().
+
+   Special character `\033` (ESC) in the input string sends the L1-A
+   abort burst — the equivalent of pressing F12 in the SDL window —
+   so headless test runs can break into the PROM monitor. */
+
+extern unsigned int map_sdl_to_sun2kb[512];
+
+#define SUN_KEY_LSHIFT 99
+
+static unsigned autotype_pos;
+static unsigned autotype_delay;        /* tick countdown before next action */
+#define AUTOTYPE_BOOT_DELAY  20000000  /* ~20M io_update ticks before first key — let PROM reach prompt */
+#define AUTOTYPE_PRESS_HOLD  100000    /* hold each key down */
+#define AUTOTYPE_GAP         200000    /* gap between successive keys */
+
+/* ASCII → Sun-2 scancode + shift flag.  Returns 1 if mapped, 0 otherwise.
+   Shifted characters require pressing LSHIFT around the key press. */
+static int autotype_lookup(unsigned char ch, unsigned int *out_code, int *out_shifted)
+{
+  static const struct { unsigned char ch; unsigned char code; } shifted[] = {
+    {'!', 30}, {'@', 31}, {'#', 32}, {'$', 33}, {'%', 34}, {'^', 35},
+    {'&', 36}, {'*', 37}, {'(', 38}, {')', 39}, {'_', 40}, {'+', 41},
+    {'~', 42}, {'{', 64}, {'}', 65}, {':', 86}, {'"', 87}, {'|', 88},
+    {'<', 107}, {'>', 108}, {'?', 109},
+  };
+  for (size_t i = 0; i < sizeof(shifted)/sizeof(shifted[0]); i++) {
+    if (shifted[i].ch == ch) {
+      *out_code = shifted[i].code;
+      *out_shifted = 1;
+      return 1;
+    }
+  }
+  if (ch >= 'A' && ch <= 'Z') {
+    unsigned int code = map_sdl_to_sun2kb[ch - 'A' + 'a'] & 0xff;
+    if (code) { *out_code = code; *out_shifted = 1; return 1; }
+  }
+  unsigned int code = map_sdl_to_sun2kb[ch] & 0xff;
+  if (code) { *out_code = code; *out_shifted = 0; return 1; }
+  return 0;
+}
+
+void sun2_autotype_tick(void)
+{
+  static int started;
+  static unsigned char emit_buf[6];   /* shift-dn, key-dn, key-up, shift-up */
+  static unsigned emit_count;
+  static unsigned emit_idx;
+
+  if (!g_autotype) return;
+  /* Wait for auto-abort to have dropped the PROM to the monitor prompt
+     before injecting any keystrokes — otherwise the keys queue up in the
+     SCC FIFO ahead of the L1-A abort burst and get consumed by the
+     still-running auto-boot.  Then add a short post-abort settle delay
+     so the PROM has finished switching context. */
+  if (auto_abort_enabled && !auto_abort_done) return;
+  if (!started) {
+    autotype_delay = AUTOTYPE_GAP * 4;   /* settle after auto-abort */
+    started = 1;
+  }
+  if (autotype_delay) { autotype_delay--; return; }
+
+  /* Drain any pending scancodes for the current char (shift-dn / key-dn /
+     key-up / shift-up — up to 4 bytes for a shifted char). */
+  if (emit_idx < emit_count) {
+    scc_in_push(3, emit_buf[emit_idx++]);
+    if (emit_idx < emit_count) {
+      autotype_delay = AUTOTYPE_PRESS_HOLD;
+    } else {
+      autotype_delay = AUTOTYPE_GAP;
+      autotype_pos++;
+    }
+    return;
+  }
+
+  if (!g_autotype[autotype_pos]) return;
+
+  unsigned char ch = (unsigned char)g_autotype[autotype_pos];
+
+  /* Special: ESC (0x1B) → L1-A abort burst (matches F12 in SDL window) */
+  if (ch == 0x1B) {
+    printf("autotype: send L1-A (abort)\n");
+    sun2_send_abort();
+    autotype_pos++;
+    autotype_delay = AUTOTYPE_GAP;
+    return;
+  }
+
+  if (ch == '\n') ch = '\r';     /* SDLK_RETURN = 0x0D */
+
+  unsigned int code;
+  int shifted;
+  if (!autotype_lookup(ch, &code, &shifted)) {
+    printf("autotype: skipping unmapped char 0x%02x\n", ch);
+    autotype_pos++;
+    autotype_delay = AUTOTYPE_GAP;
+    return;
+  }
+
+  emit_count = 0;
+  if (shifted) emit_buf[emit_count++] = SUN_KEY_LSHIFT;
+  emit_buf[emit_count++] = (unsigned char)code;
+  emit_buf[emit_count++] = (unsigned char)(code | 0x80);
+  if (shifted) emit_buf[emit_count++] = SUN_KEY_LSHIFT | 0x80;
+  emit_idx = 0;
+
+  printf("autotype: %s '%c' (scancode 0x%02x)\n",
+         shifted ? "shift+press" : "press", ch, code);
+
+  scc_in_push(3, emit_buf[emit_idx++]);
+  if (emit_idx < emit_count) {
+    autotype_delay = AUTOTYPE_PRESS_HOLD;
+  } else {
+    autotype_delay = AUTOTYPE_GAP;
+    autotype_pos++;
+  }
+}
+
 /* ----- */
 
 void sun2_kb_write(int value, int size)
 {
+    /* Sun keyboard command protocol.  PROM writes a 1-byte command to the
+       keyboard SCC data port; real keyboard responds with 0..N bytes via
+       the SCC RX FIFO.  Bell on/off produce no SCC response on real hw
+       (only drive the beeper); we hijack the FIRST bell-off as the
+       auto-abort trigger, then become inert. */
+
     /* --no-kbd: stay silent on every keyboard command so the PROM's
        reset-and-wait-for-reply times out, declares "no keyboard",
        and switches its console to ttya (SCC channel 0). */
     if (g_no_kbd) return;
 
     switch (value) {
-    case 0x01: /* reset */
-      scc_in_push(3, 0xff);
-      scc_in_push(3, 0x02);
-      scc_in_push(3, 0x7f);
+    case 0x01: /* RESET */
+      scc_in_push(3, 0xff);   /* reset done */
+      scc_in_push(3, 0x02);   /* layout id 0x02 = US English Type 4 */
+      scc_in_push(3, 0x7f);   /* idle */
       break;
-    case 0x02: /* bell on */
+    case 0x02: /* BELL ON */
       break;
-    case 0x03: /* bell off */
-      /* send abort */
-      scc_in_push(3, 0x00+1);
-      scc_in_push(3, 0x00+77);
-      scc_in_push(3, 0x80+77);
-      scc_in_push(3, 0x80+1);
-
-      scc_in_push(3, 0x7f);
+    case 0x03: /* BELL OFF */
+      if (auto_abort_enabled && !auto_abort_done) {
+        printf("kb: auto-abort (first bell-off) → L1-A burst\n");
+        sun2_send_abort();
+        auto_abort_done = 1;
+      }
       break;
     }
 }
@@ -430,6 +581,20 @@ void sun2_sdl_key(SDL_Keycode sdl_code, uint16_t modifiers, SDL_Scancode scancod
               SDL_GetScancodeName(scancode),
               (unsigned)modifiers, down);
   }
+
+  /* F12 → L1-A (Stop-A) abort burst, matching RetroCore
+     SunKeyboardMapper.IsAbortKey().  Press once on key-down only. */
+  if (scancode == SDL_SCANCODE_F12 || sdl_code == SDLK_F12) {
+    if (down) {
+      printf("kb: F12 → L1-A abort\n");
+      sun2_send_abort();
+    }
+    return;
+  }
+
+  // If the keycode is over 128 use the scancode instead
+  if(sdl_code >= 255)
+	sdl_code = scancode;
 
   /* Numeric keypad: SDL keypad Keycodes are all > 255 (e.g.
      SDLK_KP_0 = 0x40000059), so the scancode-fallback path below

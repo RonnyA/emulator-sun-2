@@ -2,6 +2,8 @@
 #include <fcntl.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
+#include <sys/stat.h>
 
 #include "sim.h"
 #include "scsi.h"
@@ -33,6 +35,8 @@ struct scsi_unit_s {
   int fd;
   int fileno;
   int eof;
+  int filemark;          /* tape: pending filemark to report in next REQUEST_SENSE */
+  int residual;          /* tape: residual byte count from last short read */
   int tape;
   int ro;
   unsigned char status[3];
@@ -51,10 +55,14 @@ int _scsi_test_unit_ready(int id, unsigned char *cmd, int cmd_size, unsigned cha
 
   u = &scsi_units[id];
 
-  if (!quiet) printf("_scsi_test_unit_ready(id=%d)\n", id);
+  if (trace_scsi) printf("_scsi_test_unit_ready(id=%d)\n", id);
 
   xfer_size = 16;
   memset(&u->data, 0, 512);
+
+  /* TUR returns GOOD when the unit is ready — independent of any prior
+     CHECK CONDITION still pending in u->status[0]. */
+  u->status[0] = 0x00;
 
   *pbuf = u->data;
   *psiz = xfer_size;
@@ -73,15 +81,25 @@ int _scsi_inquiry(int id, unsigned char *cmd, int cmd_size, unsigned char **pbuf
   spagecode = (cmd[2] << 8) | cmd[3];
   sallocationlen = (cmd[3] << 8) | cmd[4];
 
-  if (!quiet) printf("_scsi_inquiry(id=%d) spagecode %x, sallocationlen %x\n", id, spagecode, sallocationlen);
+  if (trace_scsi) printf("_scsi_inquiry(id=%d) spagecode %x, sallocationlen %x\n", id, spagecode, sallocationlen);
 
   xfer_size = 96;
   memset(&u->data, 0, 512);
 
   /* tape? */
   if (u->tape) {
-    printf("_scsi_inquiry() tape\n");
-    u->data[0] = 0x01;
+    if (trace_scsi) printf("_scsi_inquiry() tape\n");
+    /* INQUIRY response (matches RetroCore SCSIDevicePresets.EmulexMT02
+       fix in commit 2c65ba52 "Sun-2: SCSI tape boot fixes").  Without
+       proper SCSI-1/CCS identification, the Sun-2 PROM takes a wrong
+       boot path that ends in an MMU fault during PROM bcopy. */
+    u->data[0] = 0x01;        /* peripheral device type: sequential access (tape) */
+    u->data[1] = 0x80;        /* RMB=1 (removable media), device-type qualifier 0 */
+    u->data[2] = 0x01;        /* ANSI-approved version: SCSI-1 (X3.131-1986) */
+    u->data[3] = 0x01;        /* response data format: SCSI-1 / CCS */
+    u->data[4] = 91;          /* additional length (95 - 4) */
+    /* vendor / product / revision strings — left zero-padded, sufficient
+       for PROM identification purposes (RetroCore Vendor=Product="" works). */
   }
 
   *pbuf = u->data;
@@ -97,12 +115,18 @@ int _scsi_mode_select(int id, unsigned char *cmd, int cmd_size, unsigned char **
 
   u = &scsi_units[id];
 
-  xfer_size = 8;
+  /* MODE_SELECT(6): parameter list length is in CDB[4].  Falling back
+     to a fixed 8 bytes leaves the controller's DMA count short of what
+     the PROM (or standalone) requested — the host then sees a residual
+     and prints "short transfer" even though we accepted the parameters. */
+  xfer_size = cmd[4];
+  if (xfer_size == 0) xfer_size = 8;
+  if (xfer_size > (int)sizeof(u->data)) xfer_size = sizeof(u->data);
   memset(&u->data, 0, 512);
 
   /* tape? */
   if (u->tape) {
-    printf("_scsi_mode_select() tape\n");
+    if (trace_scsi) printf("_scsi_mode_select() tape len=%d\n", xfer_size);
   }
 
   *pbuf = u->data;
@@ -124,7 +148,7 @@ int _scsi_mode_sense(int id, unsigned char *cmd, int cmd_size, unsigned char **p
   spagecode = cmd[3];
   allocationlen = cmd[4];
 
-  printf("_scsi_mode_sense(id=%d) pc %x pagecode %x spagecode %x, allocationlen %x\n", id, pc, pagecode, spagecode, allocationlen);
+  if (trace_scsi) printf("_scsi_mode_sense(id=%d) pc %x pagecode %x spagecode %x, allocationlen %x\n", id, pc, pagecode, spagecode, allocationlen);
 
   xfer_size = 96;
   memset(&u->data, 0, 512);
@@ -140,7 +164,7 @@ int _scsi_mode_sense(int id, unsigned char *cmd, int cmd_size, unsigned char **p
 
   /* tape? */
   if (u->tape) {
-    printf("_scsi_mode_sense() tape\n");
+    if (trace_scsi) printf("_scsi_mode_sense() tape\n");
 //    u->data[0] = 0x01;
   }
 
@@ -162,14 +186,43 @@ int _scsi_read_block(int id, unsigned char *cmd, int cmd_size, unsigned char **p
   scount = cmd[4];
 
   if (trace_scsi)
-    printf("_scsi_read_block(id=%d) sblock 0x%x, slen 0x%x\n", id, sblock, scount);
+    if (trace_scsi) printf("_scsi_read_block(id=%d) sblock 0x%x, slen 0x%x\n", id, sblock, scount);
 
   if (scount > MAX_SCSI_BLOCKS) {
     abortf("scsi%d: buffer size exceeded\n", id);
   }
 
-  if (u->tape)
+  if (u->tape) {
     sblock = u->block_no;
+    /* Read at file end -> FILEMARK (RetroCore SCSITape.cs
+       continue_handling_read_6 line 921, FILEMARK case): 0 data
+       delivered, CHECK CONDITION, FILEMARK with residual = full
+       request size.  Auto-advance to the next tape file so the next
+       READ (after host's REQUEST_SENSE consumes the FILEMARK) reads
+       the next file naturally.  Sun-2 PROM tpboot doesn't issue
+       SPACE between files of a multi-file boot. */
+    if (u->eof && u->fd > 0) {
+      off_t end = lseek(u->fd, 0, SEEK_END);
+      if (end == u->block_no * 512) {
+        /* Read at file end -> CHECK CONDITION + FILEMARK in sense.
+           DELIVER FULL xfer_size of zeros so the controller's DMA count
+           ticks all the way and the host sees NO residual.  tpboot's
+           "st: short transfer" check (file 1 0xa3c10..0xa3c2c) only
+           triggers on bytes_transferred < requested.  By reporting full
+           transfer + CHECK CONDITION, the standalone goes through
+           REQUEST_SENSE, sees FILEMARK, and handles EOF silently
+           (matches RetroCore SunSCSIController behavior). */
+        memset(u->data, 0, 512 * scount);
+        u->status[0] = 0x02;
+        u->filemark = 1;
+        u->residual = 0;            /* no residual = no short-transfer print */
+        *pbuf = u->data;
+        *psiz = 512 * scount;       /* tick full DMA count */
+        if (trace_scsi) printf("scsi%d: tape READ at file end -> CHECK COND + FILEMARK (full DMA, no residual)\n", id);
+        return 0;
+      }
+    }
+  }
 
   offset = sblock * 512;
   xfer_size = 512*scount;
@@ -185,16 +238,30 @@ int _scsi_read_block(int id, unsigned char *cmd, int cmd_size, unsigned char **p
   *pbuf = u->data;
   *psiz = xfer_size;
 
-  if (trace_scsi) printf("scsi%d: read xfer; block=%d, blocks=%d, bytes=%d\n", id, sblock, scount, xfer_size);
+  if (trace_scsi)
+    printf("scsi%d: read xfer; %s file %d '%s' fd=%d block=%d blocks=%d bytes=%d offset=%lld\n",
+           id, u->tape ? "TAPE" : "DISK", u->fileno,
+           (u->fileno >= 0 && u->fname[u->fileno]) ? u->fname[u->fileno] : "(null)",
+           u->fd, sblock, scount, xfer_size, (long long)offset);
 
   if (fd > 0) {
-    lseek(fd, offset, SEEK_SET);
+    off_t lr = lseek(fd, offset, SEEK_SET);
+    if (lr < 0)
+      printf("scsi%d: lseek(%lld) failed: %s\n", id, (long long)offset, strerror(errno));
     ret = read(fd, u->data, xfer_size);
     if (ret < 0) {
+      printf("scsi%d: read FAILED fd=%d bytes=%d: %s\n", id, fd, xfer_size, strerror(errno));
       perror( u->fname[ u->fileno ] );
       abortf("scsi read failed\n");
     }
+    if (trace_scsi) {
+      off_t pos = lseek(fd, 0, SEEK_CUR);
+      printf("scsi%d: read got %d/%d bytes; new fpos=%lld\n",
+             id, ret, xfer_size, (long long)pos);
+    }
   } else {
+    if (trace_scsi)
+      printf("scsi%d: read with NO fd (fd=%d); zero-filling %d bytes\n", id, u->fd, xfer_size);
     memset(u->data, 0, xfer_size);
   }
 
@@ -204,9 +271,39 @@ int _scsi_read_block(int id, unsigned char *cmd, int cmd_size, unsigned char **p
 
   if (ret < xfer_size) {
     u->eof = 1;
-    u->status[0] = 0x02;
-    if (trace_scsi) printf("scsi%d: read eof; chk\n", id);
-    *psiz = ret;
+    if (u->tape) {
+      /* Tape underlength read (RetroCore SCSITape.cs
+         continue_handling_read_6, "under" branch line 887-901):
+         deliver the actual bytes (NOT zero-padded), report CHECK
+         CONDITION with ILI bit + residual = (requested - actual).
+         PROM/standalone reads the residual via the controller's DMA
+         count register, sees a short transfer, prints its EOF message
+         ("st: sense error" or "st: short transfer") and stops reading
+         the file.  Zero-padding to GOOD hid the residual and made the
+         loaded program either keep reading garbage or trip the next
+         FILEMARK path with a bogus residual. */
+      /* Tape underlength read at file end: zero-pad to full requested
+         size + CHECK CONDITION + FILEMARK in sense + NO residual.
+         tpboot's "st: short transfer" check (file 1 0xa3c10..0xa3c2c)
+         fires when bytes_transferred < requested — we avoid that by
+         delivering full DMA count, then signal EOF via CHECK CONDITION
+         status which routes the host to REQUEST_SENSE / FILEMARK silent
+         handling.  Matches RetroCore SunSCSIController's residual
+         management. */
+      memset(u->data + ret, 0, xfer_size - ret);
+      *psiz = xfer_size;            /* tick full DMA count */
+      u->status[0] = 0x02;          /* CHECK CONDITION */
+      u->filemark = 1;
+      u->residual = 0;              /* no residual = no print */
+      if (trace_scsi) printf("scsi%d: tape short read; got %d/%d bytes; CHECK COND FILEMARK (full DMA, no residual)\n",
+             id, ret, xfer_size);
+    } else {
+      u->status[0] = 0x02;
+      if (trace_scsi)
+        printf("scsi%d: short — got %d, wanted %d; eof=1 status=0x02 [disk]\n",
+               id, ret, xfer_size);
+      *psiz = ret;
+    }
   }
 
   return 0;
@@ -295,7 +392,7 @@ int _scsi_request_sense(int id, unsigned char *cmd, int cmd_size, unsigned char 
   off_t offset;
   int spagecode, sallocationlen, xfer_size;
 
-  if (!quiet) printf("_scsi_request_sense()\n");
+  if (trace_scsi) printf("_scsi_request_sense()\n");
 
   u = &scsi_units[id];
   xfer_size = 16;
@@ -303,14 +400,75 @@ int _scsi_request_sense(int id, unsigned char *cmd, int cmd_size, unsigned char 
 
   /* tape? */
   if (u->tape) {
-    if (trace_scsi) printf("scsi%d: eof %d\n", id, u->eof);
-    u->data[0] = u->eof ? 0x01 : 0x00;
-    u->data[4] = u->data[0];
+    /* Match RetroCore SCSIFullDevice.cs:set_sense_data byte-for-byte.
+       Format: SCSI-2 fixed-format extended sense (response code 0x70+).
+         byte 0: (data ? (valid?0x80:0) : 0) | (deferred ? 0x71 : 0x70).
+                 RetroCore: 0xF0 when data is provided.
+         byte 1: 0
+         byte 2: FILEMARK(0x80) | EOM(0x40) | ILI(0x20) | sense_key (low 4)
+         bytes 3..6: signed BE int32 — info (residual)
+         byte 7: 10  (additional sense length)
+         bytes 8..11: 0
+         bytes 12..13: ASC/ASCQ (BE u16 — SCSIAdditionalSenseCodes value)
+                       SKC_FILEMARK_DETECTED = 0x0001
+                       SKC_NO_ADDITIONAL     = 0x0000
+         bytes 14..17: 0 */
+    int info = u->residual;
+    /* Zero-fill all 18 bytes first (RetroCore line 667-670). */
+    memset(u->data, 0, 18);
+    u->data[0] = 0xF0;           /* valid + response code 0x70 */
+    /* byte 2: condition bits OR'd with sense key (NO_SENSE = 0). */
+    unsigned char b2 = 0;
+    if (u->filemark) b2 |= 0x80;
+    else if (u->residual) b2 |= 0x20;   /* ILI (underlength record) */
+    u->data[2] = b2 | 0x00;             /* sense key NO_SENSE */
+    /* info field, big-endian s32. */
+    u->data[3] = (info >> 24) & 0xff;
+    u->data[4] = (info >> 16) & 0xff;
+    u->data[5] = (info >>  8) & 0xff;
+    u->data[6] = (info >>  0) & 0xff;
+    u->data[7] = 10;             /* additional sense length */
+    /* bytes 8..11 already zero. */
+    /* ASC/ASCQ at bytes 12..13. */
+    if (u->filemark) {
+      u->data[12] = 0x00;
+      u->data[13] = 0x01;        /* SKC_FILEMARK_DETECTED */
+    } else {
+      u->data[12] = 0x00;
+      u->data[13] = 0x00;        /* SKC_NO_ADDITIONAL_SENSE_INFORMATION */
+    }
+    /* Respect REQUEST SENSE allocation length (CDB byte 4).
+       Allocation length 0 means "default" (most implementations use 4).
+       We always have 18 bytes of valid sense; deliver up to whatever the
+       host asked for. */
+    int alloc_len = cmd[4];
+    if (alloc_len == 0) alloc_len = 4;     /* SCSI-1 default */
+    if (alloc_len > 18) alloc_len = 18;
+    xfer_size = alloc_len;
+    int delivered_filemark = u->filemark;
+    if (trace_scsi) printf("scsi%d: REQUEST_SENSE [tape] file=%d eof=%d filemark=%d residual=%d alloc=%d -> sense %02x %02x %02x .info=%d ascq=%02x\n",
+           id, u->fileno, u->eof, u->filemark, u->residual, alloc_len,
+           u->data[0], u->data[1], u->data[2], info, u->data[13]);
+    /* SCSI: REQUEST SENSE clears the pending sense after delivery. */
+    u->filemark = 0;
+    u->residual = 0;
+    u->eof = 0;
+    u->status[0] = 0x00;        /* GOOD */
 
-#if 0
-    /* try and look like an emulex mt-02 adapter */
-    xfer_size = 11;
-#endif
+    /* Auto-advance to next tape file once host has consumed the
+       FILEMARK sense.  Sun-2 PROM tpboot doesn't issue SPACE FILEMARK
+       between files; without this, next READ short-reads 0 bytes from
+       the same already-EOF file → infinite FILEMARK loop. */
+    if (delivered_filemark) {
+      if (u->fname[u->fileno + 1]) {
+        int next = u->fileno + 1;
+        if (trace_scsi) printf("scsi%d: post-FILEMARK -> advance file %d -> %d ('%s')\n",
+               id, u->fileno, next, u->fname[next]);
+        _scsi_set_filenum(id, next);
+      } else {
+        if (trace_scsi) printf("scsi%d: post-FILEMARK and no more files\n", id);
+      }
+    }
   }
 
   *pbuf = u->data;
@@ -491,7 +649,11 @@ scsi_bus_data = 0;
 	printf("scsi: command done; cmd[0] %02x\n", scsi_cmd_buf[0]);
 
       if (id_selected == 4 && scsi_cmd_size == 6) {
-	printf("scsi: tape command %02x\n", scsi_cmd_buf[0]);
+	if (trace_scsi)
+	  printf("scsi: tape command %02x cdb=%02x %02x %02x %02x %02x %02x\n",
+	         scsi_cmd_buf[0],
+	         scsi_cmd_buf[0], scsi_cmd_buf[1], scsi_cmd_buf[2],
+	         scsi_cmd_buf[3], scsi_cmd_buf[4], scsi_cmd_buf[5]);
       }
 
       switch ((scsi_cmd_buf[0] & 0xf0) >> 4) {
@@ -502,14 +664,19 @@ scsi_bus_data = 0;
 	  *pirq = 1;
 	  sc_reset_odd_len();
 	  switch (scsi_cmd_buf[0]) {
-	  case 0x00: /* STATUS (test unit ready) */
+	  case 0x00: /* STATUS (test unit ready) — no DMA */
 	    if (trace_scsi) printf("scsi: command status\n");
 	    _scsi_test_unit_ready(id_selected, scsi_cmd_buf, 6, &pbuf, &psiz);
-//	    sc_dma_read_data(pbuf, psiz);
+	    /* No DMA; snap residue to 0xFFFF so PROM "sd: short transfer"
+	       check (PC ef9448) sees a clean transfer.  See sc.c. */
+	    sc_dma_complete_no_xfer();
 	    _scsi_set_phase(PHASE_STATUS, 0);
 	    break;
 	  case 0x01: /* REWIND */
-	    if (trace_scsi) printf("scsi: command rewind\n");
+	    if (trace_scsi)
+	      printf("scsi%d: REWIND (was file %d)\n",
+	             id_selected, scsi_units[id_selected].fileno);
+	    sc_dma_complete_no_xfer();    /* no data phase: snap dma_count=0xFFFF */
 	    _scsi_set_phase(PHASE_STATUS, 0);
 	    _scsi_set_filenum(id_selected, 0);
 	    break;
@@ -549,6 +716,7 @@ scsi_bus_data = 0;
 	    break;
 	  case 0x0d: /* QIC02 (vendor specific for cipher tape) */
 	    printf("scsi: command QIC02\n");
+	    sc_dma_complete_no_xfer();    /* no data phase: snap dma_count=0xFFFF */
 	    _scsi_set_phase(PHASE_STATUS, 0);
 	    break;
 	  default:
@@ -562,9 +730,15 @@ scsi_bus_data = 0;
 	  if (trace_scsi)
 	    printf("scsi: command1 done; size %d, cmd[0] %02x\n", scsi_cmd_size, scsi_cmd_buf[0]);
 	  *pirq = 1;
+	  sc_reset_odd_len();
 	  switch (scsi_cmd_buf[0]) {
 	  case 0x11: /* SPACE */
-	    if (trace_scsi) printf("scsi: command space\n");
+	    if (trace_scsi)
+	      printf("scsi%d: SPACE (advance from file %d) cmd=%02x %02x %02x %02x %02x %02x\n",
+	             id_selected, scsi_units[id_selected].fileno,
+	             scsi_cmd_buf[0], scsi_cmd_buf[1], scsi_cmd_buf[2],
+	             scsi_cmd_buf[3], scsi_cmd_buf[4], scsi_cmd_buf[5]);
+	    sc_dma_complete_no_xfer();    /* no data phase: snap dma_count=0xFFFF */
 	    _scsi_set_phase(PHASE_STATUS, 0);
 	    _scsi_next_file(id_selected);
 	    break;
@@ -579,12 +753,15 @@ scsi_bus_data = 0;
 	    sc_dma_read_data(pbuf, psiz);
 	    _scsi_set_phase(PHASE_STATUS, 0);
 	    break;
-	  case 0x15: /* MODE_SELECT */
+	  case 0x15: /* MODE_SELECT — DATA OUT (host RAM -> device).
+			Tick dma_count for every parameter byte the host
+			pushes; otherwise tpboot's mode-2 confirm sees a
+			residual and prints "st: short transfer". */
 	    if (trace_scsi) printf("scsi: command mode_select\n");
 	    if (_scsi_mode_select(id_selected, scsi_cmd_buf, 6, &pbuf, &psiz)) {
-	      abortf("scsi: inquiry failed\n");
+	      abortf("scsi: mode_select failed\n");
 	    }
-	    sc_dma_read_data(pbuf, psiz);
+	    sc_dma_write_data(pbuf, psiz);
 	    _scsi_set_phase(PHASE_STATUS, 0);
 	    break;
 	  case 0x1a: /* MODE_SENSE */
@@ -717,11 +894,19 @@ int _scsi_set_filenum(int unit, int num)
 
   u = &scsi_units[unit];
 
-  if (trace_scsi) printf("scsi%d: set file %d '%s'\n", unit, num, u->fname[num]);
+  if (trace_scsi)
+    printf("scsi%d: set file %d '%s' (was %d)%s\n",
+           unit, num, u->fname[num] ? u->fname[num] : "(null)",
+           u->fileno, u->tape ? " [tape]" : "");
 
   /* if open, close active file */
   if (u->fd > 0) {
-    close(u->fd);
+    if (trace_scsi)
+      printf("scsi%d: close fd=%d (file %d '%s')\n",
+             unit, u->fd, u->fileno,
+             (u->fileno >= 0 && u->fname[u->fileno]) ? u->fname[u->fileno] : "(null)");
+    if (close(u->fd) < 0)
+      printf("scsi%d: close failed: %s\n", unit, strerror(errno));
     u->fd = 0;
   }
 
@@ -736,8 +921,21 @@ int _scsi_set_filenum(int unit, int num)
   }
   fd = open(fname, (u->ro ? O_RDONLY : O_RDWR) | O_BINARY);
   if (fd < 0) {
+    printf("scsi%d: open('%s', %s) FAILED: %s\n",
+           unit, fname, u->ro ? "O_RDONLY" : "O_RDWR", strerror(errno));
     perror(fname);
     return -1;
+  }
+
+  if (trace_scsi) {
+    struct stat st;
+    if (fstat(fd, &st) == 0)
+      printf("scsi%d: open('%s', %s) OK fd=%d size=%lld%s\n",
+             unit, fname, u->ro ? "O_RDONLY" : "O_RDWR", fd,
+             (long long)st.st_size, u->tape ? " [tape]" : "");
+    else
+      printf("scsi%d: open('%s') OK fd=%d (fstat failed: %s)\n",
+             unit, fname, fd, strerror(errno));
   }
 
   u->fd = fd;
@@ -751,10 +949,17 @@ int _scsi_set_filenum(int unit, int num)
 int _scsi_next_file(int unit)
 {
   int current;
+  struct scsi_unit_s *u = &scsi_units[unit];
 
-  current = scsi_units[unit].fileno;
-  if (scsi_units[unit].fname[current+1]) {
+  current = u->fileno;
+  if (u->fname[current+1]) {
+    if (trace_scsi)
+      printf("scsi%d: next-file %d -> %d ('%s')\n",
+             unit, current, current+1, u->fname[current+1]);
     _scsi_set_filenum(unit, current+1);
+  } else {
+    if (trace_scsi)
+      printf("scsi%d: next-file %d -> NONE (end of media)\n", unit, current);
   }
 
   return 0;
@@ -777,6 +982,14 @@ int scsi_set_disk_image(int unit, char *fname)
 
 int scsi_set_tape_image(int unit, int fileno, char *fname)
 {
+  struct stat st;
+  if (stat(fname, &st) == 0)
+    printf("scsi%d: tape register file %d '%s' size=%lld\n",
+           unit, fileno, fname, (long long)st.st_size);
+  else
+    printf("scsi%d: tape register file %d '%s' (stat failed: %s)\n",
+           unit, fileno, fname, strerror(errno));
+
   scsi_units[unit].fname[fileno] = strdup(fname);
   scsi_units[unit].fd = 0;
   scsi_units[unit].fileno = -1;

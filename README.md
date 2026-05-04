@@ -12,6 +12,9 @@ Larusson.
 It now boots SunOS 2.0, 3.2, and 3.5 cleanly. SunOS 2.0 boots
 multiuser. SCSI tape emulation is still shaky.
 
+Tape boot through the standalone copy program is silent (no `st: short transfer`
+warnings) — see `Docs/sun-scsi-tpboot.md` for the controller-side rules.
+
 ## Quick start
 
 ```sh

@@ -1,5 +1,5 @@
 
-PROM   = media/rom/sun2-multi-rev-R.bin
+PROM   = media/rom/sun2-multi-rev-10F.bin
 DISK   = media/disk/disk.img
 
 # Which SunOS to stage when "make run" is called and disk.img is missing.

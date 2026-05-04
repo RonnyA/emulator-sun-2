@@ -39,7 +39,8 @@ void mm58167_update(void)
 
 void mm58167_write(unsigned pa, unsigned value, int size)
 {
-    if (!quiet)
+    extern int trace_cpu_io;
+    if (trace_cpu_io)
         printf("io: write %x <- %x (%d) tod?\n", pa, value, size);
 }
 
@@ -64,8 +65,11 @@ unsigned mm58167_read(unsigned pa, int size)
 	    break;
     }
 
-    if (!quiet)
-        printf("io: read %x -> %x (%d) tod?\n", pa, v, size);
+    {
+        extern int trace_cpu_io;
+        if (trace_cpu_io)
+            printf("io: read %x -> %x (%d) tod?\n", pa, v, size);
+    }
 
     return v;
 }

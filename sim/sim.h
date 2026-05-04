@@ -48,8 +48,16 @@ extern void sun2_dperror(const char *file, int line, const char *s);
 #define IRQ_SW_INT1     1
 
 /* ROM and RAM sizes */
-#define MAX_ROM 32768       // 32k ROM
+#define MAX_ROM 65536       // 64k ROM (Sun-2 boot ROMs: 32 KB rev-R/Q, 64 KB rev-10F)
 #define MAX_RAM 0xffffff    // 16MB of RAM
+
+extern int eprom_size;
+
+/* Auto-type: when set via --type=STRING, the emulator will inject the
+   given ASCII characters as keyboard scancodes after the PROM has had
+   time to come up.  Used to drive the PROM monitor non-interactively. */
+extern const char *g_autotype;
+void sun2_autotype_tick(void);
 
 /* Sun-2 hardware mode — selected by --mode= on the command line.
    Drives IDPROM machine type, bwtwo CSR JUMPER_HIRES bit, and SDL window size. */
@@ -136,6 +144,11 @@ int sc_device_ack(void);
 void sc_set_cmd_reg(unsigned int v);
 unsigned int sc_get_data(void);
 void sc_reset_odd_len(void);
+/* After a SCSI command that did NO DMA transfer, snap DmaCount to
+   0xFFFF so the PROM's "sd: short transfer" residue check sees a
+   clean transfer.  Mirrors RetroCore SCSIHostAdapter.cs OnLastMessage
+   when bytesReceived == 0. */
+void sc_dma_complete_no_xfer(void);
 void sc_dma_read_data(unsigned char *buf, int bufsiz);
 void sc_dma_write_data(unsigned char *buf, int bufsiz);
 
@@ -147,6 +160,7 @@ unsigned int sun2_kbm_write(unsigned int address, int size, unsigned int value);
 unsigned int sun2_video_ctl_read(unsigned int address, int size);
 unsigned int sun2_video_ctl_write(unsigned int address, int size, unsigned int value);
 void sun2_kb_write(int value, int size);
+void sun2_set_auto_abort(int enabled);
 
 void int_controller_set(unsigned int irq);
 void int_controller_clear(unsigned int irq);

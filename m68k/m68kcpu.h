@@ -1376,20 +1376,13 @@ INLINE void m68ki_jump(uint new_pc)
 
 INLINE void m68ki_jump_vector(uint vector)
 {
-	{
-		extern int quiet;
-		if (!quiet) {
-			void m68ki_dump_state(void);
-			printf("m68ki_jump_vector (inline)\n");
-			m68ki_dump_state();
-			printf("68k: vector 0x%x, old pc 0x%x (prev pc 0x%x), ", vector, REG_PC, REG_PPC);
-		}
-	}
 	REG_PC = (vector<<2) + REG_VBR;
-{ extern int quiet; if (!quiet) printf("fetch 0x%x (%x), ", vector, REG_PC); }
-//	REG_PC = m68ki_read_data_32(REG_PC);
-	REG_PC = m68ki_read_program_32(REG_PC);
-{ extern int quiet; if (!quiet) printf("new pc 0x%x\n", REG_PC); }
+	/* 68010 manual: vector table reads use FC=5 (supervisor data), NOT
+	   FC=6 (supervisor program).  Vectors are stored as data — 32-bit
+	   pointers to handlers — and the 68010 issues a supervisor-data
+	   bus cycle to fetch them.  RetroCore commit 719710a1 fixed the
+	   same bug in their CPU and noted "broke Sun2 PROM boot entirely". */
+	REG_PC = m68ki_read_data_32(REG_PC);
 	m68ki_pc_changed(REG_PC);
 #if 0
 	if (vector == 0x20) enable_trace(1);
@@ -1561,54 +1554,103 @@ INLINE void m68ki_stack_frame_buserr(uint pc, uint sr, uint address, uint write,
 	m68ki_push_16(((!write)<<4) | ((!instruction)<<3) | fc);
 }
 
-/* Format 8 stack frame (68010).
- * 68010 only.  This is the 29 word bus/address error frame.
+/* Format 8 stack frame (68010 bus / address error).
+ *
+ * Layout exactly mirrors C# RetroCore's CreateStackFrame8
+ * (RetroCore/Emulated.HW/Motorola/CPU/MC68K/Instructionset.Helpers.cs
+ *  lines 1246-1294) which is the battle-tested reference for Sun-2
+ * boot ROMs.  29 words total; the resulting on-stack offsets match
+ * the SunOS bei_long8 struct (sys/sun3/sysm68k.h):
+ *
+ *   +00  Status Register
+ *   +02  Program Counter (4)
+ *   +06  Format/Vector (0x8xxx)
+ *   +08  Special Status Word
+ *   +0A  Fault Address (4)
+ *   +0E  unused
+ *   +10  Data Output Buffer
+ *   +12  unused
+ *   +14  Data Input Buffer
+ *   +16  unused
+ *   +18  Instruction Output Buffer (bei_irc)
+ *   +1A  Chip Mask # / MicroPC      (bei_maskpc)  ← MUST be deterministic
+ *   +1C  last internal-info word    ← MUST be deterministic
+ *   +1E..+39  14 words of internal info (left uninitialised — 68010 manual)
+ *
+ * Earlier code pushed 8× fake_push_32 then 1× push_16(0), leaving +1A
+ * and +1C uninitialised.  Sun PROM bus-error handlers read +1A
+ * (bei_maskpc), so garbage there caused unpredictable behaviour.
  */
 void m68ki_stack_frame_1000(uint pc, uint sr, uint vector, uint address, uint write, uint fc)
 {
-	/* VERSION
-	 * NUMBER
-	 * INTERNAL INFORMATION, 16 WORDS
-	 */
-	m68ki_fake_push_32();
-	m68ki_fake_push_32();
-	m68ki_fake_push_32();
-	m68ki_fake_push_32();
-	m68ki_fake_push_32();
-	m68ki_fake_push_32();
-	m68ki_fake_push_32();
-	m68ki_fake_push_32();
+	/* Version + 14 words of internal info.  Real 68010 leaves these as
+	   microcode state (effectively undefined per the spec), but the Sun-2
+	   PROM bus-error dispatcher at $ef3aa4 indexes into this region:
+	     btst #5, ($62,A6)   — frame offset +0x1A (Chip Mask + MicroPC)
+	     move.w ($68,A6), D0 — frame offset +0x20 (1st internal-info word)
+	   With fake_push_32 (decrement-without-write) the dispatcher reads
+	   stale stack contents and dispatches to a wrong handler — the
+	   "invalidate kernel image PMEG" path on a tape-boot bcopy fault.
+	   Push 0 so the dispatch is deterministic.  Matches what RetroCore's
+	   battle-tested Sun-2 boot path produces. */
+	m68ki_push_32(0);
+	m68ki_push_32(0);
+	m68ki_push_32(0);
+	m68ki_push_32(0);
+	m68ki_push_32(0);
+	m68ki_push_32(0);
+	m68ki_push_32(0);
 
-	/* INSTRUCTION INPUT BUFFER */
+	/* Last internal-info word — zeroed deterministically (matches C# RetroCore) */
 	m68ki_push_16(0);
 
-	/* UNUSED, RESERVED (not written) */
-	m68ki_fake_push_16();
-
-	/* DATA INPUT BUFFER */
+	/* Chip Mask # and MicroPC (bei_maskpc) — zeroed (matches C# RetroCore) */
 	m68ki_push_16(0);
 
-	/* UNUSED, RESERVED (not written) */
-	m68ki_fake_push_16();
-	/* DATA OUTPUT BUFFER */
+	/* Instruction Output Buffer */
 	m68ki_push_16(0);
 
-	/* UNUSED, RESERVED (not written) */
+	/* Unused, reserved */
 	m68ki_fake_push_16();
 
-	/* FAULT ADDRESS */
+	/* Data Input Buffer */
+	m68ki_push_16(0);
+
+	/* Unused, reserved */
+	m68ki_fake_push_16();
+
+	/* Data Output Buffer */
+	m68ki_push_16(0);
+
+	/* Unused, reserved */
+	m68ki_fake_push_16();
+
+	/* Fault Address */
 	m68ki_push_32(address);
 
-	/* SPECIAL STATUS WORD */
-	m68ki_push_16(((!write)<<4) | fc);
-	
-	/* 1000, VECTOR OFFSET */
-	m68ki_push_16(0x8000 | (vector<<2));
+	/* Special Status Word (68010 layout):
+	 *   bit 15 = Rerun  (0 = software-rerun, set by PROM)
+	 *   bit 13 = Instruction Fetch
+	 *   bit 12 = Data Fetch
+	 *   bit  8 = R/W (1 = read, 0 = write)
+	 *   bits 0..2 = Function Code
+	 * Bits chosen to match RetroCore HelperEnums.cs SpecialStatusWord enum.
+	 */
+	{
+		uint ssw = fc & 7;
+		if (fc == 2 || fc == 6) ssw |= (1u << 13);   /* instruction fetch (program space) */
+		if (fc == 1 || fc == 5) ssw |= (1u << 12);   /* data fetch (data space) */
+		if (!write)             ssw |= (1u << 8);    /* read */
+		m68ki_push_16(ssw);
+	}
 
-	/* PROGRAM COUNTER */
+	/* Format 8 + vector offset */
+	m68ki_push_16(0x8000 | (vector << 2));
+
+	/* Program Counter (faulting instruction; restartable for RTE) */
 	m68ki_push_32(pc);
 
-	/* STATUS REGISTER */
+	/* Status Register */
 	m68ki_push_16(sr);
 }
 
@@ -1744,6 +1786,20 @@ INLINE void m68ki_exception_buserr(void)
 
 	m68ki_fault_pending = 0;
 
+	/* Auto-dump the instruction trace ring (--trace-ring=N) on bus errors
+	   matching --trace-ring-addr= (default: any). */
+	{
+		extern int trace_ring_size;
+		extern unsigned int trace_ring_trigger_addr;
+		extern void trace_ring_dump(const char *);
+		if (trace_ring_size > 0 &&
+		    (trace_ring_trigger_addr == 0 || address == trace_ring_trigger_addr)) {
+			char buf[64];
+			snprintf(buf, sizeof(buf), "bus error addr=%x pc=%x", address, pc);
+			trace_ring_dump(buf);
+		}
+	}
+
 	if(CPU_TYPE_IS_000(CPU_TYPE))
 		/*m68ki_stack_frame_buserr(REG_PC, sr, address, write, instruction, fc)*/;
 	else
@@ -1861,6 +1917,11 @@ INLINE void m68ki_exception_illegal(void)
 				 m68ki_cpu_names[CPU_TYPE], ADDRESS_68K(REG_PPC), REG_IR,
 				 m68ki_disassemble_quick(ADDRESS_68K(REG_PPC))));
 
+	{ extern int quiet;
+	  if (!quiet)
+	    printf("ILLEGAL INSN: opcode=0x%04x at pc=0x%x (ppc=0x%x) sr=0x%04x\n",
+	           REG_IR, REG_PC, REG_PPC, m68ki_get_sr()); }
+
 	sr = m68ki_init_exception();
 	m68ki_stack_frame_0000(REG_PC, sr, EXCEPTION_ILLEGAL_INSTRUCTION);
 	m68ki_jump_vector(EXCEPTION_ILLEGAL_INSTRUCTION);
@@ -1900,10 +1961,8 @@ void m68ki_exception_interrupt(uint int_level)
 	CPU_STOPPED &= ~STOP_LEVEL_STOP;
 
 	/* If we are halted, don't do anything */
-	if(CPU_STOPPED) {
-		{ extern int quiet; if (!quiet) printf("m68ki_exception_interrupt() stopped and int %d\n", int_level); }
+	if(CPU_STOPPED)
 		return;
-	}
 
 	/* Acknowledge the interrupt */
 	vector = m68ki_int_ack(int_level);

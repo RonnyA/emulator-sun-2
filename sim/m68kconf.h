@@ -131,12 +131,36 @@
 /* If on, CPU will call the instruction hook callback before every
  * instruction.
  */
-#define M68K_INSTRUCTION_HOOK       OPT_OFF
-#define M68K_INSTRUCTION_CALLBACK() your_instruction_hook_function()
+#define M68K_INSTRUCTION_HOOK       OPT_SPECIFY_HANDLER
+extern void trace_ring_record(void);
+#define M68K_INSTRUCTION_CALLBACK() trace_ring_record()
 
 
-/* If on, the CPU will emulate the 4-byte prefetch queue of a real 68000 */
-#define M68K_EMULATE_PREFETCH       OPT_ON
+/* If on, the CPU will emulate the 4-byte prefetch queue of a real 68000.
+ *
+ * DISABLED on Sun-2: the Musashi prefetch cache (CPU_PREF_ADDR /
+ * CPU_PREF_DATA in m68ki_read_imm_16) is not invalidated on FLAG_S
+ * transitions, RTE, or MMU context-register writes.  When the kernel and
+ * a user process happen to have code at the same 4-byte-aligned VA
+ * (common at low addresses like 0x44xx — both user text and the SunOS
+ * exception/syscall stubs sit there), a kernel-mode fetch leaves bytes
+ * from supervisor program space in the cache, and the next user-mode
+ * fetch at the same aligned VA hits the cache and returns those
+ * supervisor bytes instead of re-reading user memory.
+ *
+ * Symptom on SunOS 3.2: fsck takes a privilege violation at user PC
+ * 0x44be where the fetched word decodes to RTE (0x4e73), even though
+ * the user's text at that VA is BGE.S (0x6c02).  Diagnosed by reading
+ * the same VA with cpu_read at FC=2 (user program) vs FC=6 (supervisor
+ * program) — the latter returns 0x4e73, which is what the prefetch
+ * cache had stashed.
+ *
+ * Disabling the cache makes every instruction fetch go through the
+ * normal m68k_read_immediate_16 path (and our cpu_map_address with the
+ * correct FC each time), at a small performance cost.  Re-enabling
+ * would require flushing the cache on every supervisor↔user
+ * transition, RTE, and context-register write. */
+#define M68K_EMULATE_PREFETCH       OPT_OFF
 
 
 /* If on, the CPU will generate address error exceptions if it tries to

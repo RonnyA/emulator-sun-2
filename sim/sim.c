@@ -120,13 +120,14 @@ read_kernel(void)
 }
 
 int eprom_size;
-char eprom_raw[32*1024];
 
 int
 read_binary(int fd, int addr)
 {
 	extern unsigned char g_rom[];
-	eprom_size = read(fd, g_rom/*eprom_raw*/, sizeof(eprom_raw));
+	eprom_size = read(fd, g_rom, MAX_ROM);
+	if (eprom_size > 0)
+		printf("eprom: loaded %d bytes\n", eprom_size);
 	return eprom_size;
 }
 
@@ -256,6 +257,7 @@ static const sun2_mode_t sun2_modes[] = {
 static const int n_sun2_modes = sizeof(sun2_modes) / sizeof(sun2_modes[0]);
 
 const sun2_mode_t *g_mode = &sun2_modes[0];   /* default: 2/120 1152x900 */
+const char *g_autotype;
 
 const sun2_mode_t *sun2_mode_lookup(const char *name)
 {
@@ -287,6 +289,9 @@ void usage(void)
   sun2_mode_print_list();
   fprintf(stderr, "optionally:\n");
   fprintf(stderr, " --kernel=FILE  --boot=FILE\n");
+  fprintf(stderr, " --auto-abort       send L1-A on first PROM bell-off (drops to monitor)\n");
+  fprintf(stderr, " --trace-ring=N     keep last N MMU traces; dump on bus error\n");
+  fprintf(stderr, " --trace-ring-addr=ADDR  only dump trace ring for bus errors at ADDR (0=any)\n");
   fprintf(stderr, " --net-iface=NAME|N bind the 3C400 to this host interface.\n");
   fprintf(stderr, "                    NAME is a literal name (e.g. eth0 or a Windows\n");
   fprintf(stderr, "                    \\Device\\NPF_{...} GUID).  N is an index into\n");
@@ -343,22 +348,26 @@ int main(int argc, char **argv)
     int this_option_optind = optind ? optind : 1;
     int option_index = 0;
     static struct option long_options[] = {
-      {"prom",      optional_argument, 0,  'p' },
-      {"disk",      optional_argument, 0,  'd' },
-      {"tape",      optional_argument, 0,  't' },
-      {"kernel",    optional_argument, 0,  'k' },
-      {"boot",      optional_argument, 0,  'b' },
-      {"mode",      required_argument, 0,  'm' },
-      {"net-iface", required_argument, 0,  'i' },
-      {"net-list",  no_argument,       0,  'L' },
-      {"net-dump",  no_argument,       0,  'D' },
-      {"scc-tcp",   optional_argument, 0,  'S' },
-      {"scc-boards",required_argument, 0,  'B' },
-      {"no-kbd",    no_argument,       0,  'K' },
-      {0,           0,                 0,   0  }
+      {"prom",            optional_argument, 0,  'p' },
+      {"disk",            optional_argument, 0,  'd' },
+      {"tape",            optional_argument, 0,  't' },
+      {"kernel",          optional_argument, 0,  'k' },
+      {"boot",            optional_argument, 0,  'b' },
+      {"mode",            required_argument, 0,  'm' },
+      {"type",            required_argument, 0,  'T' },
+      {"auto-abort",      no_argument,       0,  'A' },
+      {"trace-ring",      required_argument, 0,  'R' },
+      {"trace-ring-addr", required_argument, 0,  'X' },
+      {"net-iface",       required_argument, 0,  'i' },
+      {"net-list",        no_argument,       0,  'L' },
+      {"net-dump",        no_argument,       0,  'D' },
+      {"scc-tcp",         optional_argument, 0,  'S' },
+      {"scc-boards",      required_argument, 0,  'B' },
+      {"no-kbd",          no_argument,       0,  'K' },
+      {0,                 0,                 0,   0  }
     };
 
-    c = getopt_long(argc, argv, "d:k:p:t:m:i:qLDS::KB:", long_options, &option_index);
+    c = getopt_long(argc, argv, "d:k:p:t:m:T:i:qAR:X:LDS::KB:", long_options, &option_index);
     if (c == -1)
       break;
 
@@ -403,9 +412,34 @@ int main(int argc, char **argv)
       break;
     }
 
+    case 'T':
+      g_autotype = strdup(optarg);
+      printf("autotype: will type %zu chars after boot delay\n", strlen(optarg));
+      break;
+
     case 'q':
       quiet++;
       break;
+
+    case 'A':
+      sun2_set_auto_abort(1);
+      printf("auto-abort enabled (first PROM bell-off → L1-A drops to monitor)\n");
+      break;
+
+    case 'R': {
+      extern void trace_ring_init(int);
+      int n = (int)strtol(optarg, NULL, 0);
+      if (n <= 0) { fprintf(stderr, "--trace-ring=N requires N>0\n"); exit(1); }
+      trace_ring_init(n);
+      break;
+    }
+
+    case 'X': {
+      extern unsigned int trace_ring_trigger_addr;
+      trace_ring_trigger_addr = (unsigned int)strtoul(optarg, NULL, 0);
+      printf("trace-ring: trigger addr set to 0x%x (0=any bus error)\n", trace_ring_trigger_addr);
+      break;
+    }
 
     case 'i':
       g_net_iface = strdup(optarg);
