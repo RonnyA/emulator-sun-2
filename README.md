@@ -277,11 +277,12 @@ WSL2 has limited raw-socket support compared to a real Linux box.
 Some WSL2 distributions cannot open `eth0` for raw I/O at all; in
 that case build with `NET_BACKEND=stub`.
 
-## SCC console over TCP
+## SCC consoles over TCP
 
-The SCC channel-A serial console (SunOS `/dev/console`) can be
-exposed on a TCP port so you can interact with it from a terminal
-client instead of (or alongside) the SDL window:
+The Sun-2's serial chips (Z8530 SCCs) can be exposed on a TCP port so
+you can drive them from a terminal client. One TCP listener serves
+all configured ttys; on connect you get a menu and pick which one to
+attach to.
 
 ```sh
 ./sim/sim --scc-tcp        --prom=... --disk=... --tape=...   # listens on 9900
@@ -303,41 +304,158 @@ telnet localhost 9900
 nc     localhost 9900
 ```
 
-### Headless boot via TCP (recommended for `make run-serial`)
+### Connection menu
 
-The Sun-2's default console is the **bwtwo framebuffer + keyboard**.
-PROM banner, "Self Test PASSED", `>` prompt and SunOS kernel messages
-all go to the framebuffer (the SDL window) by default — `--scc-tcp`
-on its own only sees data after SunOS specifically writes to
-`/dev/ttya` from a shell.
+On connect the server greets you with:
 
-Pass **`--no-kbd`** to make the emulated keyboard look unattached.
-The PROM probes the keyboard on SCC channel 3 at boot, gets no reply,
-gives up, and falls back to ttya (= SCC channel 0) for both input
-and output. From that point on every byte the PROM and SunOS print
-goes through the TCP port:
-
-```sh
-./sim/sim --scc-tcp --no-kbd ...
-make run-serial               # convenience wrapper for the above
+```
+Sun-2 SCC console -- pick a tty:
+  [a] ttya  (idle)
+  [b] ttyb  (idle)
+  [Enter] pick first idle
+  [q]     disconnect
+> 
 ```
 
-With this combo, `telnet localhost 9900` (or `nc localhost 9900`) is
-your full Sun-2 console session — banner, boot prompt, login. The
-SDL window still appears with the bwtwo display but you don't need
-to interact with it.
+- A single keypress (`a`, `b`, …) picks that tty.
+- `Enter` picks the first idle tty.
+- `q` closes the connection.
+- Picking a busy tty prints `ttyX busy, try another` and re-shows the
+  menu.  The busy line shows the connected client's address so you can
+  see who has it.
 
-The server is raw bytes both ways — no telnet IAC negotiation. When
-using `telnet`, the client emits a few IAC option bytes at startup;
-SunOS's tty discipline mostly ignores them. `nc` is cleaner.
+Each tty allows one client at a time.  Multiple clients can be
+connected simultaneously to **different** ttys.
 
-Single client at a time; new connections wait until the previous
-one disconnects. Bytes you type are pushed into SCC channel 0 input
-(SunOS sees them as console keystrokes); bytes SunOS writes to
-channel 0 (and channel 1) are forwarded out. Default port: **9900**.
-Implemented in `sim/scc_tcp.c` — pthread-based server, ringbuf'd in
-both directions so the emulator main loop never blocks on the
-network.
+The server speaks telnet IAC: on connect it sends `IAC WILL ECHO` +
+`IAC WILL/DO SUPPRESS_GO_AHEAD` so a vanilla `telnet host port`
+switches to remote-echo character-at-a-time mode.  Inbound IAC
+sequences (option negotiation, subnegotiation) are parsed and
+swallowed before they reach SunOS's tty discipline, so you don't
+see garbage characters at login.  `nc` users see the IAC bytes as
+opaque data; if that bothers you, `telnet` is cleaner.
+
+### Adding more ttys -- `--scc-boards=N`
+
+The on-board hardware has two Z8530 chips: zs0 (ttya / ttyb) and zs1
+(keyboard / mouse).  Sun-2 GENERIC SunOS supports up to four extra
+**Multibus expansion** SCC cards (zs2..zs5).  Enable them with:
+
+```sh
+./sim/sim --scc-tcp --scc-boards=N ...
+```
+
+| `--scc-boards=` | Adds                | Total ttys                       |
+|----------------:|---------------------|----------------------------------|
+| `0` (default)   | nothing             | ttya, ttyb                       |
+| `1`             | zs2 @ MBMEM 0x80800 | + ttye, ttyf                     |
+| `2`             | + zs3 @ 0x81000     | + ttyg, ttyh                     |
+| `3`             | + zs4 @ 0x84800     | + ttyi, ttyj                     |
+| `4`             | + zs5 @ 0x85000     | + ttyk, ttyl  (10 ttys total)    |
+
+**There is no `ttyc` or `ttyd` on a Sun-2.**  SunOS minor-numbers
+strictly by chip-unit, so the kbd/mouse chip (zs1) eats those names
+even though kbd/mouse aren't text terminals.  The menu reflects this:
+
+```
+Sun-2 SCC console -- pick a tty:
+  [a] ttya  (idle)
+  [b] ttyb  (idle)
+  [e] ttye  (idle)        <- with --scc-boards=2 ...
+  [f] ttyf  (idle)
+  [g] ttyg  (idle)        <- ... up to here
+  [h] ttyh  (idle)
+  [Enter] pick first idle
+  [q]     disconnect
+> 
+```
+
+When `--scc-boards>=N` is set, SunOS's autoconf probes the matching
+MBMEM addresses and reports the chips at boot:
+
+```
+zs0 at obio 2000 pri 3 
+zs2 at mbmem 80800 pri 3 
+zs3 at mbmem 81000 pri 3 
+```
+
+Below the threshold those addresses bus-error so SunOS's `zsprobe`
+correctly fails for the missing slots.
+
+### Getting a login prompt on ttya/ttyb/...
+
+Detecting the chips is only half the job — SunOS's stock `/etc/ttytab`
+has every serial line marked **`off`**, so `init` never spawns `getty`
+on them.  A `telnet` client that picks `ttya` from the menu will
+attach successfully but see nothing until something inside SunOS
+opens `/dev/ttya` and writes to it.
+
+The **headless** case (`make run-serial` = `--scc-tcp + --no-kbd`)
+works around this: with `--no-kbd` the PROM detects no keyboard,
+declares ttya the system console, so `getty`-on-console runs there
+automatically and login prompts fly out the TCP port without any
+disk-image edits.
+
+For everything else — booting with the SDL window AND wanting login
+prompts on telnet, or wanting prompts on ttye/f/g/h — you have to
+edit SunOS's `/etc/ttytab` once, inside the running system:
+
+```sh
+# from the SunOS shell (root):
+#   keep `console` as-is; turn the ttys you want on:
+
+cat > /etc/ttytab.new <<'EOF'
+console "/etc/getty std.9600"  sun           on  secure
+ttya    "/etc/getty std.9600"  unknown       on
+ttyb    "/etc/getty std.9600"  unknown       on
+ttye    "/etc/getty std.9600"  unknown       on
+ttyf    "/etc/getty std.9600"  unknown       on
+ttyg    "/etc/getty std.9600"  unknown       on
+ttyh    "/etc/getty std.9600"  unknown       on
+ttyi    "/etc/getty std.9600"  unknown       off
+ttyj    "/etc/getty std.9600"  unknown       off
+ttyk    "/etc/getty std.9600"  unknown       off
+ttyl    "/etc/getty std.9600"  unknown       off
+EOF
+mv /etc/ttytab.new /etc/ttytab
+kill -HUP 1                       # tell init to re-read ttytab
+```
+
+After `init` re-reads, every `on` tty has a `getty` and the next
+client that picks it from the menu lands at a `noname login:`.
+
+Field reference (SunOS 3.2 `ttytab(5)`):
+- column 1: device name in `/dev`
+- column 2: command + argv (`-` to disable explicitly)
+- column 3: terminal type, looked up in `/etc/termcap`
+- column 4: `on` runs the command, `off` doesn't; `secure` allows root
+  login, no-`secure` doesn't.
+
+The disk image ships with all serials `off` because real Sun-2 owners
+typically didn't have anything plugged into them and an unloaded
+`getty` waiting on a non-existent line is wasted process slots.
+
+### How it works under the hood
+
+- One TCP listener (default port 9900).  An accept thread spawns one
+  worker thread per client.  Each worker handles its own menu +
+  passthrough lifecycle then exits.
+- Per-tty state lives in `sim/scc_tcp.c` (input ringbuf, output ring-
+  buf, `client_fd`, busy address).  `scc_tcp_send_byte(idx, byte)` is
+  called from the emulator main thread for every byte SunOS writes;
+  it appends to that tty's output ringbuf and the worker thread
+  drains it to the socket.  Inbound bytes from the socket are staged
+  in the tty's input ringbuf and drained on the main thread by
+  `scc_tcp_poll()` so chip-side state is only mutated from one thread.
+- SCC chip emulation (`sim/scc.c`) is shared: every Z8530 in the
+  machine — zs0, zs1 (kbd/mouse), zs2..zs5 — is just a `scc_chip_t`
+  instance of the same code with different callbacks wired up.
+- All chips share IRQ_SCC (m68k level 3).  The IRQ helper walks every
+  configured chip when deciding whether to drop the line on ack.
+
+Implemented across `sim/scc.c`, `sim/scc.h`, `sim/scc_tcp.c`, and
+the address routing in `sim/sim68k.c`'s `cpu_read_mbmem` /
+`cpu_write_mbmem`.
 
 ### Caveats (from the original 3C400 driver)
 
