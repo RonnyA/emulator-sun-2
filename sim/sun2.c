@@ -109,6 +109,9 @@ static void mouse_send_packet(void)
   /* Sun: positive dy = up; SDL: positive dy = down. */
   dy1 = -dy1; dy2 = -dy2;
 
+  if (0) printf("mouse: pkt btn=0x%02x dx=%d,%d dy=%d,%d\n",
+                0x80 | mouse_buttons, dx1, dx2, dy1, dy2);
+
   scc_in_push(2, 0x80 | mouse_buttons);
   scc_in_push(2, (unsigned char)dx1);
   scc_in_push(2, (unsigned char)dy1);

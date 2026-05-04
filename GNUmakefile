@@ -40,11 +40,11 @@ ifneq (,$(filter $(RUN_TARGETS),$(MAKECMDGOALS)))
     endif
 endif
 
-# Optional SCC-over-TCP console.  Two ways to enable:
-#   make run TCP=9900    -> sim --scc-tcp=9900
-#   make run-tcp         -> shortcut for the default port 9900
-# Then connect with:  telnet localhost 9900   or   nc localhost 9900
-ifdef TCP
+# SCC-over-TCP console.  Enabled by default on port 9900.
+# Override:  make run TCP=0  (disable)  or  make run TCP=5555  (other port)
+# Connect:   telnet localhost 9900   or   nc localhost 9900
+TCP ?= 9900
+ifneq ($(TCP),0)
     SCC_TCP_FLAG := --scc-tcp=$(TCP)
 endif
 
