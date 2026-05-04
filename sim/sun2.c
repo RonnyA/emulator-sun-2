@@ -88,6 +88,7 @@ static void mouse_toggle_capture(void)
   mouse_captured = !mouse_captured;
   SDL_SetRelativeMouseMode(mouse_captured ? SDL_TRUE : SDL_FALSE);
   mouse_update_title();
+  printf("mouse: capture %s\n", mouse_captured ? "ON" : "OFF");
 }
 
 static void mouse_send_packet(void)
@@ -418,8 +419,14 @@ void sdl_poll(void)
 	    case SDL_KEYDOWN:
 	      if (event.key.repeat)
 	        break; /* suppress SDL auto-repeat -- SunOS does software repeat */
-	      if (event.key.keysym.sym == SDLK_RALT) {
-	        mouse_toggle_capture();
+	      /* Right Alt (PC) / Right Option (Mac) RELEASES the mouse.
+	         Capture happens by clicking inside the window.  Match on the
+	         positional scancode -- SDLK_RALT alone misses on macOS layouts
+	         where Right Option produces a special character. */
+	      if (event.key.keysym.scancode == SDL_SCANCODE_RALT ||
+	          event.key.keysym.sym == SDLK_RALT) {
+	        if (mouse_captured)
+	          mouse_toggle_capture();
 	        break;
 	      }
 	      sun2_sdl_key(event.key.keysym.sym, event.key.keysym.mod, event.key.keysym.scancode, 1);
@@ -448,8 +455,11 @@ void sdl_poll(void)
 	        else if (event.button.button == SDL_BUTTON_RIGHT)  mouse_buttons &= ~0x01;
 	        mouse_send_button_packet();
 	      } else {
-	        /* Right-click pastes clipboard text when not captured. */
-	        if (event.button.button == SDL_BUTTON_RIGHT)
+	        /* Not captured: left-click captures the mouse, right-click
+	           still pastes clipboard text. */
+	        if (event.button.button == SDL_BUTTON_LEFT)
+	          mouse_toggle_capture();
+	        else if (event.button.button == SDL_BUTTON_RIGHT)
 	          paste_start();
 	      }
 	      break;

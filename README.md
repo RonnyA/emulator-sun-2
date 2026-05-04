@@ -286,10 +286,11 @@ The emulator implements the MouseSystems 5-byte serial mouse protocol on
 SCC channel A (port at 0x780000) -- the same protocol used by the
 original Sun-2 optical mouse.
 
-Press **Right Alt** (PC) / **Right Option** (Mac) to capture the host
-mouse; the window title shows capture state. Movement and the three
-buttons (left/middle/right) are sent to SunOS as MouseSystems packets.
-Press the same key again to release.
+**Left-click** inside the window to capture the host mouse; press
+**Right Alt** (PC) / **Right Option** (Mac) to release. The window
+title and a console line (`mouse: capture ON/OFF`) reflect the state.
+While captured, movement and the three buttons (left/middle/right) are
+sent to SunOS as MouseSystems packets.
 
 When the mouse is **not** captured, right-clicking the window pastes the
 host clipboard into the keyboard channel (channel B): ASCII characters
