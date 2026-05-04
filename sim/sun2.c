@@ -51,6 +51,81 @@ static int paste_len = 0;
 static int paste_delay = 0;
 #define PASTE_CHAR_DELAY 3
 
+/* Forward declaration -- defined further down with the other SDL globals. */
+static SDL_Window *screen;
+
+/* ---- MouseSystems 5-byte mouse on SCC channel 2 ----
+   Right Alt (PC) / Right Option (Mac) toggles SDL relative-mouse capture.
+   When captured, motion deltas accumulate per poll and a packet is emitted
+   per MOUSE_PACKET_DELAY cycles to keep the 16-byte SCC FIFO from
+   overflowing.  Button-only packets (zero deltas) flush immediately. */
+static int mouse_captured = 0;
+static int mouse_dx = 0;
+static int mouse_dy = 0;
+static unsigned char mouse_buttons = 0x07; /* bits 2,1,0 = L,M,R; 0=pressed */
+static int mouse_delay = 0;
+#define MOUSE_PACKET_DELAY 2
+
+static void mouse_update_title(void)
+{
+  char title[128];
+#ifdef __APPLE__
+  const char *key = "Right Option";
+#else
+  const char *key = "Right Alt";
+#endif
+  if (mouse_captured) {
+    snprintf(title, sizeof(title),
+             "Sun2 - Mouse captured, press %s to release", key);
+    SDL_SetWindowTitle(screen, title);
+  } else {
+    SDL_SetWindowTitle(screen, "Sun2");
+  }
+}
+
+static void mouse_toggle_capture(void)
+{
+  mouse_captured = !mouse_captured;
+  SDL_SetRelativeMouseMode(mouse_captured ? SDL_TRUE : SDL_FALSE);
+  mouse_update_title();
+}
+
+static void mouse_send_packet(void)
+{
+  if (mouse_delay > 0) { mouse_delay--; return; }
+  if (mouse_dx == 0 && mouse_dy == 0) return;
+
+  int dx = mouse_dx, dy = mouse_dy;
+  mouse_dx = 0; mouse_dy = 0;
+
+  if (dx >  127) dx =  127;
+  if (dx < -127) dx = -127;
+  if (dy >  127) dy =  127;
+  if (dy < -127) dy = -127;
+
+  int dx1 = dx / 2, dx2 = dx - dx1;
+  int dy1 = dy / 2, dy2 = dy - dy1;
+  /* Sun: positive dy = up; SDL: positive dy = down. */
+  dy1 = -dy1; dy2 = -dy2;
+
+  scc_in_push(2, 0x80 | mouse_buttons);
+  scc_in_push(2, (unsigned char)dx1);
+  scc_in_push(2, (unsigned char)dy1);
+  scc_in_push(2, (unsigned char)dx2);
+  scc_in_push(2, (unsigned char)dy2);
+
+  mouse_delay = MOUSE_PACKET_DELAY;
+}
+
+static void mouse_send_button_packet(void)
+{
+  scc_in_push(2, 0x80 | mouse_buttons);
+  scc_in_push(2, 0);
+  scc_in_push(2, 0);
+  scc_in_push(2, 0);
+  scc_in_push(2, 0);
+}
+
 struct ascii_to_sun2 {
   unsigned char sc;
   unsigned char shifted;
@@ -343,6 +418,10 @@ void sdl_poll(void)
 	    case SDL_KEYDOWN:
 	      if (event.key.repeat)
 	        break; /* suppress SDL auto-repeat -- SunOS does software repeat */
+	      if (event.key.keysym.sym == SDLK_RALT) {
+	        mouse_toggle_capture();
+	        break;
+	      }
 	      sun2_sdl_key(event.key.keysym.sym, event.key.keysym.mod, event.key.keysym.scancode, 1);
 	      break;
 
@@ -357,20 +436,40 @@ void sdl_poll(void)
 	      SDL_Quit();
 	      exit(0);
 	    case SDL_MOUSEMOTION:
-	//      sdl_send_mouse_event();
+	      if (mouse_captured) {
+	        mouse_dx += event.motion.xrel;
+	        mouse_dy += event.motion.yrel;
+	      }
 	      break;
 	    case SDL_MOUSEBUTTONDOWN:
-	      /* Right-click pastes clipboard text into the keyboard FIFO. */
-	      if (event.button.button == SDL_BUTTON_RIGHT)
-	        paste_start();
+	      if (mouse_captured) {
+	        if      (event.button.button == SDL_BUTTON_LEFT)   mouse_buttons &= ~0x04;
+	        else if (event.button.button == SDL_BUTTON_MIDDLE) mouse_buttons &= ~0x02;
+	        else if (event.button.button == SDL_BUTTON_RIGHT)  mouse_buttons &= ~0x01;
+	        mouse_send_button_packet();
+	      } else {
+	        /* Right-click pastes clipboard text when not captured. */
+	        if (event.button.button == SDL_BUTTON_RIGHT)
+	          paste_start();
+	      }
 	      break;
 	    case SDL_MOUSEBUTTONUP:
+	      if (mouse_captured) {
+	        if      (event.button.button == SDL_BUTTON_LEFT)   mouse_buttons |= 0x04;
+	        else if (event.button.button == SDL_BUTTON_MIDDLE) mouse_buttons |= 0x02;
+	        else if (event.button.button == SDL_BUTTON_RIGHT)  mouse_buttons |= 0x01;
+	        mouse_send_button_packet();
+	      }
 	      break;
 	    }
   }
 
   /* Drip-feed paste buffer into the SCC keyboard FIFO. */
   paste_feed();
+
+  /* Send accumulated mouse motion to SCC channel 2. */
+  if (mouse_captured)
+    mouse_send_packet();
 }
 
 void sun2_fb_alloc(void)

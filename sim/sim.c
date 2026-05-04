@@ -521,9 +521,7 @@ int main(int argc, char **argv)
     setup_kernel(kernel_arg, boot_arg);
     read_kernel();
   } else {
-    if (prom_arg == NULL ||
-	disk_arg == NULL ||
-	tape_arg == NULL)
+    if (prom_arg == NULL || disk_arg == NULL)
       usage();
 
     setup_eeprom(prom_arg);
@@ -531,8 +529,10 @@ int main(int argc, char **argv)
     if (setup_disk(disk_arg))
       exit(1);
 
-    if (setup_tape(tape_arg))
-      exit(1);
+    if (tape_arg) {
+      if (setup_tape(tape_arg))
+        exit(1);
+    }
   }
 
   sim68k();

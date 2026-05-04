@@ -280,6 +280,22 @@ WSL2 has limited raw-socket support compared to a real Linux box.
 Some WSL2 distributions cannot open `eth0` for raw I/O at all; in
 that case build with `NET_BACKEND=stub`.
 
+## Mouse
+
+The emulator implements the MouseSystems 5-byte serial mouse protocol on
+SCC channel A (port at 0x780000) -- the same protocol used by the
+original Sun-2 optical mouse.
+
+Press **Right Alt** (PC) / **Right Option** (Mac) to capture the host
+mouse; the window title shows capture state. Movement and the three
+buttons (left/middle/right) are sent to SunOS as MouseSystems packets.
+Press the same key again to release.
+
+When the mouse is **not** captured, right-clicking the window pastes the
+host clipboard into the keyboard channel (channel B): ASCII characters
+are mapped to Sun-2 scancodes and drip-fed through the SCC FIFO with
+throttling so it doesn't overflow.
+
 ## SCC consoles over TCP
 
 The Sun-2's serial chips (Z8530 SCCs) can be exposed on a TCP port so
