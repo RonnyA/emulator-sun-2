@@ -1089,10 +1089,24 @@ void io_init(void)
   e3c400_init();
   sun2_init();
   scc_init_traces();
-  /* Start the SCC-TCP server if --scc-tcp[=PORT] was given. */
+  /* Start the SCC-TCP server if --scc-tcp[=PORT] was given.  If bind
+     fails (e.g. another sim.exe is already holding the port -- common
+     on Windows where taskkill of the previous sim leaves the FD in
+     LISTENING for a moment), exit the sim immediately instead of
+     running silently with no listener.  Otherwise the user's next
+     `telnet localhost 9900` either gets refused or connects to the
+     stale sim, which is hard to diagnose. */
   extern int g_scc_tcp_port;
-  if (g_scc_tcp_port > 0)
-    scc_tcp_start(g_scc_tcp_port);
+  if (g_scc_tcp_port > 0) {
+    if (scc_tcp_start(g_scc_tcp_port) < 0) {
+      fprintf(stderr,
+              "scc-tcp: aborting -- the listener could not be started.\n"
+              "  Likely another sim.exe is still bound to port %d;\n"
+              "  kill it (Windows: `taskkill /F /IM sim.exe`) and retry.\n",
+              g_scc_tcp_port);
+      exit(1);
+    }
+  }
 }
 
 /* Implementation for the interrupt controller */
