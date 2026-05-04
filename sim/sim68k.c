@@ -1106,6 +1106,12 @@ void io_init(void)
               g_scc_tcp_port);
       exit(1);
     }
+    /* atexit hook so the listen socket and client sockets get closed
+       on every normal exit path (SDL_QUIT, SIGINT/TERM/HUP, abortf,
+       etc).  Without this, a fast restart of the sim hits "bind:
+       address already in use" because the previous instance's listen
+       FD lingers a few seconds. */
+    atexit(scc_tcp_stop);
   }
 }
 
