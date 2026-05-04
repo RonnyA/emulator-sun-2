@@ -50,6 +50,111 @@ static int paste_len = 0;
 static int paste_delay = 0;
 #define PASTE_CHAR_DELAY 3
 
+/* Forward declaration - defined further down with other SDL globals */
+static SDL_Window* screen;
+
+/* ---- Mouse support (MouseSystems 5-byte protocol on SCC channel 2) ---- */
+
+/* Mouse capture state: F12 toggles SDL relative mouse mode */
+static int mouse_captured = 0;
+
+/* Accumulated deltas and button state */
+static int mouse_dx = 0;
+static int mouse_dy = 0;
+static unsigned char mouse_buttons = 0x07; /* all released: bits 2,1,0 = L,M,R (0=pressed) */
+
+/* Throttle mouse packets to avoid flooding the 16-byte SCC FIFO */
+static int mouse_delay = 0;
+#define MOUSE_PACKET_DELAY 2
+
+static void mouse_update_title(void)
+{
+  char title[128];
+
+#ifdef __APPLE__
+  const char *key = "Right Option";
+#else
+  const char *key = "Right Alt";
+#endif
+
+  if (mouse_captured) {
+    sprintf(title, "Sun2 - Mouse captured, press %s to release", key);
+    SDL_SetWindowTitle(screen, title);
+  } else {
+    SDL_SetWindowTitle(screen, "Sun2");
+  }
+}
+
+static void mouse_toggle_capture(void)
+{
+  mouse_captured = !mouse_captured;
+  SDL_SetRelativeMouseMode(mouse_captured ? SDL_TRUE : SDL_FALSE);
+  mouse_update_title();
+}
+
+/* Send a 5-byte MouseSystems packet to SCC channel 2.
+ *
+ * Format:
+ *   byte 0: 0x80 | button_bits  (bit2=L, bit1=M, bit0=R; 0=pressed)
+ *   byte 1: dx first half
+ *   byte 2: dy first half  (positive = up on screen)
+ *   byte 3: dx second half
+ *   byte 4: dy second half
+ */
+static void mouse_send_packet(void)
+{
+  int dx, dy;
+  int dx1, dy1, dx2, dy2;
+
+  if (mouse_delay > 0) {
+    mouse_delay--;
+    return;
+  }
+
+  /* Nothing to report? */
+  if (mouse_dx == 0 && mouse_dy == 0)
+    return;
+
+  dx = mouse_dx;
+  dy = mouse_dy;
+  mouse_dx = 0;
+  mouse_dy = 0;
+
+  /* Clamp to signed byte range */
+  if (dx > 127) dx = 127;
+  if (dx < -127) dx = -127;
+  if (dy > 127) dy = 127;
+  if (dy < -127) dy = -127;
+
+  /* Split into two halves for the 5-byte format */
+  dx1 = dx / 2;
+  dx2 = dx - dx1;
+  dy1 = dy / 2;
+  dy2 = dy - dy1;
+
+  /* Sun convention: positive dy = up, but SDL positive dy = down */
+  dy1 = -dy1;
+  dy2 = -dy2;
+
+  scc_in_push(2, 0x80 | mouse_buttons);
+  scc_in_push(2, (unsigned char)dx1);
+  scc_in_push(2, (unsigned char)dy1);
+  scc_in_push(2, (unsigned char)dx2);
+  scc_in_push(2, (unsigned char)dy2);
+
+  mouse_delay = MOUSE_PACKET_DELAY;
+}
+
+/* Send a button-only packet immediately (no motion) */
+static void mouse_send_button_packet(void)
+{
+  scc_in_push(2, 0x80 | mouse_buttons);
+  scc_in_push(2, 0);
+  scc_in_push(2, 0);
+  scc_in_push(2, 0);
+  scc_in_push(2, 0);
+}
+
 /* ASCII to Sun-2 scancode mapping: {scancode, needs_shift} */
 struct ascii_to_sun2 {
   unsigned char sc;
@@ -208,7 +313,6 @@ static void paste_feed(void)
 
 static unsigned char *fbmem;
 //static SDL_Surface *screen;
-static SDL_Window* screen;
 static SDL_Surface* surface;
 static SDL_Color COLOR_BLACK = {0,0,0,0};
 static SDL_Color COLOR_WHITE = {255,255,255,255};
@@ -373,6 +477,10 @@ void sdl_poll(void)
 	    case SDL_KEYDOWN:
 	      if (event.key.repeat)
 	        break; /* suppress SDL auto-repeat */
+	      if (event.key.keysym.sym == SDLK_RALT) {
+	        mouse_toggle_capture();
+	        break;
+	      }
 	      sun2_sdl_key(event.key.keysym.sym, event.key.keysym.mod, event.key.keysym.scancode, 1);
 	      break;
 
@@ -385,21 +493,51 @@ void sdl_poll(void)
 	      break;
 
 	    case SDL_QUIT:
+	      printf("SDL window closed, exiting emulator\n");
+	      SDL_Quit();
+	      exit(0);
 	      break;
 	    case SDL_MOUSEMOTION:
+	      if (mouse_captured) {
+	        mouse_dx += event.motion.xrel;
+	        mouse_dy += event.motion.yrel;
+	      }
 	      break;
 	    case SDL_MOUSEBUTTONDOWN:
-	      /* Right-click pastes clipboard text */
-	      if (event.button.button == SDL_BUTTON_RIGHT)
-	        paste_start();
+	      if (mouse_captured) {
+	        if (event.button.button == SDL_BUTTON_LEFT)
+	          mouse_buttons &= ~0x04;
+	        else if (event.button.button == SDL_BUTTON_MIDDLE)
+	          mouse_buttons &= ~0x02;
+	        else if (event.button.button == SDL_BUTTON_RIGHT)
+	          mouse_buttons &= ~0x01;
+	        mouse_send_button_packet();
+	      } else {
+	        /* Right-click pastes clipboard text when not captured */
+	        if (event.button.button == SDL_BUTTON_RIGHT)
+	          paste_start();
+	      }
 	      break;
 	    case SDL_MOUSEBUTTONUP:
+	      if (mouse_captured) {
+	        if (event.button.button == SDL_BUTTON_LEFT)
+	          mouse_buttons |= 0x04;
+	        else if (event.button.button == SDL_BUTTON_MIDDLE)
+	          mouse_buttons |= 0x02;
+	        else if (event.button.button == SDL_BUTTON_RIGHT)
+	          mouse_buttons |= 0x01;
+	        mouse_send_button_packet();
+	      }
 	      break;
 	    }
   }
 
   /* Drip-feed paste buffer into SCC FIFO */
   paste_feed();
+
+  /* Send accumulated mouse movement */
+  if (mouse_captured)
+    mouse_send_packet();
 }
 
 void sun2_fb_alloc(void)

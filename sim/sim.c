@@ -253,12 +253,12 @@ int main(int argc, char **argv)
     int this_option_optind = optind ? optind : 1;
     int option_index = 0;
     static struct option long_options[] = {
-      {"prom",   optional_argument, 0,  'p' },
-      {"disk",   optional_argument, 0,  'd' },
-      {"tape",   optional_argument, 0,  't' },
-      {"kernel", optional_argument, 0,  'k' },
-      {"boot",   optional_argument, 0,  'b' },
-      {"ether",  optional_argument, 0,  'e' },
+      {"prom",   required_argument, 0,  'p' },
+      {"disk",   required_argument, 0,  'd' },
+      {"tape",   required_argument, 0,  't' },
+      {"kernel", required_argument, 0,  'k' },
+      {"boot",   required_argument, 0,  'b' },
+      {"ether",  required_argument, 0,  'e' },
       {0,        0,                 0,  0 }
     };
 
@@ -268,7 +268,6 @@ int main(int argc, char **argv)
 
     if (0) {
       printf("option_index %d, c %c 0x%x, optarg %p\n", option_index, c, c, optarg);
-      printf("option %s", long_options[option_index].name);
     }
 
     if (c == 0) {
@@ -326,8 +325,7 @@ int main(int argc, char **argv)
     read_kernel();
   } else {
     if (prom_arg == NULL ||
-	disk_arg == NULL ||
-	tape_arg == NULL)
+	disk_arg == NULL)
       usage();
 
     setup_eeprom(prom_arg);
@@ -335,8 +333,10 @@ int main(int argc, char **argv)
     if (setup_disk(disk_arg))
       exit(1);
 
-    if (setup_tape(tape_arg))
-      exit(1);
+    if (tape_arg) {
+      if (setup_tape(tape_arg))
+        exit(1);
+    }
   }
 
   sim68k();

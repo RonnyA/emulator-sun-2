@@ -18,6 +18,54 @@ The SCSI emulation code is still shakey for tapes, however.
 
 SunOS 2.0 will boot multiuser and works as you'd expect.
 
+## Mouse Support
+
+The emulator implements the MouseSystems 5-byte serial mouse protocol,
+the same protocol used by the original Sun-2 optical mouse. Mouse data
+is fed to the Z8530 SCC channel A (port at 0x780000), which is the
+hardware mouse port on real Sun-2 hardware.
+
+### How to use
+
+1. Boot SunOS and start a graphical environment (SunView or X11 on bwtwo)
+2. Press **Right Alt** (PC) or **Right Option** (Mac) to capture the mouse
+3. The console prints `mouse: capture ON` to confirm
+4. Press the same key again to release the mouse
+
+When captured:
+- Mouse movement and all three buttons (left, middle, right) are sent
+  to SunOS via the MouseSystems protocol
+- The SDL window grabs the cursor (relative mouse mode)
+
+When not captured:
+- Mouse events are ignored by the emulator
+- Right-click pastes clipboard text into the keyboard channel
+
+### Protocol details
+
+The MouseSystems protocol sends 5-byte packets at 1200 baud:
+
+| Byte | Content                                              |
+|------|------------------------------------------------------|
+| 0    | `0x80 \| buttons` (bit 2=L, bit 1=M, bit 0=R; 0=pressed) |
+| 1    | X delta, first half (signed, -127 to +127)           |
+| 2    | Y delta, first half (positive = up)                  |
+| 3    | X delta, second half                                 |
+| 4    | Y delta, second half                                 |
+
+Movement deltas are split across bytes 1-2 and 3-4 to handle large
+movements. Packets are rate-limited to avoid overflowing the 16-byte
+SCC input FIFO. Button-only packets (zero deltas) are sent immediately
+on press/release.
+
+### Clipboard paste
+
+When the mouse is **not** captured, right-clicking the emulator window
+pastes the host clipboard as keyboard input. Text is converted to Sun-2
+keyboard scancodes and drip-fed into the SCC keyboard channel (channel B)
+with throttling to prevent FIFO overflow. This is useful for typing
+commands into SunOS without a graphical environment.
+
 ## Some changes by sigurbjornl
 
 * Converted to use SDL2
