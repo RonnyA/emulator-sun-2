@@ -435,28 +435,6 @@ The disk image ships with all serials `off` because real Sun-2 owners
 typically didn't have anything plugged into them and an unloaded
 `getty` waiting on a non-existent line is wasted process slots.
 
-### How it works under the hood
-
-- One TCP listener (default port 9900).  An accept thread spawns one
-  worker thread per client.  Each worker handles its own menu +
-  passthrough lifecycle then exits.
-- Per-tty state lives in `sim/scc_tcp.c` (input ringbuf, output ring-
-  buf, `client_fd`, busy address).  `scc_tcp_send_byte(idx, byte)` is
-  called from the emulator main thread for every byte SunOS writes;
-  it appends to that tty's output ringbuf and the worker thread
-  drains it to the socket.  Inbound bytes from the socket are staged
-  in the tty's input ringbuf and drained on the main thread by
-  `scc_tcp_poll()` so chip-side state is only mutated from one thread.
-- SCC chip emulation (`sim/scc.c`) is shared: every Z8530 in the
-  machine — zs0, zs1 (kbd/mouse), zs2..zs5 — is just a `scc_chip_t`
-  instance of the same code with different callbacks wired up.
-- All chips share IRQ_SCC (m68k level 3).  The IRQ helper walks every
-  configured chip when deciding whether to drop the line on ack.
-
-Implemented across `sim/scc.c`, `sim/scc.h`, `sim/scc_tcp.c`, and
-the address routing in `sim/sim68k.c`'s `cpu_read_mbmem` /
-`cpu_write_mbmem`.
-
 ### Caveats (from the original 3C400 driver)
 
 The driver puts the host interface in promiscuous mode and was
