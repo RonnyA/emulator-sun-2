@@ -35,8 +35,6 @@
 #include "sim.h"
 #include "icon_data.h"
 
-#define debug 0
-
 /* Sun-2 modifier scancodes */
 #define SUN2_SC_LSHIFT   99
 #define SUN2_SC_RSHIFT   111
@@ -55,10 +53,10 @@ static int paste_delay = 0;
 static SDL_Window *screen;
 
 /* ---- MouseSystems 5-byte mouse on SCC channel 2 ----
-   Right Alt (PC) / Right Option (Mac) toggles SDL relative-mouse capture.
-   When captured, motion deltas accumulate per poll and a packet is emitted
-   per MOUSE_PACKET_DELAY cycles to keep the 16-byte SCC FIFO from
-   overflowing.  Button-only packets (zero deltas) flush immediately. */
+   Left-click captures the mouse; Right Alt (PC) / Right Option (Mac)
+   releases.  When captured, motion deltas accumulate per poll and a
+   packet is emitted per MOUSE_PACKET_DELAY cycles to keep the 16-byte
+   SCC FIFO from overflowing.  Button-only packets flush immediately. */
 static int mouse_captured = 0;
 static int mouse_dx = 0;
 static int mouse_dy = 0;
@@ -823,12 +821,9 @@ void sun2_kb_write(int value, int size)
 
 unsigned int map_sdl_to_sun2kb[512];
 
-#define SHIFTED 0x10s
-
-//void sun2_sdl_key(int sdl_code, int modifiers, unsigned int unicode, int down)
 void sun2_sdl_key(SDL_Keycode sdl_code, uint16_t modifiers, SDL_Scancode scancode, int down)
 {
-  unsigned int mapped, shifted;
+  unsigned int mapped;
 
   /* --no-kbd: the keyboard is "not attached" — discard SDL keystrokes
      so they don't show up on SCC channel 3.  Use --scc-tcp + a telnet
@@ -924,7 +919,6 @@ void sun2_sdl_key(SDL_Keycode sdl_code, uint16_t modifiers, SDL_Scancode scancod
     mapped = map_sdl_to_sun2kb[sdl_code];
   }
   if (0) printf("sdl: %u %u %u %u %d \n", sdl_code, modifiers, scancode, mapped, down);
-//  shifted = mapped & SHIFTED;
 
   mapped &= 0xff;
   if (mapped == 0)
@@ -955,7 +949,6 @@ void sun2_sdl_key(SDL_Keycode sdl_code, uint16_t modifiers, SDL_Scancode scancod
 }
 
 #define m(f,t) map_sdl_to_sun2kb[(f)] = (t);
-#define m_sh(f,t) map_sdl_to_sun2kb[(f)] = (t) | SHIFTED;
 
 void sun2_init(void)
 {
@@ -1028,36 +1021,6 @@ void sun2_init(void)
   m(SDL_SCANCODE_RCTRL, 76);
   m(SDL_SCANCODE_LSHIFT, 99);
   m(SDL_SCANCODE_RSHIFT,111);
-
-#if 0
-  /* shifted */
-  m_sh(SDLK_EXCLAIM, 30);
-  m_sh(SDLK_AT, 31);
-
-  m_sh(SDLK_HASH, 32);
-  m_sh(SDLK_DOLLAR, 33);
-  m_sh('%', 34);
-  m_sh(SDLK_CARET, 35);
-  m_sh(SDLK_AMPERSAND, 36);
-  m_sh(SDLK_ASTERISK, 37);
-  m_sh(SDLK_LEFTPAREN, 38);
-  m_sh(SDLK_RIGHTPAREN, 39);
-
-  m_sh(SDLK_UNDERSCORE, 40);
-  m_sh(SDLK_PLUS, 41);
-  m_sh('~', 42);
-
-  m_sh('{', 64);
-  m_sh('}', 65);
-
-  m_sh(SDLK_COLON, 86);
-  m_sh(SDLK_QUOTEDBL, 87);
-  m_sh('|', 88);
-
-  m_sh(SDLK_LESS, 107);
-  m_sh(SDLK_GREATER, 108);
-  m_sh(SDLK_QUESTION, 109);
-#endif
 
 //-----
 //	SDLK_CLEAR		
