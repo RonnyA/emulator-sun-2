@@ -24,6 +24,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #ifdef __APPLE__
 #include <SDL.h>
@@ -35,6 +36,142 @@
 #include "icon_data.h"
 
 #define debug 0
+
+/* Sun-2 modifier scancodes */
+#define SUN2_SC_LSHIFT   99
+#define SUN2_SC_RSHIFT   111
+#define SUN2_SC_CTRL     76
+#define SUN2_SC_CAPSLOCK 119
+
+/* Clipboard paste: maps ASCII to Sun-2 scancodes and drip-feeds keystrokes
+   into the SCC FIFO so the PROM/SunOS sees them as if typed. */
+static char *paste_buf = NULL;
+static int paste_pos = 0;
+static int paste_len = 0;
+static int paste_delay = 0;
+#define PASTE_CHAR_DELAY 3
+
+struct ascii_to_sun2 {
+  unsigned char sc;
+  unsigned char shifted;
+};
+static struct ascii_to_sun2 ascii_map[128];
+
+static void init_ascii_map(void)
+{
+  int i;
+  for (i = 0; i < 128; i++) { ascii_map[i].sc = 0; ascii_map[i].shifted = 0; }
+
+  /* lowercase letters */
+  ascii_map['a'].sc = 77;  ascii_map['b'].sc = 104;
+  ascii_map['c'].sc = 102; ascii_map['d'].sc = 79;
+  ascii_map['e'].sc = 56;  ascii_map['f'].sc = 80;
+  ascii_map['g'].sc = 81;  ascii_map['h'].sc = 82;
+  ascii_map['i'].sc = 61;  ascii_map['j'].sc = 83;
+  ascii_map['k'].sc = 84;  ascii_map['l'].sc = 85;
+  ascii_map['m'].sc = 106; ascii_map['n'].sc = 105;
+  ascii_map['o'].sc = 62;  ascii_map['p'].sc = 63;
+  ascii_map['q'].sc = 54;  ascii_map['r'].sc = 57;
+  ascii_map['s'].sc = 78;  ascii_map['t'].sc = 58;
+  ascii_map['u'].sc = 60;  ascii_map['v'].sc = 103;
+  ascii_map['w'].sc = 55;  ascii_map['x'].sc = 101;
+  ascii_map['y'].sc = 59;  ascii_map['z'].sc = 100;
+
+  /* uppercase = same scancode but shifted */
+  for (i = 'A'; i <= 'Z'; i++) {
+    ascii_map[i].sc = ascii_map[i + 32].sc;
+    ascii_map[i].shifted = 1;
+  }
+
+  /* digits */
+  ascii_map['1'].sc = 30;  ascii_map['2'].sc = 31;
+  ascii_map['3'].sc = 32;  ascii_map['4'].sc = 33;
+  ascii_map['5'].sc = 34;  ascii_map['6'].sc = 35;
+  ascii_map['7'].sc = 36;  ascii_map['8'].sc = 37;
+  ascii_map['9'].sc = 38;  ascii_map['0'].sc = 39;
+
+  /* shifted digits */
+  ascii_map['!'].sc = 30;  ascii_map['!'].shifted = 1;
+  ascii_map['@'].sc = 31;  ascii_map['@'].shifted = 1;
+  ascii_map['#'].sc = 32;  ascii_map['#'].shifted = 1;
+  ascii_map['$'].sc = 33;  ascii_map['$'].shifted = 1;
+  ascii_map['%'].sc = 34;  ascii_map['%'].shifted = 1;
+  ascii_map['^'].sc = 35;  ascii_map['^'].shifted = 1;
+  ascii_map['&'].sc = 36;  ascii_map['&'].shifted = 1;
+  ascii_map['*'].sc = 37;  ascii_map['*'].shifted = 1;
+  ascii_map['('].sc = 38;  ascii_map['('].shifted = 1;
+  ascii_map[')'].sc = 39;  ascii_map[')'].shifted = 1;
+
+  /* punctuation - unshifted */
+  ascii_map['-'].sc = 40;  ascii_map['='].sc = 41;
+  ascii_map['`'].sc = 42;  ascii_map['\t'].sc = 53;
+  ascii_map['['].sc = 64;  ascii_map[']'].sc = 65;
+  ascii_map[';'].sc = 86;  ascii_map['\''].sc = 87;
+  ascii_map['\\'].sc = 88; ascii_map['\r'].sc = 89;
+  ascii_map['\n'].sc = 89;
+  ascii_map[','].sc = 107; ascii_map['.'].sc = 108;
+  ascii_map['/'].sc = 109; ascii_map[' '].sc = 121;
+  ascii_map[27].sc = 29;   /* ESC */
+  ascii_map[8].sc = 43;    /* backspace */
+
+  /* punctuation - shifted */
+  ascii_map['_'].sc = 40;  ascii_map['_'].shifted = 1;
+  ascii_map['+'].sc = 41;  ascii_map['+'].shifted = 1;
+  ascii_map['~'].sc = 42;  ascii_map['~'].shifted = 1;
+  ascii_map['{'].sc = 64;  ascii_map['{'].shifted = 1;
+  ascii_map['}'].sc = 65;  ascii_map['}'].shifted = 1;
+  ascii_map[':'].sc = 86;  ascii_map[':'].shifted = 1;
+  ascii_map['"'].sc = 87;  ascii_map['"'].shifted = 1;
+  ascii_map['|'].sc = 88;  ascii_map['|'].shifted = 1;
+  ascii_map['<'].sc = 107; ascii_map['<'].shifted = 1;
+  ascii_map['>'].sc = 108; ascii_map['>'].shifted = 1;
+  ascii_map['?'].sc = 109; ascii_map['?'].shifted = 1;
+}
+
+static void paste_start(void)
+{
+  if (!SDL_HasClipboardText()) return;
+
+  char *clip = SDL_GetClipboardText();
+  if (clip == NULL || clip[0] == '\0') { SDL_free(clip); return; }
+
+  if (paste_buf != NULL) free(paste_buf);
+  paste_len = strlen(clip);
+  paste_buf = malloc(paste_len + 1);
+  memcpy(paste_buf, clip, paste_len + 1);
+  paste_pos = 0;
+  paste_delay = 0;
+  SDL_free(clip);
+}
+
+/* Feed one character from paste buffer into SCC FIFO; called every poll. */
+static void paste_feed(void)
+{
+  if (paste_buf == NULL || paste_pos >= paste_len) return;
+  if (paste_delay > 0) { paste_delay--; return; }
+
+  unsigned char ch = (unsigned char)paste_buf[paste_pos];
+  if (ch >= 128 || ascii_map[ch].sc == 0) { paste_pos++; return; }
+
+  unsigned char sc = ascii_map[ch].sc;
+  if (ascii_map[ch].shifted) {
+    scc_in_push(3, SUN2_SC_LSHIFT);
+    scc_in_push(3, sc);
+    scc_in_push(3, sc | 0x80);
+    scc_in_push(3, SUN2_SC_LSHIFT | 0x80);
+  } else {
+    scc_in_push(3, sc);
+    scc_in_push(3, sc | 0x80);
+  }
+
+  paste_pos++;
+  paste_delay = PASTE_CHAR_DELAY;
+
+  if (paste_pos >= paste_len) {
+    free(paste_buf); paste_buf = NULL;
+    paste_pos = paste_len = 0;
+  }
+}
 
 static unsigned char *fbmem;
 static SDL_Window* screen;
@@ -223,14 +360,17 @@ void sdl_poll(void)
 	//      sdl_send_mouse_event();
 	      break;
 	    case SDL_MOUSEBUTTONDOWN:
+	      /* Right-click pastes clipboard text into the keyboard FIFO. */
+	      if (event.button.button == SDL_BUTTON_RIGHT)
+	        paste_start();
+	      break;
 	    case SDL_MOUSEBUTTONUP:
-	    {
-	      /*SDL_MouseButtonEvent *bev = &ev->button;*/
-	//      sdl_send_mouse_event();
-	    }
-	    break;
+	      break;
 	    }
   }
+
+  /* Drip-feed paste buffer into the SCC keyboard FIFO. */
+  paste_feed();
 }
 
 void sun2_fb_alloc(void)
@@ -694,6 +834,8 @@ void sun2_sdl_key(SDL_Keycode sdl_code, uint16_t modifiers, SDL_Scancode scancod
 
 void sun2_init(void)
 {
+  init_ascii_map();
+
   m(SDLK_ESCAPE, 29);
 
   m(SDLK_1, 30);
