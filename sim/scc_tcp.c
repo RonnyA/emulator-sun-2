@@ -509,7 +509,20 @@ static void *server_thread_func(void *arg)
         socklen_t alen = sizeof(caddr);
 #endif
         sock_t cfd = accept(listen_fd, (struct sockaddr *)&caddr, &alen);
-        if (cfd == SOCK_INVALID) break;
+        if (cfd == SOCK_INVALID) {
+            /* Two cases:
+               (a) genuine shutdown -- scc_tcp_stop closed listen_fd,
+                   which makes accept() return failure.  shutdown_request
+                   will already be set; bail out cleanly.
+               (b) transient OS error (WSAEINTR, WSAECONNABORTED, signal
+                   interruption, ...).  Don't kill the accept thread --
+                   if we did, every following client connect would get
+                   ECONNREFUSED because the listen socket is bound but
+                   nobody is consuming the backlog. */
+            if (shutdown_request || listen_fd == SOCK_INVALID) break;
+            fprintf(stderr, "scc-tcp: accept() transient error, retrying\n");
+            continue;
+        }
 
         int one = 1;
         setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY,
