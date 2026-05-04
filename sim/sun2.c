@@ -298,6 +298,8 @@ static void sdl_render_frame(void)
   SDL_UnlockTexture(texture);
 }
 
+static int sdl_ready = 0;
+
 void sdl_init(void)
 {
     /* Logical FB dimensions come from the active --mode=.  The same mode also
@@ -313,10 +315,15 @@ void sdl_init(void)
     last_win_w = win_w;
     last_win_h = win_h;
 
+    printf("SDL: initializing video subsystem...\n");
+
     if (SDL_Init(SDL_INIT_VIDEO)) {
-        printf("SDL initialization failed: %s\n", SDL_GetError());
+        printf("ERROR: SDL_Init(SDL_INIT_VIDEO) failed: %s\n", SDL_GetError());
+        printf("ERROR: No display will be available. Check DISPLAY or WAYLAND_DISPLAY.\n");
         return;
     }
+
+    printf("SDL: video driver: %s\n", SDL_GetCurrentVideoDriver());
 
     screen = SDL_CreateWindow("Sun2",
                               SDL_WINDOWPOS_CENTERED,
@@ -324,7 +331,8 @@ void sdl_init(void)
                               win_w, win_h,
                               SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
     if (!screen) {
-        printf("Could not open SDL window: %s\n", SDL_GetError());
+        printf("ERROR: SDL_CreateWindow failed: %s\n", SDL_GetError());
+        printf("ERROR: No display will be available.\n");
         return;
     }
 
@@ -342,16 +350,19 @@ void sdl_init(void)
         }
     }
 
+    /* Try hardware-accelerated renderer first, fall back to software. */
     renderer = SDL_CreateRenderer(screen, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     if (!renderer) {
-        renderer = SDL_CreateRenderer(screen, -1, 0);
+        printf("SDL: accelerated renderer failed (%s), trying software...\n", SDL_GetError());
+        renderer = SDL_CreateRenderer(screen, -1, SDL_RENDERER_SOFTWARE);
         if (!renderer) {
-            printf("Could not create renderer: %s\n", SDL_GetError());
+            printf("ERROR: SDL_CreateRenderer failed: %s\n", SDL_GetError());
+            printf("ERROR: No display will be available.\n");
             return;
         }
     }
 
-    /* Map the logical 1024x1024 framebuffer onto whatever window size,
+    /* Map the logical framebuffer onto whatever window size,
        preserving aspect ratio and using nearest-neighbor for crisp pixels. */
     SDL_RenderSetLogicalSize(renderer, cols, rows);
     SDL_RenderSetIntegerScale(renderer, SDL_FALSE);
@@ -362,16 +373,16 @@ void sdl_init(void)
                                 SDL_TEXTUREACCESS_STREAMING,
                                 cols, rows);
     if (!texture) {
-        printf("Could not create texture: %s\n", SDL_GetError());
+        printf("ERROR: SDL_CreateTexture failed: %s\n", SDL_GetError());
+        printf("ERROR: No display will be available.\n");
         return;
     }
 
     SDL_RendererInfo info;
     SDL_GetRendererInfo(renderer, &info);
-    extern int quiet;
-    if (!quiet)
-        printf("sdl_init: logical fb %dx%d, window %dx%d (resizable), renderer=%s\n",
-               cols, rows, win_w, win_h, info.name);
+    printf("SDL: display ready - %dx%d framebuffer, %dx%d window, renderer=%s\n",
+           cols, rows, win_w, win_h, info.name);
+    sdl_ready = 1;
 }
 
 //void sun2_sdl_key(int sdl_code, int modifiers, unsigned int unicode, int down);
@@ -380,7 +391,9 @@ void sun2_sdl_key(SDL_Keycode sdl_code, uint16_t modifiers, SDL_Scancode unicode
 void sdl_poll(void)
 {
   SDL_Event event;
-  //SDL_Event ev1, *ev = &ev1;
+
+  if (!sdl_ready)
+    return;
 
   sdl_render_frame();
   SDL_RenderClear(renderer);
