@@ -26,6 +26,7 @@
 #include "sim68k.h"
 #include "m68k.h"
 #include "sim.h"
+#include "scc.h"
 #include "scc_tcp.h"
 
 
@@ -691,18 +692,22 @@ unsigned int cpu_read_mbmem(unsigned int address, int size)
   // 3c400 board takes up 8k from e0000 to e2000, the address is dip settable but this is afaik the default and sufficient for our needs
   } else if(address >= 0xe0000 && address < 0xe2000) {
     value = e3c400_read(address, size);
-  } else if (address >= 0x80800 && address <= 0x80807) {
-    /* MBMEM 0x80800 is the GENERIC config slot for zs2, an OPTIONAL
-       Multibus serial expansion card.  Our scc.c only models ONE
-       chip (channels 0/1 for ttya/ttyb), and routing 0x80800 here
-       would alias zs2 onto zs0's state -- meaning SunOS's zsattach
-       for zs2 issues RESET_WORLD on the chip that's holding ttya
-       open as the console, clobbering its MIE/TIE/RIE state and
-       hanging interrupt-driven console output after the first
-       byte.  Bus-error the access so zs2's probe fails and SunOS
-       doesn't attach it. */
-    pending_buserr();
-    value = 0xffffffff;
+  } else if ((address >= 0x80800 && address <= 0x80807) ||  /* zs2 */
+             (address >= 0x81000 && address <= 0x81007) ||  /* zs3 */
+             (address >= 0x84800 && address <= 0x84807) ||  /* zs4 */
+             (address >= 0x85000 && address <= 0x85007)) {  /* zs5 */
+    /* SunOS Sun-2 GENERIC has 4 optional Multibus expansion SCC slots.
+       Route to the matching scc_chip_t if --scc-boards configured it,
+       otherwise bus-error so SunOS's zsprobe fails for that slot.  The
+       low 3 address bits are the in-chip register offset (ctlB/dataB/
+       ctlA/dataA), which scc_chip_read/write decode. */
+    scc_chip_t *chip = scc_lookup_mb(address);
+    if (chip)
+      value = scc_chip_read(chip, address & 0x7);
+    else {
+      pending_buserr();
+      value = 0xffffffff;
+    }
   } else
     switch (address) {
 #if 0
@@ -741,9 +746,15 @@ void cpu_write_mbmem(unsigned int address, int size, unsigned int value)
     sc_write(address, size, value);
   } else if(address >= 0xe0000 && address <= 0xe2000) {
     e3c400_write(address, size, value);
-  } else if (address >= 0x80800 && address <= 0x80807) {
-    /* zs2 (Multibus expansion) is not modelled -- see cpu_read_mbmem. */
-    pending_buserr();
+  } else if ((address >= 0x80800 && address <= 0x80807) ||  /* zs2 */
+             (address >= 0x81000 && address <= 0x81007) ||  /* zs3 */
+             (address >= 0x84800 && address <= 0x84807) ||  /* zs4 */
+             (address >= 0x85000 && address <= 0x85007)) {  /* zs5 */
+    scc_chip_t *chip = scc_lookup_mb(address);
+    if (chip)
+      scc_chip_write(chip, address & 0x7, value);
+    else
+      pending_buserr();
   } else
   switch (address) {
   default:

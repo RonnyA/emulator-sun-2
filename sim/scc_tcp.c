@@ -1,24 +1,17 @@
 /*
- * sun-2 emulator — SCC channel-A console over TCP
+ * sun-2 emulator -- SCC tty consoles over TCP, with menu.
  *
- * Single-client TCP server that bridges:
+ * See scc_tcp.h for the design overview.
  *
- *   client ─────► input_buf  ─(scc_tcp_poll, main thread)─►  scc_in_push(ch=0)
- *   client ◄───── output_buf ◄─(scc_tcp_send_byte, emu thread)── scc_wr_data ch=0/1
- *
- * Use `--scc-tcp` (default port 9900) or `--scc-tcp=PORT` on the
- * sim.exe command line.  Connect with:
- *
- *   telnet localhost 9900
- *   nc     localhost 9900
- *
- * The server is raw bytes both ways — no telnet IAC negotiation.
- * Connecting with `telnet` may emit a few negotiation bytes at the
- * start (the client trying to do option negotiation that we ignore);
- * SunOS's tty discipline mostly ignores them.  `nc` avoids that.
- *
- * Pattern lifted from nd100x's telnetserver.c (same author) but
- * stripped to single client + no menu + no IAC parser.
+ * Pattern lifted from nd100x's telnetserver (same author): on connect,
+ * present a list of available terminals, let the user pick one, then
+ * tunnel that channel transparently.  Differences vs. nd100x:
+ *   - up to 10 ttys (ttya, ttyb, ttye..ttyl); SunOS Sun-2 skips ttyc/d
+ *     because zs1 is the kbd/mouse chip.
+ *   - busy slots show the connected client address; second connection
+ *     to a busy tty is refused with a message and re-enters the menu.
+ *   - one accept thread + per-client worker thread (instead of a
+ *     single-client server-thread model).
  */
 
 #include <stdio.h>
@@ -28,6 +21,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <errno.h>
+#include <ctype.h>
 
 #ifdef _WIN32
 #  include <winsock2.h>
@@ -53,44 +47,63 @@
 #include "scc_tcp.h"
 #include "sim.h"
 
-/* SCC primitives we hand bytes to.  Implemented in scc.c.  Not
-   thread-safe to call directly from our worker thread, so input
-   from the network is staged in input_buf and drained on the main
-   thread via scc_tcp_poll(). */
-extern void scc_in_push(int ch, int v);
-extern void scc_throw_interrupt(int ch, int which);
+/* These come from scc.c. */
+extern int          scc_tty_count(void);
+extern const char  *scc_tty_name(int tty_idx);
+extern void         scc_tty_in_push(int tty_idx, uint8_t byte);
 
-/* ───── ring buffers ───── */
+/* ===== Per-tty state ===== */
+#define SCC_MAX_TTYS      10
 #define SCC_TCP_IN_SIZE   256
 #define SCC_TCP_OUT_SIZE  4096
 
-static uint8_t input_buf[SCC_TCP_IN_SIZE];
-static volatile int input_head, input_tail;
-static pthread_mutex_t input_lock = PTHREAD_MUTEX_INITIALIZER;
+typedef struct scc_tcp_tty_s {
+    /* IN: TCP client -> SunOS.  Worker thread writes here, main thread
+       drains via scc_tcp_poll(). */
+    uint8_t          in_buf[SCC_TCP_IN_SIZE];
+    int              in_head, in_tail;
+    pthread_mutex_t  in_lock;
 
-static uint8_t output_buf[SCC_TCP_OUT_SIZE];
-static volatile int output_head, output_tail;
-static pthread_mutex_t output_lock = PTHREAD_MUTEX_INITIALIZER;
+    /* OUT: SunOS -> TCP client.  Main thread (scc_tcp_send_byte) writes
+       here, worker thread drains and sends. */
+    uint8_t          out_buf[SCC_TCP_OUT_SIZE];
+    int              out_head, out_tail;
+    pthread_mutex_t  out_lock;
 
-/* ───── server state ───── */
-static volatile int  server_running = 0;
+    /* Bound client.  SOCK_INVALID if no client.  client_addr is a
+       printable form for the menu's "busy: X" tag. */
+    sock_t           client_fd;
+    char             client_addr[64];
+} scc_tcp_tty_t;
+
+static scc_tcp_tty_t g_ttys[SCC_MAX_TTYS];
+static pthread_mutex_t g_bind_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* ===== Server state ===== */
+static volatile int  server_running   = 0;
 static volatile int  shutdown_request = 0;
-static int           server_port = 0;
-static sock_t        listen_fd = SOCK_INVALID;
-static volatile sock_t client_fd = SOCK_INVALID;   /* 0 or 1 connected client */
-static pthread_t     server_thread;
+static int           server_port      = 0;
+static sock_t        listen_fd        = SOCK_INVALID;
+static pthread_t     accept_thread;
 
-/* ───── ring-buffer helpers (caller holds the relevant lock) ───── */
-static int rb_put(uint8_t *buf, int size, volatile int *head, int tail, uint8_t b)
+/* Diagnostic counters (env SCC_TCP_TRACE=1 enables verbose stderr). */
+static int  scc_tcp_trace = 0;
+static long bytes_from_scc;
+static long bytes_to_client;
+static long bytes_from_client;
+static long bytes_to_scc;
+
+/* ===== Ring-buffer helpers (caller holds the relevant lock) ===== */
+static int rb_put(uint8_t *buf, int size, int *head, int tail, uint8_t b)
 {
     int next = (*head + 1) % size;
-    if (next == tail) return 0;        /* full — drop */
+    if (next == tail) return 0;
     buf[*head] = b;
     *head = next;
     return 1;
 }
 
-static int rb_get_block(uint8_t *buf, int size, int head, volatile int *tail,
+static int rb_get_block(uint8_t *buf, int size, int head, int *tail,
                         uint8_t *out, int max)
 {
     int n = 0;
@@ -101,79 +114,48 @@ static int rb_get_block(uint8_t *buf, int size, int head, volatile int *tail,
     return n;
 }
 
-/* ───── public API ───── */
+/* ===== Public API: main-thread side ===== */
 
-/* Diagnostic counters — when SCC_TCP_TRACE=1 is set in the environment,
-   every call to scc_tcp_send_byte and every TCP recv/send is logged
-   to stderr.  Helps prove which side of the pipe is silent. */
-static int  scc_tcp_trace = 0;
-static long bytes_from_scc;     /* scc_wr_data → scc_tcp_send_byte */
-static long bytes_to_client;    /* server thread → send() */
-static long bytes_from_client;  /* server thread ← recv() */
-static long bytes_to_scc;       /* scc_tcp_poll → scc_in_push */
-
-/* SCC channel that maps to ttya (per RetroCore MachineSun2Memory.cs:
-   serial port SCC offset 0x06 = DA = data channel A = ttya).  In our
-   scc.c enumeration this is index 1 (`w+1` from `case 6:`).  Channel 0
-   in our enumeration is ttyb, which is binary noise during PROM probe
-   — don't forward it to the TCP client. */
-#define SCC_TTYA_CH 1
-
-void scc_tcp_send_byte(int ch, uint8_t byte)
+void scc_tcp_send_byte(int tty_idx, uint8_t byte)
 {
-    /* Only forward ttya (ch 1).  ttyb on ch 0 is rarely interesting and
-       it just clutters the telnet stream with PROM probe bytes. */
-    if (ch != SCC_TTYA_CH) return;
-    if (!server_running)   return;
+    if (!server_running) return;
+    if (tty_idx < 0 || tty_idx >= SCC_MAX_TTYS) return;
+    scc_tcp_tty_t *t = &g_ttys[tty_idx];
+    /* Skip if no one is listening on this tty -- avoids filling the
+       ringbuf with megabytes of unsent data while ttya runs at 9600. */
+    if (t->client_fd == SOCK_INVALID) return;
 
-    pthread_mutex_lock(&output_lock);
-    rb_put(output_buf, SCC_TCP_OUT_SIZE, &output_head, output_tail, byte);
-    pthread_mutex_unlock(&output_lock);
+    pthread_mutex_lock(&t->out_lock);
+    rb_put(t->out_buf, SCC_TCP_OUT_SIZE, &t->out_head, t->out_tail, byte);
+    pthread_mutex_unlock(&t->out_lock);
     bytes_from_scc++;
     if (scc_tcp_trace)
-        fprintf(stderr, "scc-tcp: send_byte ch=%d 0x%02x\n", ch, byte);
+        fprintf(stderr, "scc-tcp: send_byte %s 0x%02x\n",
+                scc_tty_name(tty_idx), byte);
 }
 
 void scc_tcp_poll(void)
 {
+    int i;
     if (!server_running) return;
-
-    pthread_mutex_lock(&input_lock);
-    while (input_tail != input_head) {
-        uint8_t b = input_buf[input_tail];
-        input_tail = (input_tail + 1) % SCC_TCP_IN_SIZE;
-        /* Push to ttya (= our SCC channel 1, see SCC_TTYA_CH comment
-           above).  Throw the rx-char interrupt so the PROM/SunOS knows
-           there's a byte ready in the channel-1 FIFO. */
-        scc_in_push(SCC_TTYA_CH, b);
-        /* which=2 = RX char available (per scc_throw_interrupt's
-           encoding -- which=1 is TX-empty, which=2 is RX).  This
-           used to incorrectly send TX-empty here; SunOS would never
-           realize a byte had arrived and console input was dead. */
-        scc_throw_interrupt(SCC_TTYA_CH, 2);
-        bytes_to_scc++;
-        if (scc_tcp_trace)
-            fprintf(stderr, "scc-tcp: poll -> scc_in_push(%d, 0x%02x)\n",
-                    SCC_TTYA_CH, b);
+    for (i = 0; i < SCC_MAX_TTYS; i++) {
+        scc_tcp_tty_t *t = &g_ttys[i];
+        pthread_mutex_lock(&t->in_lock);
+        while (t->in_tail != t->in_head) {
+            uint8_t b = t->in_buf[t->in_tail];
+            t->in_tail = (t->in_tail + 1) % SCC_TCP_IN_SIZE;
+            scc_tty_in_push(i, b);
+            bytes_to_scc++;
+        }
+        pthread_mutex_unlock(&t->in_lock);
     }
-    pthread_mutex_unlock(&input_lock);
 }
 
-/* ───── telnet IAC negotiation ─────
- * RFC 854/857/858.  We act as a server that:
- *   - WILL ECHO            -- tells the client "I will echo your input",
- *                              which makes telnet stop local-echoing so
- *                              the user only sees what SunOS echoes back.
- *   - WILL SUPPRESS_GO_AHEAD + DO SUPPRESS_GO_AHEAD
- *                           -- character-at-a-time mode (kills line mode).
- *
- * On the inbound side we need a small state machine that swallows IAC
- * sequences so client-initiated negotiations don't end up as garbage
- * characters in SunOS's tty input.  We respond minimally:
- *   - DO  ECHO / DO  SUPPRESS_GO_AHEAD  -> already WILL'd, ignore.
- *   - DONT X / WONT X                   -> ignore.
- *   - WILL X / DO X (anything else)     -> reply DONT/WONT to refuse.
- *   - SB ... SE                         -> swallow.
+/* ===== Telnet IAC parser =====
+ * RFC 854/857/858.  Active during BOTH the menu phase and the
+ * passthrough phase: in either case we want IAC sequences swallowed
+ * so they don't leak into the user's keystrokes (during menu) or
+ * into SunOS's tty input (during passthrough).
  */
 #define IAC  255
 #define DONT 254
@@ -186,6 +168,14 @@ void scc_tcp_poll(void)
 #define TELOPT_ECHO 1
 #define TELOPT_SGA  3
 
+typedef enum {
+    IAC_NORMAL = 0,
+    IAC_GOT_IAC,
+    IAC_GOT_CMD,
+    IAC_IN_SB,
+    IAC_IN_SB_GOT_IAC,
+} iac_state_t;
+
 static void send_iac3(sock_t cfd, uint8_t a, uint8_t b, uint8_t c)
 {
     uint8_t pkt[3] = { a, b, c };
@@ -194,23 +184,13 @@ static void send_iac3(sock_t cfd, uint8_t a, uint8_t b, uint8_t c)
 
 static void send_telnet_init(sock_t cfd)
 {
-    /* Server-initiated negotiation -- order matches what most BSDs send. */
     send_iac3(cfd, IAC, WILL, TELOPT_ECHO);
     send_iac3(cfd, IAC, WILL, TELOPT_SGA);
     send_iac3(cfd, IAC, DO,   TELOPT_SGA);
 }
 
-/* Per-connection IAC parser state. */
-typedef enum {
-    IAC_NORMAL = 0,
-    IAC_GOT_IAC,           /* saw IAC, expecting cmd */
-    IAC_GOT_CMD,           /* saw IAC + WILL/WONT/DO/DONT, expecting opt */
-    IAC_IN_SB,             /* inside SB ... SE subnegotiation */
-    IAC_IN_SB_GOT_IAC,     /* inside SB, saw IAC -- next byte is cmd or escaped IAC */
-} iac_state_t;
-
-/* Process one byte through the IAC parser.  Returns 1 if the byte
-   should be passed through to SunOS, 0 if it was consumed by IAC. */
+/* Returns 1 if `b` is real data (pass through to caller), 0 if it
+   was consumed by IAC. */
 static int iac_feed(sock_t cfd, iac_state_t *st, uint8_t *cmd, uint8_t b)
 {
     switch (*st) {
@@ -218,37 +198,25 @@ static int iac_feed(sock_t cfd, iac_state_t *st, uint8_t *cmd, uint8_t b)
         if (b == IAC) { *st = IAC_GOT_IAC; return 0; }
         return 1;
     case IAC_GOT_IAC:
-        if (b == IAC) { *st = IAC_NORMAL; return 1; }    /* escaped 0xFF -> data */
+        if (b == IAC) { *st = IAC_NORMAL; return 1; }
         if (b == WILL || b == WONT || b == DO || b == DONT) {
-            *cmd = b;
-            *st  = IAC_GOT_CMD;
-            return 0;
+            *cmd = b; *st = IAC_GOT_CMD; return 0;
         }
         if (b == SB) { *st = IAC_IN_SB; return 0; }
-        /* Other 2-byte commands (NOP, DM, BRK, IP, AO, AYT, EC, EL, GA) */
         *st = IAC_NORMAL;
         return 0;
     case IAC_GOT_CMD: {
-        uint8_t reply_cmd = 0;
+        uint8_t reply = 0;
         switch (*cmd) {
         case WILL:
-            /* Client wants to do option `b`.  Refuse all except SGA. */
-            reply_cmd = (b == TELOPT_SGA) ? DO : DONT;
-            send_iac3(cfd, IAC, reply_cmd, b);
+            reply = (b == TELOPT_SGA) ? DO : DONT;
+            send_iac3(cfd, IAC, reply, b);
             break;
         case DO:
-            /* Client wants us to do option `b`.  We already advertised
-               WILL ECHO + WILL SGA in send_telnet_init; reply WONT for
-               anything else so the client stops asking. */
             if (b != TELOPT_ECHO && b != TELOPT_SGA)
                 send_iac3(cfd, IAC, WONT, b);
             break;
-        case WONT: case DONT:
-            /* Client refusing/disabling -- just acknowledge by not
-               continuing to advertise.  We don't track per-option state
-               so this is a no-op; safe because we initiate options that
-               telnet always accepts. */
-            break;
+        case WONT: case DONT: break;
         }
         *st = IAC_NORMAL;
         return 0;
@@ -257,22 +225,150 @@ static int iac_feed(sock_t cfd, iac_state_t *st, uint8_t *cmd, uint8_t b)
         if (b == IAC) *st = IAC_IN_SB_GOT_IAC;
         return 0;
     case IAC_IN_SB_GOT_IAC:
-        if (b == SE) *st = IAC_NORMAL;       /* end of subneg */
-        else         *st = IAC_IN_SB;        /* IAC IAC = literal 0xFF inside SB; ignore */
+        if (b == SE) *st = IAC_NORMAL;
+        else         *st = IAC_IN_SB;
         return 0;
     }
     return 0;
 }
 
-/* ───── server thread ───── */
+/* ===== Menu helpers ===== */
 
-static void serve_client(sock_t cfd)
+/* Map menu letter (a, b, e, f, g, h, i, j, k, l) -> tty_idx 0..9. */
+static int letter_to_idx(char c)
 {
-    iac_state_t iac_st  = IAC_NORMAL;
-    uint8_t     iac_cmd = 0;
+    switch (c) {
+    case 'a': return 0;
+    case 'b': return 1;
+    case 'e': return 2;
+    case 'f': return 3;
+    case 'g': return 4;
+    case 'h': return 5;
+    case 'i': return 6;
+    case 'j': return 7;
+    case 'k': return 8;
+    case 'l': return 9;
+    default:  return -1;
+    }
+}
 
-    /* select() loop: 50 ms timeout so we can drain output_buf without
-       blocking on read forever. */
+static char idx_to_letter(int idx)
+{
+    static const char letters[10] = {
+        'a','b','e','f','g','h','i','j','k','l'
+    };
+    return (idx >= 0 && idx < 10) ? letters[idx] : '?';
+}
+
+static void send_menu(sock_t cfd)
+{
+    int n = scc_tty_count();
+    int i;
+    char buf[1024];
+    int p = 0;
+
+    p += snprintf(buf + p, sizeof(buf) - p,
+                  "\r\nSun-2 SCC console -- pick a tty:\r\n");
+
+    for (i = 0; i < n; i++) {
+        scc_tcp_tty_t *t = &g_ttys[i];
+        char letter = idx_to_letter(i);
+        const char *name = scc_tty_name(i);
+
+        /* Snapshot busy state with the bind lock held briefly. */
+        sock_t cfd_snapshot;
+        char addr_snapshot[64];
+        pthread_mutex_lock(&g_bind_lock);
+        cfd_snapshot = t->client_fd;
+        memcpy(addr_snapshot, t->client_addr, sizeof(addr_snapshot));
+        pthread_mutex_unlock(&g_bind_lock);
+
+        if (cfd_snapshot == SOCK_INVALID)
+            p += snprintf(buf + p, sizeof(buf) - p,
+                          "  [%c] %s  (idle)\r\n", letter, name);
+        else
+            p += snprintf(buf + p, sizeof(buf) - p,
+                          "  [%c] %s  (busy: %s)\r\n",
+                          letter, name, addr_snapshot);
+    }
+
+    p += snprintf(buf + p, sizeof(buf) - p,
+                  "  [Enter] pick first idle\r\n"
+                  "  [q]     disconnect\r\n"
+                  "> ");
+
+    send(cfd, buf, p, MSG_NOSIGNAL);
+}
+
+static void send_str(sock_t cfd, const char *s)
+{
+    send(cfd, s, (int)strlen(s), MSG_NOSIGNAL);
+}
+
+/* Read one byte through the IAC parser, skipping IAC sequences.  Used
+   during menu interaction.  Returns the byte, or -1 on disconnect/error. */
+static int read_byte_iac(sock_t cfd, iac_state_t *st, uint8_t *cmd)
+{
+    for (;;) {
+        char c;
+        int n = recv(cfd, &c, 1, 0);
+        if (n <= 0) return -1;
+        if (iac_feed(cfd, st, cmd, (uint8_t)c))
+            return (uint8_t)c;
+    }
+}
+
+/* Try to bind this client to tty_idx.  Returns 1 if bound, 0 if busy. */
+static int try_bind(int tty_idx, sock_t cfd, const char *addr)
+{
+    int ok = 0;
+    pthread_mutex_lock(&g_bind_lock);
+    if (g_ttys[tty_idx].client_fd == SOCK_INVALID) {
+        g_ttys[tty_idx].client_fd = cfd;
+        snprintf(g_ttys[tty_idx].client_addr,
+                 sizeof(g_ttys[tty_idx].client_addr), "%s", addr);
+        /* Drop any stale ringbuf data from a previous client. */
+        g_ttys[tty_idx].in_head  = g_ttys[tty_idx].in_tail  = 0;
+        g_ttys[tty_idx].out_head = g_ttys[tty_idx].out_tail = 0;
+        ok = 1;
+    }
+    pthread_mutex_unlock(&g_bind_lock);
+    return ok;
+}
+
+static void unbind(int tty_idx)
+{
+    pthread_mutex_lock(&g_bind_lock);
+    g_ttys[tty_idx].client_fd = SOCK_INVALID;
+    g_ttys[tty_idx].client_addr[0] = '\0';
+    pthread_mutex_unlock(&g_bind_lock);
+}
+
+static int find_first_idle(void)
+{
+    int n = scc_tty_count();
+    int i;
+    pthread_mutex_lock(&g_bind_lock);
+    int found = -1;
+    for (i = 0; i < n; i++) {
+        if (g_ttys[i].client_fd == SOCK_INVALID) { found = i; break; }
+    }
+    pthread_mutex_unlock(&g_bind_lock);
+    return found;
+}
+
+/* ===== Per-client worker thread ===== */
+
+typedef struct client_args_s {
+    sock_t cfd;
+    char   addr[64];
+} client_args_t;
+
+static void passthrough(sock_t cfd, int tty_idx, iac_state_t *iac_st,
+                        uint8_t *iac_cmd)
+{
+    scc_tcp_tty_t *t = &g_ttys[tty_idx];
+
     while (!shutdown_request) {
         fd_set rfds;
         FD_ZERO(&rfds);
@@ -284,35 +380,123 @@ static void serve_client(sock_t cfd)
         if (r > 0 && FD_ISSET(cfd, &rfds)) {
             char buf[64];
             int n = recv(cfd, buf, (int)sizeof(buf), 0);
-            if (n <= 0) break;        /* client disconnected */
+            if (n <= 0) break;
             bytes_from_client += n;
-            pthread_mutex_lock(&input_lock);
+            pthread_mutex_lock(&t->in_lock);
             for (int i = 0; i < n; i++) {
-                if (iac_feed(cfd, &iac_st, &iac_cmd, (uint8_t)buf[i]))
-                    rb_put(input_buf, SCC_TCP_IN_SIZE,
-                           &input_head, input_tail, (uint8_t)buf[i]);
+                if (iac_feed(cfd, iac_st, iac_cmd, (uint8_t)buf[i]))
+                    rb_put(t->in_buf, SCC_TCP_IN_SIZE,
+                           &t->in_head, t->in_tail, (uint8_t)buf[i]);
             }
-            pthread_mutex_unlock(&input_lock);
+            pthread_mutex_unlock(&t->in_lock);
             if (scc_tcp_trace)
-                fprintf(stderr, "scc-tcp: recv %d bytes from client\n", n);
+                fprintf(stderr, "scc-tcp: %s recv %d\n",
+                        scc_tty_name(tty_idx), n);
         }
 
-        /* Drain output ringbuf to client. */
+        /* Drain the OUT ringbuf for this tty to the client. */
         uint8_t out[256];
-        pthread_mutex_lock(&output_lock);
-        int outlen = rb_get_block(output_buf, SCC_TCP_OUT_SIZE,
-                                  output_head, &output_tail,
+        pthread_mutex_lock(&t->out_lock);
+        int outlen = rb_get_block(t->out_buf, SCC_TCP_OUT_SIZE,
+                                  t->out_head, &t->out_tail,
                                   out, (int)sizeof(out));
-        pthread_mutex_unlock(&output_lock);
+        pthread_mutex_unlock(&t->out_lock);
         if (outlen > 0) {
             int sent = send(cfd, (const char *)out, outlen, MSG_NOSIGNAL);
-            if (sent < 0) break;      /* client gone */
+            if (sent < 0) break;
             bytes_to_client += sent;
             if (scc_tcp_trace)
-                fprintf(stderr, "scc-tcp: send %d bytes to client\n", sent);
+                fprintf(stderr, "scc-tcp: %s send %d\n",
+                        scc_tty_name(tty_idx), sent);
         }
     }
 }
+
+static void *client_thread_func(void *arg)
+{
+    client_args_t *args = (client_args_t *)arg;
+    sock_t cfd  = args->cfd;
+    char   addr[64];
+    snprintf(addr, sizeof(addr), "%s", args->addr);
+    free(args);
+
+    iac_state_t iac_st  = IAC_NORMAL;
+    uint8_t     iac_cmd = 0;
+
+    /* Telnet negotiation first so a real telnet client switches to
+       remote-echo mode before we render the menu. */
+    send_telnet_init(cfd);
+
+    /* Menu loop. */
+    int tty_idx = -1;
+    while (tty_idx < 0 && !shutdown_request) {
+        send_menu(cfd);
+        int b = read_byte_iac(cfd, &iac_st, &iac_cmd);
+        if (b < 0) goto done;       /* disconnect */
+
+        if (b == 'q' || b == 'Q') {
+            send_str(cfd, "\r\nbye\r\n");
+            goto done;
+        }
+        if (b == '\r' || b == '\n') {
+            int idle = find_first_idle();
+            if (idle < 0) {
+                send_str(cfd, "\r\nno idle ttys -- try again or q to quit\r\n");
+                continue;
+            }
+            if (!try_bind(idle, cfd, addr)) {
+                /* Race: someone else grabbed it.  Re-show menu. */
+                send_str(cfd, "\r\nrace lost, retrying\r\n");
+                continue;
+            }
+            tty_idx = idle;
+            break;
+        }
+        b = tolower(b);
+        if (b >= 'a' && b <= 'l') {
+            int idx = letter_to_idx((char)b);
+            if (idx < 0 || idx >= scc_tty_count()) {
+                send_str(cfd, "\r\nno such tty\r\n");
+                continue;
+            }
+            if (!try_bind(idx, cfd, addr)) {
+                char msg[64];
+                snprintf(msg, sizeof(msg),
+                         "\r\n%s busy, try another\r\n",
+                         scc_tty_name(idx));
+                send_str(cfd, msg);
+                continue;
+            }
+            tty_idx = idx;
+            break;
+        }
+        /* anything else: silent re-prompt */
+    }
+
+    if (tty_idx < 0) goto done;
+
+    /* Bound!  Announce and drop into passthrough. */
+    {
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+                 "\r\n[bound to %s -- Ctrl-] q  to disconnect from telnet]\r\n",
+                 scc_tty_name(tty_idx));
+        send_str(cfd, msg);
+    }
+    fprintf(stderr, "scc-tcp: %s <- client %s\n", scc_tty_name(tty_idx), addr);
+
+    passthrough(cfd, tty_idx, &iac_st, &iac_cmd);
+
+    fprintf(stderr, "scc-tcp: %s client %s disconnected\n",
+            scc_tty_name(tty_idx), addr);
+    unbind(tty_idx);
+
+done:
+    close_sock(cfd);
+    return NULL;
+}
+
+/* ===== Accept thread ===== */
 
 static void *server_thread_func(void *arg)
 {
@@ -325,53 +509,53 @@ static void *server_thread_func(void *arg)
         socklen_t alen = sizeof(caddr);
 #endif
         sock_t cfd = accept(listen_fd, (struct sockaddr *)&caddr, &alen);
-        if (cfd == SOCK_INVALID) {
-            /* listen_fd closed by scc_tcp_stop, bail out. */
-            break;
-        }
+        if (cfd == SOCK_INVALID) break;
 
-        /* Disable Nagle for snappier interactive typing. */
         int one = 1;
         setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY,
                    (const char *)&one, sizeof(one));
 
-        client_fd = cfd;
-        char addr[64];
-        snprintf(addr, sizeof(addr), "%s:%u",
-                 inet_ntoa(caddr.sin_addr), (unsigned)ntohs(caddr.sin_port));
-        fprintf(stderr, "scc-tcp: client connected from %s\n", addr);
+        client_args_t *args = (client_args_t *)malloc(sizeof(*args));
+        if (!args) { close_sock(cfd); continue; }
+        args->cfd = cfd;
+        snprintf(args->addr, sizeof(args->addr), "%s:%u",
+                 inet_ntoa(caddr.sin_addr),
+                 (unsigned)ntohs(caddr.sin_port));
 
-        /* Telnet IAC negotiation: WILL ECHO + WILL/DO SGA.  Sent before
-           the greeting so a real telnet client switches to remote-echo
-           character-at-a-time mode immediately and the user doesn't see
-           their keystrokes echoed twice during login. */
-        send_telnet_init(cfd);
-
-        /* Greeting */
-        const char *hi =
-            "\r\n[connected to sun-2 SCC console — Ctrl-] q  to disconnect from telnet]\r\n";
-        send(cfd, hi, (int)strlen(hi), MSG_NOSIGNAL);
-
-        serve_client(cfd);
-
-        close_sock(cfd);
-        client_fd = SOCK_INVALID;
-        fprintf(stderr, "scc-tcp: client %s disconnected\n", addr);
+        pthread_t th;
+        if (pthread_create(&th, NULL, client_thread_func, args) != 0) {
+            fprintf(stderr, "scc-tcp: pthread_create for client failed\n");
+            close_sock(cfd);
+            free(args);
+            continue;
+        }
+        /* Detach: workers clean up themselves on disconnect. */
+        pthread_detach(th);
     }
     return NULL;
 }
 
-/* ───── lifecycle ───── */
+/* ===== Lifecycle ===== */
 
 int scc_tcp_start(int port)
 {
+    int i;
     if (server_running) return 0;
 
-    /* Verbose tracing on every byte through the pipe — useful for
-       proving "no SunOS data" vs "TCP server broken". */
     {
         const char *e = getenv("SCC_TCP_TRACE");
         scc_tcp_trace = (e && *e && *e != '0');
+    }
+
+    /* Init per-tty state.  All ttys start unbound. */
+    for (i = 0; i < SCC_MAX_TTYS; i++) {
+        scc_tcp_tty_t *t = &g_ttys[i];
+        t->in_head = t->in_tail = 0;
+        t->out_head = t->out_tail = 0;
+        pthread_mutex_init(&t->in_lock,  NULL);
+        pthread_mutex_init(&t->out_lock, NULL);
+        t->client_fd = SOCK_INVALID;
+        t->client_addr[0] = '\0';
     }
 
 #ifdef _WIN32
@@ -383,8 +567,6 @@ int scc_tcp_start(int port)
         }
     }
 #else
-    /* SIGPIPE on send-to-closed-socket would kill us; ignore globally.
-       On Linux we'd rely on MSG_NOSIGNAL but macOS doesn't have it. */
     signal(SIGPIPE, SIG_IGN);
 #endif
 
@@ -410,7 +592,7 @@ int scc_tcp_start(int port)
         listen_fd = SOCK_INVALID;
         return -1;
     }
-    if (listen(listen_fd, 1) < 0) {
+    if (listen(listen_fd, 4) < 0) {
         fprintf(stderr, "scc-tcp: listen() failed\n");
         close_sock(listen_fd);
         listen_fd = SOCK_INVALID;
@@ -421,7 +603,7 @@ int scc_tcp_start(int port)
     server_running   = 1;
     shutdown_request = 0;
 
-    if (pthread_create(&server_thread, NULL, server_thread_func, NULL) != 0) {
+    if (pthread_create(&accept_thread, NULL, server_thread_func, NULL) != 0) {
         fprintf(stderr, "scc-tcp: pthread_create failed\n");
         close_sock(listen_fd);
         listen_fd = SOCK_INVALID;
@@ -429,27 +611,34 @@ int scc_tcp_start(int port)
         return -1;
     }
 
-    fprintf(stderr, "scc-tcp: listening on port %d (raw TCP, single client)\n",
-            port);
+    fprintf(stderr, "scc-tcp: listening on port %d (menu-driven; %d ttys)\n",
+            port, scc_tty_count());
     return 0;
 }
 
 void scc_tcp_stop(void)
 {
+    int i;
     if (!server_running) return;
     shutdown_request = 1;
 
-    /* Drop client + listen socket so the thread's accept/recv unblock. */
-    if (client_fd != SOCK_INVALID) {
-        close_sock(client_fd);
-        client_fd = SOCK_INVALID;
+    /* Close every active client to unstick its worker, plus the listen
+       socket to unstick the accept thread. */
+    pthread_mutex_lock(&g_bind_lock);
+    for (i = 0; i < SCC_MAX_TTYS; i++) {
+        if (g_ttys[i].client_fd != SOCK_INVALID) {
+            close_sock(g_ttys[i].client_fd);
+            g_ttys[i].client_fd = SOCK_INVALID;
+        }
     }
+    pthread_mutex_unlock(&g_bind_lock);
+
     if (listen_fd != SOCK_INVALID) {
         close_sock(listen_fd);
         listen_fd = SOCK_INVALID;
     }
 
-    pthread_join(server_thread, NULL);
+    pthread_join(accept_thread, NULL);
     server_running = 0;
 
 #ifdef _WIN32

@@ -461,6 +461,7 @@ int main(void)
  * ============================================================ */
 
 int quiet = 1;
+int g_scc_boards = 0;   /* unit test: never use expansion boards */
 
 void int_controller_set(unsigned int n)   { (void)n; }
 void int_controller_clear(unsigned int n) { (void)n; }

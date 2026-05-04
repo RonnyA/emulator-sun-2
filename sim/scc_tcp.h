@@ -1,29 +1,36 @@
 /*
- * sun-2 emulator — SCC channel-A console over TCP
+ * sun-2 emulator -- SCC tty consoles over TCP, with menu.
  *
- * When started, exposes a TCP listener on the configured port.  One
- * client at a time can connect.  Bytes from the client are pushed
- * into SCC channel 0 (= SunOS /dev/console), and bytes SunOS writes
- * to channel 0 are forwarded out to the client.
+ * One TCP listener is started by scc_tcp_start(port).  Each new client
+ * is greeted by a menu of configured ttys (ttya, ttyb, plus ttye/f/g/
+ * h/i/j/k/l from --scc-boards expansion cards).  The client picks a
+ * tty by letter, Enter for the first idle one, or q to disconnect.
+ * Once bound the connection is transparent: bytes flow both ways
+ * between the chosen SCC channel and the socket.
  *
- *   telnet host PORT      ← simplest
- *   nc     host PORT      ← rawer; no IAC handshake noise at start
+ * Telnet IAC negotiation:
+ *   On connect we send IAC WILL ECHO + IAC WILL/DO SUPPRESS_GO_AHEAD
+ *   so a vanilla `telnet host port` switches to remote-echo character-
+ *   at-a-time mode immediately.  Inbound IAC sequences from the client
+ *   are parsed and swallowed.
  *
- * The server itself is dumb: raw bytes both ways.  When connecting
- * with telnet, the client may emit a few IAC negotiation bytes
- * (0xFF...) before any real data; SunOS's tty discipline will
- * mostly ignore them.
+ * Threading:
+ *   - One accept thread (in server_thread_func).
+ *   - One worker thread per connected client (in client_thread_func)
+ *     that handles menu + transparent passthrough for that client.
+ *   - The main emulator thread calls scc_tcp_poll() each io_update
+ *     iteration to drain per-tty input ringbufs into the SCC chip
+ *     (via scc_tty_in_push, which is only safe on the main thread).
+ *   - SunOS writes to any SCC channel land in scc_tcp_send_byte(idx,
+ *     byte) on the main thread; the function appends to the per-tty
+ *     output ringbuf, which the worker thread drains and sends.
  *
- * Threading model:
- *   - scc_tcp_start() spawns a server thread.
- *   - The server thread does accept() + the per-client read/write
- *     loop.  Reads put bytes in an input ring buffer; writes drain
- *     an output ring buffer.
- *   - The main emulator thread calls scc_tcp_poll() each iteration
- *     of the io_update loop to drain the input ring buffer into
- *     scc_in_push() (which is not thread-safe on its own).
- *   - SunOS writes to SCC channel 0 / 1 land in scc_tcp_send_byte(),
- *     which appends to the output ring buffer (mutex-protected).
+ * tty_idx convention (matches scc.c's scc_tty_name):
+ *     0  ttya = zs0 chan A
+ *     1  ttyb = zs0 chan B
+ *     2  ttye = zs2 chan A
+ *     3  ttyf = zs2 chan B
+ *     4  ttyg = zs3 chan A   ... up to 9 = ttyl = zs5 chan B.
  */
 
 #ifndef SCC_TCP_H
@@ -31,23 +38,15 @@
 
 #include <stdint.h>
 
-/* Start the TCP listener on `port`.  No-op if already running.
-   Default port suggested by the CLI is 9900.  Returns 0 on success,
-   -1 on failure (port already in use, socket setup error). */
 int  scc_tcp_start(int port);
-
-/* Tear down the TCP listener and any active client connection.
-   Safe to call even if scc_tcp_start was never called. */
 void scc_tcp_stop(void);
 
-/* Called by the main emulator thread (from io_update) to deliver
-   any TCP-arrived bytes to SCC channel 0's input FIFO.  No-op when
-   no server is running. */
+/* Called by the emulator main thread to drain per-tty input ringbufs
+   into the SCC chips.  No-op when the server isn't running. */
 void scc_tcp_poll(void);
 
-/* Called from scc_wr_data() in scc.c when SunOS writes a byte to
-   channel 0 or 1 — we forward it out the TCP client.  No-op when
-   no client is connected. */
-void scc_tcp_send_byte(int ch, uint8_t byte);
+/* Called from scc.c on every byte SunOS transmits.  tty_idx is the
+   per-channel index (0..9 -- see scc_tty_name() in scc.c). */
+void scc_tcp_send_byte(int tty_idx, uint8_t byte);
 
 #endif /* SCC_TCP_H */

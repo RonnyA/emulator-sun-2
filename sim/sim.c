@@ -46,6 +46,10 @@ const char *g_net_iface = NULL;
 int g_net_dump = 0;
 int g_scc_tcp_port = 0;   /* 0 = disabled; otherwise listen on this port */
 int g_no_kbd = 0;         /* --no-kbd: pretend no keyboard, so PROM uses ttya */
+int g_scc_boards = 0;     /* --scc-boards=N: number of MULTIBUS expansion SCCs
+                             (zs2..zs5).  Default 0 = on-board zs0 + zs1 only.
+                             1 = +zs2 (ttye/f); 2 = +zs3 (ttyg/h); 3 = +zs4
+                             (ttyi/j); 4 = +zs5 (ttyk/l). */
 
 #include "scsi.h"
 
@@ -290,8 +294,14 @@ void usage(void)
   fprintf(stderr, "                    (env: SUN2_NET_IFACE; default: backend auto-picks)\n");
   fprintf(stderr, " --net-list         list available host interfaces and exit\n");
   fprintf(stderr, " --net-dump         dump every 3C400 RX/TX frame to stderr\n");
-  fprintf(stderr, " --scc-tcp[=PORT]   expose SCC channel-A console on TCP (default 9900)\n");
+  fprintf(stderr, " --scc-tcp[=PORT]   expose SCC tty consoles on TCP (default port 9900).\n");
   fprintf(stderr, "                    connect with: telnet host PORT   (or: nc host PORT)\n");
+  fprintf(stderr, "                    On connect a menu lists configured ttys; pick one.\n");
+  fprintf(stderr, " --scc-boards=N     attach N Multibus SCC expansion cards (0..4, default 0).\n");
+  fprintf(stderr, "                    Each card adds 2 ttys: 1=>ttye/f, 2=>+ttyg/h, 3=>+ttyi/j,\n");
+  fprintf(stderr, "                    4=>+ttyk/l.  SunOS GENERIC has zs2..zs5 compiled in.\n");
+  fprintf(stderr, "                    NOTE: the kbd/mouse chip is zs1 (Sun-2 conventions);\n");
+  fprintf(stderr, "                    there is no ttyc/ttyd on a Sun-2.\n");
   fprintf(stderr, " --no-kbd           pretend no keyboard is attached; the PROM falls back\n");
   fprintf(stderr, "                    to ttya as console.  Useful with --scc-tcp.\n");
   fprintf(stderr, " -q                 quiet (suppress bus-error/vector trace)\n");
@@ -343,11 +353,12 @@ int main(int argc, char **argv)
       {"net-list",  no_argument,       0,  'L' },
       {"net-dump",  no_argument,       0,  'D' },
       {"scc-tcp",   optional_argument, 0,  'S' },
+      {"scc-boards",required_argument, 0,  'B' },
       {"no-kbd",    no_argument,       0,  'K' },
       {0,           0,                 0,   0  }
     };
 
-    c = getopt_long(argc, argv, "d:k:p:t:m:i:qLDS::K", long_options, &option_index);
+    c = getopt_long(argc, argv, "d:k:p:t:m:i:qLDS::KB:", long_options, &option_index);
     if (c == -1)
       break;
 
@@ -420,6 +431,14 @@ int main(int argc, char **argv)
 
     case 'K':
       g_no_kbd = 1;
+      break;
+
+    case 'B':
+      g_scc_boards = atoi(optarg);
+      if (g_scc_boards < 0 || g_scc_boards > 4) {
+        fprintf(stderr, "--scc-boards: must be 0..4 (got '%s')\n", optarg);
+        exit(1);
+      }
       break;
 
     case '?':

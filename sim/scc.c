@@ -516,59 +516,154 @@ void scc_chip_update(scc_chip_t *chip)
  * unchanged while we migrate the routing.
  */
 
-scc_chip_t g_scc_serial;   /* ttya/ttyb -- chan A=ttya=ch1, chan B=ttyb=ch0 */
-scc_chip_t g_scc_kbd;      /* kbd/mouse -- chan A=kbd=ch3,  chan B=mouse=ch2 */
+scc_chip_t g_scc_serial;       /* zs0: ttya / ttyb (on-board OBMEM 0x7F2000)   */
+scc_chip_t g_scc_kbd;          /* zs1: keyboard / mouse (OBMEM 0x780000)       */
+/* zs2..zs5: Multibus expansion boards.  Number of CONFIGURED boards is
+   g_scc_boards (0..4), set from --scc-boards=N.  Address per SunOS Sun-2
+   GENERIC config:
+        zs2 -> MBMEM 0x80800   (-> ttye / ttyf)
+        zs3 -> MBMEM 0x81000   (-> ttyg / ttyh)
+        zs4 -> MBMEM 0x84800   (-> ttyi / ttyj)
+        zs5 -> MBMEM 0x85000   (-> ttyk / ttyl)
+   ttyc / ttyd don't exist on the Sun-2 because zs1 (kbd/mouse) eats those
+   minor numbers. */
+scc_chip_t g_scc_zs[4];
+
+extern int g_scc_boards;
+
+/* Returns 1 if ANY configured chip is asserting IRQ_SCC.  All Z8530s on
+   a Sun-2 (zs0/zs1 on-board, zs2..zs5 on Multibus) share the same level-3
+   line into the interrupt controller. */
+static int any_chip_asserted(void)
+{
+    int i;
+    if (g_scc_serial.irq_asserted) return 1;
+    if (g_scc_kbd.irq_asserted)    return 1;
+    for (i = 0; i < g_scc_boards; i++)
+        if (g_scc_zs[i].irq_asserted) return 1;
+    return 0;
+}
 
 static void shim_irq_cb(scc_chip_t *chip, int asserted)
 {
     (void)chip;
     if (asserted) int_controller_set(IRQ_SCC);
     else {
-        /* Both chips share the IRQ_SCC line.  Only drop the line if
-           NEITHER chip is asserting -- otherwise the other chip's
-           IRQ would silently disappear. */
-        if (!g_scc_serial.irq_asserted && !g_scc_kbd.irq_asserted)
+        /* Only drop the line if NO chip is still asserting -- otherwise
+           the other chips' IRQs would silently disappear. */
+        if (!any_chip_asserted())
             int_controller_clear(IRQ_SCC);
     }
 }
 
+/* TX byte from any tty chip -> dispatch to the TCP server with the
+   tty index encoded.  Parity-bit strip applies for terminal use:
+   SunOS's tty discipline computes parity in SOFTWARE for some
+   output paths (cnputc + printf via uart) and ORs the parity bit
+   into the data byte before writing it to the data port.  Real
+   hardware would still drive that bit out on the wire; for human-
+   readable telnet clients we mask it. */
 static void shim_serial_tx(scc_chip_t *chip, int chan, uint8_t byte)
 {
     (void)chip;
-    /* Map chan -> legacy ch index for the TCP server. */
-    int ch = (chan == SCC_CH_A) ? 1 : 0;
-    /* SunOS's tty discipline computes parity in SOFTWARE for some
-       output paths (cnputc + printf via uart) and OR's the parity
-       bit into the data byte before writing it to the data port.
-       Real hardware would still drive that bit out on the wire as
-       part of the 8-bit cell, but human-readable terminal clients
-       expect 7-bit ASCII.  Strip bit 7 on the TCP forwarder.  Side
-       effect: this also strips actual MSBs of true 8-bit data --
-       not a concern for the SunOS console use case (always ASCII)
-       and easy to gate later if a binary protocol ever runs over
-       the same channel. */
-    scc_tcp_send_byte(ch, byte & 0x7f);
+    /* zs0: chan A=ttya=tty_idx 0, chan B=ttyb=tty_idx 1. */
+    int tty_idx = (chan == SCC_CH_A) ? 0 : 1;
+    scc_tcp_send_byte(tty_idx, byte & 0x7f);
+}
+
+static void shim_expansion_tx(scc_chip_t *chip, int chan, uint8_t byte)
+{
+    /* zsN (N=2..5) -> ttye/f, ttyg/h, ttyi/j, ttyk/l.
+       tty index is 2 + 2*board + (chanA?0:1).  board comes from the
+       chip's slot in g_scc_zs[]. */
+    int board = (int)(chip - g_scc_zs);
+    int tty_idx = 2 + board * 2 + ((chan == SCC_CH_A) ? 0 : 1);
+    scc_tcp_send_byte(tty_idx, byte & 0x7f);
 }
 
 static void shim_kbd_tx(scc_chip_t *chip, int chan, uint8_t byte)
 {
     (void)chip;
-    /* Only chan A (= kbd in our mapping, legacy ch=3) drives the kbd cmd queue.
-       chan B = mouse -- not modelled. */
+    /* zs1 chan A = kbd cmd queue.  Chan B = mouse (not modelled). */
     if (chan == SCC_CH_A) sun2_kb_write(byte, 1);
 }
 
 static int shim_inited = 0;
 static void shim_init(void)
 {
+    int i;
     if (shim_inited) return;
-    scc_chip_init(&g_scc_serial, "serial");
-    scc_chip_init(&g_scc_kbd,    "kbd");
+
+    scc_chip_init(&g_scc_serial, "zs0");
+    scc_chip_init(&g_scc_kbd,    "zs1");
     g_scc_serial.on_tx_byte = shim_serial_tx;
     g_scc_serial.on_irq     = shim_irq_cb;
     g_scc_kbd   .on_tx_byte = shim_kbd_tx;
     g_scc_kbd   .on_irq     = shim_irq_cb;
+
+    /* Multibus expansion boards.  Names match SunOS's GENERIC config. */
+    for (i = 0; i < g_scc_boards; i++) {
+        static const char *names[4] = { "zs2", "zs3", "zs4", "zs5" };
+        scc_chip_init(&g_scc_zs[i], names[i]);
+        g_scc_zs[i].on_tx_byte = shim_expansion_tx;
+        g_scc_zs[i].on_irq     = shim_irq_cb;
+    }
+
     shim_inited = 1;
+}
+
+/* ===== tty-index public API (used by scc_tcp.c for the TCP menu) =====
+   tty index numbering matches SunOS's minor-device convention with the
+   kbd/mouse gap removed -- so 0..(2+boards*2-1).
+       0  ttya = zs0 chan A
+       1  ttyb = zs0 chan B
+       2  ttye = zs2 chan A
+       3  ttyf = zs2 chan B
+       4  ttyg = zs3 chan A
+       5  ttyh = zs3 chan B
+       6  ttyi = zs4 chan A
+       7  ttyj = zs4 chan B
+       8  ttyk = zs5 chan A
+       9  ttyl = zs5 chan B
+*/
+
+int scc_tty_count(void)
+{
+    return 2 + g_scc_boards * 2;
+}
+
+const char *scc_tty_name(int tty_idx)
+{
+    static const char *names[10] = {
+        "ttya", "ttyb",
+        "ttye", "ttyf",
+        "ttyg", "ttyh",
+        "ttyi", "ttyj",
+        "ttyk", "ttyl",
+    };
+    if (tty_idx < 0 || tty_idx >= (int)(sizeof(names)/sizeof(names[0])))
+        return "?";
+    return names[tty_idx];
+}
+
+/* Push a byte received from the TCP client into the appropriate chip's
+   input FIFO.  Called from the main thread (via scc_tcp_poll), never
+   from worker threads. */
+void scc_tty_in_push(int tty_idx, uint8_t byte)
+{
+    shim_init();
+    scc_chip_t *chip;
+    int chan;
+    if (tty_idx < 2) {
+        chip = &g_scc_serial;
+        chan = (tty_idx == 0) ? SCC_CH_A : SCC_CH_B;
+    } else {
+        int board = (tty_idx - 2) / 2;
+        if (board >= g_scc_boards) return;
+        chip = &g_scc_zs[board];
+        chan = ((tty_idx - 2) & 1) == 0 ? SCC_CH_A : SCC_CH_B;
+    }
+    scc_chip_in_push(chip, chan, byte);
 }
 
 /* Map legacy ch=[0..3] to (chip, chan).
@@ -593,10 +688,14 @@ int scc_device_ack(int which)
     (void)which;
     shim_init();
     if (trace_scc) printf("scc: irq ack %d\n", which);
-    /* Only ack chips that are actually asserting -- the line is shared. */
+    /* Only ack chips that are actually asserting -- the IRQ line is
+       shared by every Z8530 in the machine. */
     int vec = M68K_INT_ACK_AUTOVECTOR;
+    int i;
     if (g_scc_serial.irq_asserted) vec = scc_chip_ack(&g_scc_serial);
     if (g_scc_kbd.irq_asserted)    vec = scc_chip_ack(&g_scc_kbd);
+    for (i = 0; i < g_scc_boards; i++)
+        if (g_scc_zs[i].irq_asserted) vec = scc_chip_ack(&g_scc_zs[i]);
     return vec;
 }
 
@@ -664,9 +763,33 @@ void scc_write(unsigned int pa, unsigned int value, int size)
 
 void scc_update(void)
 {
+    int i;
     shim_init();
     scc_chip_update(&g_scc_serial);
     scc_chip_update(&g_scc_kbd);
+    for (i = 0; i < g_scc_boards; i++)
+        scc_chip_update(&g_scc_zs[i]);
+}
+
+/* Look up the expansion chip for a given Multibus base address.
+   Returns NULL if no board is configured at that address.  The
+   base addresses come from SunOS's Sun-2 GENERIC config. */
+scc_chip_t *scc_lookup_mb(unsigned int mb_base)
+{
+    /* Address ranges (each chip occupies 8 bytes, mask off low 3). */
+    static const unsigned int bases[4] = {
+        0x80800,    /* zs2 */
+        0x81000,    /* zs3 */
+        0x84800,    /* zs4 */
+        0x85000,    /* zs5 */
+    };
+    int i;
+    shim_init();
+    for (i = 0; i < g_scc_boards; i++) {
+        if ((mb_base & ~0x07u) == bases[i])
+            return &g_scc_zs[i];
+    }
+    return NULL;
 }
 
 /* Local Variables:  */

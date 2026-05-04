@@ -85,6 +85,10 @@ extern int g_net_dump;
    channel 0) for console I/O.  Combined with --scc-tcp this gives
    a fully serial-console session over TCP. */
 extern int g_no_kbd;
+/* Number of MULTIBUS SCC expansion cards (0..4).  Each adds 2 ttys.
+   See sim.c for the SunOS naming convention (no ttyc/d because zs1 is
+   the kbd/mouse chip). */
+extern int g_scc_boards;
 /* Build the IDPROM bytes for a given machine type, recompute byte-15 checksum. */
 void idprom_setup(unsigned char machine_type);
 
@@ -97,6 +101,16 @@ int scc_device_ack(int which);
 void scc_update(void);
 int scc_in_pop(int ch, unsigned int *pv);
 void scc_in_push(int ch, int v);
+
+/* tty-index API used by scc_tcp.c.  Indexing matches SunOS Sun-2 minor
+   numbers WITH the kbd/mouse gap removed: 0=ttya, 1=ttyb, 2=ttye,
+   3=ttyf, 4=ttyg, 5=ttyh, 6=ttyi, 7=ttyj, 8=ttyk, 9=ttyl. */
+int          scc_tty_count(void);
+const char  *scc_tty_name(int tty_idx);
+void         scc_tty_in_push(int tty_idx, uint8_t byte);
+/* Multibus expansion chip lookup -- used by sim68k.c for routing. */
+struct scc_chip_s;
+struct scc_chip_s *scc_lookup_mb(unsigned int mb_base);
 
 unsigned int am9513_read(unsigned int pa, int size);
 void am9513_write(unsigned int pa, unsigned int value, int size);
