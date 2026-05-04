@@ -1,16 +1,17 @@
 /*
- * test_scc.c -- unit tests for the 5 SCC bugs we fixed in scc.c.
+ * test_scc.c -- unit tests for the per-instance scc_chip_t API.
  *
  * Build:
- *   make test-scc      (or:  cc -I. -I../m68k -fcommon -DM68K_V33 \
- *                              test_scc.c -o test_scc.exe )
+ *   make test-scc
  *
- * Each TEST() block exercises one bug-fix and asserts the post-state
- * of scc_rr / scc_wr / scc_ints / scc_int_pending matches the
- * canonical Z8530 spec from sun/sys/sundev/zsreg.h.
+ * Each TEST() block builds a local scc_chip_t and exercises it via
+ * the public per-instance API (scc_chip_init / scc_chip_read /
+ * scc_chip_write / scc_chip_in_push / scc_chip_ack / etc.).  No
+ * global state is touched, so tests are independent of each other
+ * and of the legacy shim used by the live emulator.
  *
- * Stubs at the bottom of this file replace the real CPU/IRQ/TCP glue
- * so the SCC module can run in isolation.
+ * Stubs at the bottom replace the parts of the larger emulator we
+ * don't link in for a unit test.
  */
 
 #include <stdio.h>
@@ -18,12 +19,9 @@
 #include <stdint.h>
 #include <string.h>
 
-/* Pull in the SCC implementation directly so we can poke the global
-   state arrays.  We can't link against scc.o because we need the
-   *test* version of int_controller_set / sun2_kb_write / etc. */
-#include "scc.c"
+#include "scc.c"   /* pulls in implementation + the legacy shim */
 
-/* ---- assertion helper ---- */
+/* ---- assertion helper ---------------------------------------------- */
 static int g_failed = 0;
 static int g_total  = 0;
 
@@ -37,226 +35,432 @@ static int g_total  = 0;
     }                                                                 \
 } while (0)
 
-/* Reset all SCC global state between tests. */
-static void test_reset_world(void)
+/* IRQ-callback recorder so we can assert on line edges. */
+static int        irq_state;
+static int        irq_changes;
+static scc_chip_t *irq_last_chip;
+
+static void rec_irq(scc_chip_t *chip, int asserted)
 {
-    memset(scc_init,         0, sizeof(scc_init));
-    memset(scc_cmd,          0, sizeof(scc_cmd));
-    memset(scc_cmd_primed,   0, sizeof(scc_cmd_primed));
-    memset(scc_wr,           0, sizeof(scc_wr));
-    memset(scc_rr,           0, sizeof(scc_rr));
-    memset(scc_ints,         0, sizeof(scc_ints));
-    scc_int_pending = 0;
-    memset(scc_ififo,        0, sizeof(scc_ififo));
-    memset(scc_ofifo,        0, sizeof(scc_ofifo));
+    irq_state    = asserted;
+    irq_changes++;
+    irq_last_chip = chip;
 }
 
-/* Helper: do the "select reg N, then write data byte" two-step on
-   ctlA of channel ch.  Mirrors the Z8530 indirect-register protocol. */
-static void wr_reg(int ch, int reg, int value)
+/* TX-byte recorder. */
+static uint8_t tx_buf[64];
+static int     tx_count;
+static int     tx_last_chan;
+
+static void rec_tx(scc_chip_t *chip, int chan, uint8_t byte)
 {
-    /* First write: register pointer (low 3 bits) + cmd group (bits 3-5).
-       For regs 0-7 cmd=0; for regs 8-15 cmd=1 (point hi). */
+    (void)chip;
+    if (tx_count < (int)sizeof(tx_buf)) tx_buf[tx_count++] = byte;
+    tx_last_chan = chan;
+}
+
+static void reset_recorders(void)
+{
+    irq_state    = 0;
+    irq_changes  = 0;
+    irq_last_chip = NULL;
+    tx_count     = 0;
+    tx_last_chan = -1;
+    memset(tx_buf, 0, sizeof(tx_buf));
+}
+
+/* Helper: WR0-then-data two-step on a chan. */
+static void wr_reg(scc_chip_t *chip, int chan, int reg, uint8_t value)
+{
     int cmd = (reg >= 8) ? 1 : 0;
     int low = reg & 0x7;
-    scc_wr_ctl(ch, (cmd << 3) | low, 1);
-    scc_wr_ctl(ch, value, 1);
+    unsigned int off = (chan == SCC_CH_A) ? 0x4 : 0x0;
+    scc_chip_write(chip, off, (cmd << 3) | low);
+    scc_chip_write(chip, off, value);
 }
 
-/* =========================================================== */
-/* Bug 1 -- WR13 must NOT clobber RR9                          */
-/* =========================================================== */
-static void test_bug1_wr13_no_rr9_clobber(void)
+static unsigned int rd_reg(scc_chip_t *chip, int chan, int reg)
 {
-    fprintf(stderr, "[bug 1] WR13 must not corrupt RR9 mirror\n");
-    test_reset_world();
-    scc_chk_init(0);
-    scc_rr[0][9] = 0xAA;            /* sentinel */
-    wr_reg(0, 13, 0x55);            /* write WR13 = 0x55 */
-    CHECK("RR13 mirrors WR13", scc_rr[0][13] == 0x55);
-    CHECK("RR9 sentinel unchanged (bug 1 fixed)", scc_rr[0][9] == 0xAA);
+    int cmd = (reg >= 8) ? 1 : 0;
+    int low = reg & 0x7;
+    unsigned int off = (chan == SCC_CH_A) ? 0x4 : 0x0;
+    scc_chip_write(chip, off, (cmd << 3) | low);
+    return scc_chip_read(chip, off);
 }
 
-/* =========================================================== */
-/* Bug 2 -- WR15 must NOT clobber RR11                         */
-/* =========================================================== */
-static void test_bug2_wr15_no_rr11_clobber(void)
+/* =================================================================== */
+/* Test 1 -- chip initialization defaults                              */
+/* =================================================================== */
+static void test_init(void)
 {
-    fprintf(stderr, "[bug 2] WR15 must not corrupt RR11 mirror\n");
-    test_reset_world();
-    scc_chk_init(0);
-    scc_rr[0][11] = 0xCC;           /* sentinel */
-    wr_reg(0, 15, 0xFF);            /* WR15 with all-bits-set */
-    CHECK("RR15 mirrors WR15 with bits 0,2 cleared",
-          scc_rr[0][15] == (0xFF & ~5));
-    CHECK("RR11 sentinel unchanged (bug 2 fixed)", scc_rr[0][11] == 0xCC);
+    fprintf(stderr, "[test 1] init defaults\n");
+    scc_chip_t chip;
+    scc_chip_init(&chip, "t1");
+
+    CHECK("init: register_ptr = 0",        chip.register_ptr == 0);
+    CHECK("init: MIE = 0",                  chip.master_int_enable == 0);
+    CHECK("init: interrupt_pending = 0",    chip.interrupt_pending == 0);
+    CHECK("init: irq_asserted = 0",         chip.irq_asserted == 0);
+    CHECK("init: chan B RR0 has TX_READY",  (chip.rr[SCC_CH_B][0] & SCC_RR0_TX_READY) != 0);
+    CHECK("init: chan A RR0 has TX_READY",  (chip.rr[SCC_CH_A][0] & SCC_RR0_TX_READY) != 0);
+    CHECK("init: chan B RR1 has ALL_SENT",  (chip.rr[SCC_CH_B][1] & SCC_RR1_ALL_SENT) != 0);
 }
 
-/* =========================================================== */
-/* Bug 3 -- RR2 modified vector must land in chan B of correct */
-/*          chip pair, not unconditionally [2][2]              */
-/* =========================================================== */
-static void test_bug3_rr2_chip_pair(void)
+/* =================================================================== */
+/* Test 2 -- WR9 MIE gating: no MIE -> no IRQ even with IP bit set     */
+/* =================================================================== */
+static void test_mie_gates_irq(void)
 {
-    fprintf(stderr, "[bug 3] RR2 modified vector goes to chip-B index\n");
+    fprintf(stderr, "[test 2] WR9.MIE gates IRQ\n");
+    scc_chip_t chip;
+    scc_chip_init(&chip, "t2");
+    chip.on_irq = rec_irq;
+    reset_recorders();
 
-    /* ch=0/1 = chip 0 (chan B / chan A);  ch=2/3 = chip 1.       */
+    /* Force RR3 IP bit -- but MIE off.  No IRQ should fire. */
+    chip.interrupt_pending = SCC_RR3_IP_A_TX;
+    scc_chip_check_irq(&chip);
+    CHECK("MIE off: no IRQ assert",        irq_state == 0);
+    CHECK("MIE off: irq_asserted = 0",     chip.irq_asserted == 0);
 
-    /* Case A: throw RX int on ch=0 (chip 0, chan B).
-       Modified vector should appear in chan B's RR2 = [0][2],
-       NOT in [2][2]. */
-    test_reset_world();
-    scc_throw_interrupt(0, 2);
-    CHECK("ch=0 RX int -> RR2[chip0 chan B] = 0x04",
-          scc_rr[0][2] == 0x04);
-    CHECK("ch=0 RX int does NOT touch RR2[chip1 chan B]",
-          scc_rr[2][2] == 0x00);
-
-    /* Case B: throw RX int on ch=1 (chip 0, chan A).
-       Modified vector should still land in chan B's RR2 = [0][2]
-       (chan A's RR2 = base; chan B's RR2 = modified). */
-    test_reset_world();
-    scc_throw_interrupt(1, 2);
-    CHECK("ch=1 RX int -> RR2[chip0 chan B] = 0x0c",
-          scc_rr[0][2] == 0x0c);
-    CHECK("ch=1 RX int does NOT touch RR2[chip1 chan B]",
-          scc_rr[2][2] == 0x00);
-
-    /* Case C: throw RX int on ch=2 (chip 1, chan B).
-       Should land in [2][2], NOT [0][2]. */
-    test_reset_world();
-    scc_throw_interrupt(2, 2);
-    CHECK("ch=2 RX int -> RR2[chip1 chan B] = 0x04",
-          scc_rr[2][2] == 0x04);
-    CHECK("ch=2 RX int does NOT touch RR2[chip0 chan B]",
-          scc_rr[0][2] == 0x00);
-
-    /* Case D: ch=3 (chip 1, chan A) -- vector in chan B = [2][2] */
-    test_reset_world();
-    scc_throw_interrupt(3, 2);
-    CHECK("ch=3 RX int -> RR2[chip1 chan B] = 0x0c",
-          scc_rr[2][2] == 0x0c);
+    /* Now enable MIE via WR9 = 0x09 (MIE | VIS). */
+    wr_reg(&chip, SCC_CH_A, 9, SCC_WR9_MIE | SCC_WR9_VIS);
+    CHECK("WR9 MIE: master_int_enable = 1", chip.master_int_enable == 1);
+    CHECK("WR9 MIE: vector_incl_stat = 1",  chip.vector_incl_stat == 1);
+    CHECK("WR9 MIE: irq_asserted = 1",      chip.irq_asserted == 1);
+    CHECK("WR9 MIE: irq_state = 1",         irq_state == 1);
 }
 
-/* =========================================================== */
-/* Bug 4 -- RR3 IP bits must be set in chan A of chip pair     */
-/* =========================================================== */
-static void test_bug4_rr3_ip_bits(void)
+/* =================================================================== */
+/* Test 3 -- TX path raises RR3 IP_x_TX iff WR1.TIE                    */
+/* =================================================================== */
+static void test_tx_int(void)
 {
-    fprintf(stderr, "[bug 4] RR3 IP bits set in chan A of chip pair\n");
+    fprintf(stderr, "[test 3] TX writes raise IP_x_TX iff WR1.TIE\n");
+    scc_chip_t chip;
+    scc_chip_init(&chip, "t3");
+    chip.on_irq     = rec_irq;
+    chip.on_tx_byte = rec_tx;
+    reset_recorders();
 
-    /* ch=0 (chip0 chan B) RX -> IP_B_RX (0x04) in chan A's RR3 = [1][3] */
-    test_reset_world();
-    scc_throw_interrupt(0, 2);
-    CHECK("ch=0 RX -> RR3[chip0 chan A] has IP_B_RX=0x04",
-          (scc_rr[1][3] & 0x04) != 0);
+    /* Enable MIE chip-wide. */
+    wr_reg(&chip, SCC_CH_A, 9, SCC_WR9_MIE);
+    /* Enable TIE on chan A. */
+    wr_reg(&chip, SCC_CH_A, 1, SCC_WR1_TX_IE);
 
-    /* ch=1 (chip0 chan A) TX -> IP_A_TX (0x10) in [1][3] */
-    test_reset_world();
-    scc_throw_interrupt(1, 1);
-    CHECK("ch=1 TX -> RR3[chip0 chan A] has IP_A_TX=0x10",
-          (scc_rr[1][3] & 0x10) != 0);
+    /* Write a data byte to chan A. */
+    scc_chip_write(&chip, 0x6, '/');   /* offset 6 = data, chan A */
+    CHECK("TX: byte forwarded to on_tx_byte",  tx_count == 1 && tx_buf[0] == '/');
+    CHECK("TX: chan = A",                       tx_last_chan == SCC_CH_A);
+    CHECK("TX: IP_A_TX set",                    (chip.interrupt_pending & SCC_RR3_IP_A_TX) != 0);
+    CHECK("TX: IRQ asserted",                   chip.irq_asserted == 1);
 
-    /* ch=2 (chip1 chan B) TX -> IP_B_TX (0x02) in [3][3] */
-    test_reset_world();
-    scc_throw_interrupt(2, 1);
-    CHECK("ch=2 TX -> RR3[chip1 chan A] has IP_B_TX=0x02",
-          (scc_rr[3][3] & 0x02) != 0);
-
-    /* ch=3 (chip1 chan A) RX -> IP_A_RX (0x20) in [3][3] */
-    test_reset_world();
-    scc_throw_interrupt(3, 2);
-    CHECK("ch=3 RX -> RR3[chip1 chan A] has IP_A_RX=0x20",
-          (scc_rr[3][3] & 0x20) != 0);
-
-    /* Cross-pair isolation: ch=0 int must NOT touch [3][3]. */
-    test_reset_world();
-    scc_throw_interrupt(0, 2);
-    CHECK("ch=0 RX leaves RR3[chip1 chan A] = 0",
-          scc_rr[3][3] == 0);
-
-    /* scc_device_ack clears RR3 of chan A in both chip pairs. */
-    test_reset_world();
-    scc_throw_interrupt(0, 2);
-    scc_throw_interrupt(2, 2);   /* second one is masked by int_pending */
-    scc_rr[3][3] = 0x04;          /* but pretend chip1 also has IP set */
-    scc_device_ack(6);
-    CHECK("scc_device_ack clears RR3[chip0 chan A]",
-          scc_rr[1][3] == 0);
-    CHECK("scc_device_ack clears RR3[chip1 chan A]",
-          scc_rr[3][3] == 0);
+    /* Disable TIE on chan A: another write must NOT raise IP. */
+    chip.interrupt_pending = 0;
+    chip.irq_asserted = 0;
+    irq_state = 0;
+    wr_reg(&chip, SCC_CH_A, 1, 0);
+    scc_chip_write(&chip, 0x6, 'X');
+    CHECK("TX no-TIE: byte still forwarded",   tx_buf[1] == 'X');
+    CHECK("TX no-TIE: IP_A_TX NOT set",        (chip.interrupt_pending & SCC_RR3_IP_A_TX) == 0);
 }
 
-/* =========================================================== */
-/* Bug 5 -- WR9 reset commands honored                         */
-/* =========================================================== */
-static void test_bug5_wr9_reset(void)
+/* =================================================================== */
+/* Test 4 -- WR0 RESET_TXINT (0x28) clears IP_x_TX, drops IRQ if last  */
+/* =================================================================== */
+static void test_wr0_reset_txint(void)
 {
-    fprintf(stderr, "[bug 5] WR9 reset commands clear chip state\n");
+    fprintf(stderr, "[test 4] WR0 RESET_TXINT (0x28) clears IP_x_TX\n");
+    scc_chip_t chip;
+    scc_chip_init(&chip, "t4");
+    chip.on_irq     = rec_irq;
+    chip.on_tx_byte = rec_tx;
+    reset_recorders();
 
-    /* RESET_CHAN_B: write 0x40 to WR9 via ch=0 -> resets chip0 chan B (=ch 0). */
-    test_reset_world();
-    scc_chk_init(0);
-    scc_chk_init(1);
-    /* Pre-load some non-zero state on both channels of chip 0. */
-    scc_wr[0][1]   = 0xFF;     scc_wr[1][1]   = 0xFF;
-    scc_rr[0][3]   = 0xAB;     scc_rr[1][3]   = 0xAB;
-    scc_ints[0]    = 0x82;     scc_ints[1]    = 0x82;
-    scc_ififo[0].count = 5;    scc_ififo[1].count = 5;
+    wr_reg(&chip, SCC_CH_A, 9, SCC_WR9_MIE);
+    wr_reg(&chip, SCC_CH_A, 1, SCC_WR1_TX_IE);
+    scc_chip_write(&chip, 0x6, 'a');         /* writes to data port chan A */
+    CHECK("setup: IP_A_TX set",              (chip.interrupt_pending & SCC_RR3_IP_A_TX) != 0);
+    CHECK("setup: IRQ asserted",             chip.irq_asserted == 1);
 
-    wr_reg(0, 9, 0x40);        /* WR9 = RESET_CHAN_B (chip 0 chan B = idx 0) */
+    /* Send WR0 = RESET_TXINT (cmd=5 -> 0x28) on chan A (offset 4). */
+    scc_chip_write(&chip, 0x4, 0x28);
+    CHECK("RESET_TXINT: IP_A_TX cleared",    (chip.interrupt_pending & SCC_RR3_IP_A_TX) == 0);
+    CHECK("RESET_TXINT: IRQ dropped",        chip.irq_asserted == 0);
+}
 
-    CHECK("RESET_CHAN_B clears WR1 of chan B (idx 0)", scc_wr[0][1] == 0);
-    CHECK("RESET_CHAN_B clears RR3 of chan B (idx 0)", scc_rr[0][3] == 0);
-    CHECK("RESET_CHAN_B clears scc_ints of chan B",     scc_ints[0] == 0);
-    CHECK("RESET_CHAN_B clears input FIFO of chan B",   scc_ififo[0].count == 0);
-    /* Sister channel A (idx 1) must NOT be touched. */
-    CHECK("RESET_CHAN_B leaves chan A WR1 untouched",   scc_wr[1][1] == 0xFF);
-    CHECK("RESET_CHAN_B leaves chan A RR3 untouched",   scc_rr[1][3] == 0xAB);
-    /* RR0/RR1 of reset channel get the canonical defaults. */
-    CHECK("RESET_CHAN_B sets RR0 = TX_READY",           scc_rr[0][0] == 0x04);
-    CHECK("RESET_CHAN_B sets RR1 = ALL_SENT",           scc_rr[0][1] == 0x01);
+/* =================================================================== */
+/* Test 5 -- RX path: in_push raises IP_x_RX iff WR1.RIE              */
+/* =================================================================== */
+static void test_rx_int(void)
+{
+    fprintf(stderr, "[test 5] RX in_push raises IP_x_RX iff WR1.RIE\n");
+    scc_chip_t chip;
+    scc_chip_init(&chip, "t5");
+    chip.on_irq = rec_irq;
+    reset_recorders();
 
-    /* RESET_CHAN_A: write 0x80 via ch=1 -> resets chan A (idx 1). */
-    test_reset_world();
-    scc_chk_init(0); scc_chk_init(1);
-    scc_wr[0][1] = 0xAA;  scc_wr[1][1] = 0xBB;
-    wr_reg(1, 9, 0x80);
-    CHECK("RESET_CHAN_A clears chan A WR1",             scc_wr[1][1] == 0);
-    CHECK("RESET_CHAN_A leaves chan B WR1 untouched",   scc_wr[0][1] == 0xAA);
+    wr_reg(&chip, SCC_CH_A, 9, SCC_WR9_MIE);
+    wr_reg(&chip, SCC_CH_A, 1, SCC_WR1_RX_IE);   /* RIE on chan A */
 
-    /* RESET_WORLD: write 0xC0 -> resets BOTH channels of chip pair. */
-    test_reset_world();
-    scc_chk_init(0); scc_chk_init(1);
-    scc_chk_init(2); scc_chk_init(3);
-    scc_wr[0][1] = scc_wr[1][1] = 0xAA;
-    scc_wr[2][1] = scc_wr[3][1] = 0xBB;
-    wr_reg(0, 9, 0xC0);
-    CHECK("RESET_WORLD clears chip0 chan B WR1",        scc_wr[0][1] == 0);
-    CHECK("RESET_WORLD clears chip0 chan A WR1",        scc_wr[1][1] == 0);
-    CHECK("RESET_WORLD on chip0 leaves chip1 chan B",   scc_wr[2][1] == 0xBB);
-    CHECK("RESET_WORLD on chip0 leaves chip1 chan A",   scc_wr[3][1] == 0xBB);
+    scc_chip_in_push(&chip, SCC_CH_A, 0x42);
+    CHECK("RX: IP_A_RX set",                 (chip.interrupt_pending & SCC_RR3_IP_A_RX) != 0);
+    CHECK("RX: RR0[A].RX_READY set",         (chip.rr[SCC_CH_A][0] & SCC_RR0_RX_READY) != 0);
+    CHECK("RX: IRQ asserted",                chip.irq_asserted == 1);
+
+    /* Read the data port to drain the FIFO -- IP_RX must clear. */
+    unsigned int v = scc_chip_read(&chip, 0x6);  /* data, chan A */
+    CHECK("RX read: got the byte",           v == 0x42);
+    CHECK("RX read: IP_A_RX cleared",        (chip.interrupt_pending & SCC_RR3_IP_A_RX) == 0);
+    CHECK("RX read: IRQ dropped",            chip.irq_asserted == 0);
+}
+
+/* =================================================================== */
+/* Test 6 -- RR2 chan B = modified vector, chan A = unmodified         */
+/* =================================================================== */
+static void test_rr2_modified_vector(void)
+{
+    fprintf(stderr, "[test 6] RR2 chan B is modified by IP, chan A is not\n");
+    scc_chip_t chip;
+    scc_chip_init(&chip, "t6");
+
+    /* Set vector base to 0x40 via WR2 (any chan). */
+    wr_reg(&chip, SCC_CH_A, 2, 0x40);
+
+    /* Inject an A_TX pending. */
+    chip.interrupt_pending = SCC_RR3_IP_A_TX;
+
+    /* RR2 chan A = unmodified vector (= 0x40). */
+    unsigned int va = rd_reg(&chip, SCC_CH_A, 2);
+    CHECK("RR2 chan A unmodified",           va == 0x40);
+
+    /* RR2 chan B = vector with code in bits 3:1 (status-low default).
+       A_TX code = 100b -> shifted left 1 = 1000b = 0x08.
+       Combined with vector base 0x40 (bits clear in 3:1) = 0x48. */
+    unsigned int vb = rd_reg(&chip, SCC_CH_B, 2);
+    CHECK("RR2 chan B = base | (A_TX<<1) = 0x48", vb == 0x48);
+
+    /* With B_RX pending instead, code = 010 -> bits 3:1 = 0100 = 0x04. */
+    chip.interrupt_pending = SCC_RR3_IP_B_RX;
+    vb = rd_reg(&chip, SCC_CH_B, 2);
+    CHECK("RR2 chan B = base | (B_RX<<1) = 0x44", vb == 0x44);
+
+    /* No interrupt pending -> "special receive" sentinel = 011 -> 0x06.
+       Combined with 0x40 = 0x46. */
+    chip.interrupt_pending = 0;
+    vb = rd_reg(&chip, SCC_CH_B, 2);
+    CHECK("RR2 chan B = base | (NoInt<<1) = 0x46", vb == 0x46);
+}
+
+/* =================================================================== */
+/* Test 7 -- RR3 only readable on chan A, chan B always 0              */
+/* =================================================================== */
+static void test_rr3_chan_only(void)
+{
+    fprintf(stderr, "[test 7] RR3 readable only on chan A\n");
+    scc_chip_t chip;
+    scc_chip_init(&chip, "t7");
+
+    chip.interrupt_pending = SCC_RR3_IP_A_TX | SCC_RR3_IP_B_RX;
+
+    unsigned int rA = rd_reg(&chip, SCC_CH_A, 3);
+    unsigned int rB = rd_reg(&chip, SCC_CH_B, 3);
+    CHECK("RR3 chan A returns IP mask",      rA == (SCC_RR3_IP_A_TX | SCC_RR3_IP_B_RX));
+    CHECK("RR3 chan B returns 0",            rB == 0);
+}
+
+/* =================================================================== */
+/* Test 8 -- WR9 reset commands                                        */
+/* =================================================================== */
+static void test_wr9_resets(void)
+{
+    fprintf(stderr, "[test 8] WR9 RESET_CHAN_A/B/WORLD\n");
+    scc_chip_t chip;
+    scc_chip_init(&chip, "t8");
+    chip.on_irq = rec_irq;
+    reset_recorders();
+
+    /* Pre-load some state. */
+    wr_reg(&chip, SCC_CH_A, 9, SCC_WR9_MIE);
+    wr_reg(&chip, SCC_CH_A, 1, 0xff);
+    wr_reg(&chip, SCC_CH_B, 1, 0xff);
+    chip.interrupt_pending = SCC_RR3_IP_A_TX | SCC_RR3_IP_B_RX;
+    scc_chip_check_irq(&chip);
+
+    /* RESET_CHAN_A via WR9 = 0x80. */
+    wr_reg(&chip, SCC_CH_A, 9, SCC_WR9_RESET_A);
+    CHECK("RESET_A: WR1 chan A cleared",     chip.wr[SCC_CH_A][1] == 0);
+    CHECK("RESET_A: WR1 chan B untouched",   chip.wr[SCC_CH_B][1] == 0xff);
+    CHECK("RESET_A: chan-A IP cleared",      (chip.interrupt_pending & (SCC_RR3_IP_A_TX|SCC_RR3_IP_A_RX|SCC_RR3_IP_A_STAT)) == 0);
+    CHECK("RESET_A: chan-B IP intact",       (chip.interrupt_pending & SCC_RR3_IP_B_RX) != 0);
+
+    /* RESET_CHAN_B via WR9 = 0x40. */
+    wr_reg(&chip, SCC_CH_B, 9, SCC_WR9_RESET_B);
+    CHECK("RESET_B: WR1 chan B cleared",     chip.wr[SCC_CH_B][1] == 0);
+    CHECK("RESET_B: chan-B IP cleared",      (chip.interrupt_pending & (SCC_RR3_IP_B_TX|SCC_RR3_IP_B_RX|SCC_RR3_IP_B_STAT)) == 0);
+
+    /* RESET_WORLD via WR9 = 0xC0. */
+    wr_reg(&chip, SCC_CH_A, 1, 0xaa);
+    wr_reg(&chip, SCC_CH_B, 1, 0xbb);
+    wr_reg(&chip, SCC_CH_A, 9, SCC_WR9_RESET_HW);
+    CHECK("RESET_WORLD: WR1 chan A cleared", chip.wr[SCC_CH_A][1] == 0);
+    CHECK("RESET_WORLD: WR1 chan B cleared", chip.wr[SCC_CH_B][1] == 0);
+    CHECK("RESET_WORLD: MIE cleared",        chip.master_int_enable == 0);
+    CHECK("RESET_WORLD: IP cleared",         chip.interrupt_pending == 0);
+    CHECK("RESET_WORLD: IRQ dropped",        chip.irq_asserted == 0);
+}
+
+/* =================================================================== */
+/* Test 9 -- IRQ ack drops the line; re-assertion is deferred           */
+/*    Contract: ack itself never re-asserts inside the same call.       */
+/*    Doing so creates an immediate high->low->high transition that    */
+/*    the m68k can re-vector into before the current handler runs,     */
+/*    leading to runaway nesting + stack overflow on real boots.       */
+/*    The line goes back high on the next state-changing operation     */
+/*    (chip_check_irq from a register write, in_push, or update).      */
+/* =================================================================== */
+static void test_ack_reasserts(void)
+{
+    fprintf(stderr, "[test 9] ack drops IRQ; re-assertion is deferred\n");
+    scc_chip_t chip;
+    scc_chip_init(&chip, "t9");
+    chip.on_irq = rec_irq;
+    reset_recorders();
+
+    chip.master_int_enable = 1;
+    chip.interrupt_pending = SCC_RR3_IP_A_TX | SCC_RR3_IP_A_RX;
+    scc_chip_check_irq(&chip);
+    CHECK("setup: IRQ asserted",             chip.irq_asserted == 1);
+    CHECK("setup: irq_changes = 1",          irq_changes == 1);
+
+    /* Ack -- drops the line; sources still pending but line stays low. */
+    int vec = scc_chip_ack(&chip);
+    CHECK("ack: returns autovector",         vec == M68K_INT_ACK_AUTOVECTOR);
+    CHECK("ack: IRQ dropped",                chip.irq_asserted == 0);
+    CHECK("ack: irq_changes = 2 (raise+drop)", irq_changes == 2);
+
+    /* Sources still in interrupt_pending. */
+    CHECK("ack leaves IP intact",
+          chip.interrupt_pending == (SCC_RR3_IP_A_TX | SCC_RR3_IP_A_RX));
+
+    /* Next state-changing op re-asserts.  Use scc_chip_update which
+       any sim main-loop pump call would do. */
+    scc_chip_update(&chip);
+    CHECK("post-ack update re-asserts",      chip.irq_asserted == 1);
+
+    /* Now clear remaining sources via WR0 RESET_TXINT + manual RX clear. */
+    scc_chip_write(&chip, 0x4, 0x28);                /* RESET_TXINT chan A */
+    chip.interrupt_pending &= ~SCC_RR3_IP_A_RX;
+    scc_chip_check_irq(&chip);
+    CHECK("after clear: IRQ dropped",        chip.irq_asserted == 0);
+}
+
+/* =================================================================== */
+/* Test 10 -- legacy shim: scc_in_push(3, ...) goes to kbd chip A      */
+/* =================================================================== */
+static void test_legacy_shim(void)
+{
+    fprintf(stderr, "[test 10] legacy global API -> per-chip routing\n");
+    /* shim_init resets g_scc_serial and g_scc_kbd. */
+    g_scc_serial.init_done = 0;
+    g_scc_kbd.init_done    = 0;
+    shim_inited = 0;
+    shim_init();
+
+    scc_in_push(3, 0xab);   /* legacy ch=3 = kbd chan A */
+    CHECK("legacy ch=3 -> g_scc_kbd chan A FIFO has 1 byte",
+          g_scc_kbd.ififo[SCC_CH_A].count == 1);
+    CHECK("legacy ch=3 byte = 0xab",
+          g_scc_kbd.ififo[SCC_CH_A].buf[0] == 0xab);
+    CHECK("legacy ch=3 does NOT touch g_scc_serial",
+          g_scc_serial.ififo[SCC_CH_A].count == 0
+       && g_scc_serial.ififo[SCC_CH_B].count == 0);
+
+    scc_in_push(0, 0xcd);   /* legacy ch=0 = serial chan B = ttyb */
+    CHECK("legacy ch=0 -> g_scc_serial chan B FIFO has 1 byte",
+          g_scc_serial.ififo[SCC_CH_B].count == 1);
+    CHECK("legacy ch=0 byte = 0xcd",
+          g_scc_serial.ififo[SCC_CH_B].buf[0] == 0xcd);
+}
+
+/* =================================================================== */
+/* Test 11 -- regression: per-chip MIE is independent                   */
+/*    The original bug: a single global scc_int_pending bit blocked    */
+/*    the serial chip from asserting while the kbd chip was active.    */
+/* =================================================================== */
+static void test_chip_independence(void)
+{
+    fprintf(stderr, "[test 11] two chips assert IRQ independently\n");
+    scc_chip_t kbd, ser;
+    scc_chip_init(&kbd, "kbd");
+    scc_chip_init(&ser, "ser");
+    kbd.on_irq = rec_irq;
+    ser.on_irq = rec_irq;
+    reset_recorders();
+
+    kbd.master_int_enable = 1;
+    ser.master_int_enable = 1;
+
+    /* kbd chip raises an IRQ; serial then raises -- both should fire
+       independently and each should track its own irq_asserted state. */
+    kbd.interrupt_pending = SCC_RR3_IP_A_RX;
+    scc_chip_check_irq(&kbd);
+    CHECK("kbd asserts",                     kbd.irq_asserted == 1);
+
+    ser.interrupt_pending = SCC_RR3_IP_A_TX;
+    scc_chip_check_irq(&ser);
+    CHECK("ser asserts independently",       ser.irq_asserted == 1);
+    CHECK("kbd still asserted",              kbd.irq_asserted == 1);
+
+    /* Drop kbd via ack + clear -- ser should remain asserted. */
+    kbd.interrupt_pending = 0;
+    scc_chip_check_irq(&kbd);
+    CHECK("kbd dropped after clear",         kbd.irq_asserted == 0);
+    CHECK("ser STILL asserted (independence)", ser.irq_asserted == 1);
+}
+
+/* =================================================================== */
+/* Test 12 -- WR2 vector is chip-wide                                   */
+/* =================================================================== */
+static void test_wr2_chip_wide(void)
+{
+    fprintf(stderr, "[test 12] WR2 is chip-wide (write A reads B)\n");
+    scc_chip_t chip;
+    scc_chip_init(&chip, "t12");
+
+    wr_reg(&chip, SCC_CH_A, 2, 0x77);
+    CHECK("WR2 stored",                      chip.interrupt_vector == 0x77);
+
+    /* Read RR2 from chan A = unmodified */
+    unsigned int v = rd_reg(&chip, SCC_CH_A, 2);
+    CHECK("RR2 chan A returns WR2",          v == 0x77);
 }
 
 int main(void)
 {
-    fprintf(stderr, "===== scc.c unit tests =====\n");
-    test_bug1_wr13_no_rr9_clobber();
-    test_bug2_wr15_no_rr11_clobber();
-    test_bug3_rr2_chip_pair();
-    test_bug4_rr3_ip_bits();
-    test_bug5_wr9_reset();
+    fprintf(stderr, "===== scc.c per-instance unit tests =====\n");
+    test_init();
+    test_mie_gates_irq();
+    test_tx_int();
+    test_wr0_reset_txint();
+    test_rx_int();
+    test_rr2_modified_vector();
+    test_rr3_chan_only();
+    test_wr9_resets();
+    test_ack_reasserts();
+    test_legacy_shim();
+    test_chip_independence();
+    test_wr2_chip_wide();
     fprintf(stderr, "===== %d/%d passed (%d failed) =====\n",
             g_total - g_failed, g_total, g_failed);
     return g_failed == 0 ? 0 : 1;
 }
 
 /* ============================================================
- * Stubs for the parts of the emulator scc.c references that we
- * don't want pulled in for a unit test.
+ * Stubs -- replace bits of the bigger sim we don't link in.
  * ============================================================ */
 
-int quiet = 1;                  /* silence !quiet printfs */
+int quiet = 1;
 
 void int_controller_set(unsigned int n)   { (void)n; }
 void int_controller_clear(unsigned int n) { (void)n; }
