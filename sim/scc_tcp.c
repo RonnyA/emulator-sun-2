@@ -159,10 +159,118 @@ void scc_tcp_poll(void)
     pthread_mutex_unlock(&input_lock);
 }
 
+/* ───── telnet IAC negotiation ─────
+ * RFC 854/857/858.  We act as a server that:
+ *   - WILL ECHO            -- tells the client "I will echo your input",
+ *                              which makes telnet stop local-echoing so
+ *                              the user only sees what SunOS echoes back.
+ *   - WILL SUPPRESS_GO_AHEAD + DO SUPPRESS_GO_AHEAD
+ *                           -- character-at-a-time mode (kills line mode).
+ *
+ * On the inbound side we need a small state machine that swallows IAC
+ * sequences so client-initiated negotiations don't end up as garbage
+ * characters in SunOS's tty input.  We respond minimally:
+ *   - DO  ECHO / DO  SUPPRESS_GO_AHEAD  -> already WILL'd, ignore.
+ *   - DONT X / WONT X                   -> ignore.
+ *   - WILL X / DO X (anything else)     -> reply DONT/WONT to refuse.
+ *   - SB ... SE                         -> swallow.
+ */
+#define IAC  255
+#define DONT 254
+#define DO   253
+#define WONT 252
+#define WILL 251
+#define SB   250
+#define SE   240
+
+#define TELOPT_ECHO 1
+#define TELOPT_SGA  3
+
+static void send_iac3(sock_t cfd, uint8_t a, uint8_t b, uint8_t c)
+{
+    uint8_t pkt[3] = { a, b, c };
+    send(cfd, (const char *)pkt, 3, MSG_NOSIGNAL);
+}
+
+static void send_telnet_init(sock_t cfd)
+{
+    /* Server-initiated negotiation -- order matches what most BSDs send. */
+    send_iac3(cfd, IAC, WILL, TELOPT_ECHO);
+    send_iac3(cfd, IAC, WILL, TELOPT_SGA);
+    send_iac3(cfd, IAC, DO,   TELOPT_SGA);
+}
+
+/* Per-connection IAC parser state. */
+typedef enum {
+    IAC_NORMAL = 0,
+    IAC_GOT_IAC,           /* saw IAC, expecting cmd */
+    IAC_GOT_CMD,           /* saw IAC + WILL/WONT/DO/DONT, expecting opt */
+    IAC_IN_SB,             /* inside SB ... SE subnegotiation */
+    IAC_IN_SB_GOT_IAC,     /* inside SB, saw IAC -- next byte is cmd or escaped IAC */
+} iac_state_t;
+
+/* Process one byte through the IAC parser.  Returns 1 if the byte
+   should be passed through to SunOS, 0 if it was consumed by IAC. */
+static int iac_feed(sock_t cfd, iac_state_t *st, uint8_t *cmd, uint8_t b)
+{
+    switch (*st) {
+    case IAC_NORMAL:
+        if (b == IAC) { *st = IAC_GOT_IAC; return 0; }
+        return 1;
+    case IAC_GOT_IAC:
+        if (b == IAC) { *st = IAC_NORMAL; return 1; }    /* escaped 0xFF -> data */
+        if (b == WILL || b == WONT || b == DO || b == DONT) {
+            *cmd = b;
+            *st  = IAC_GOT_CMD;
+            return 0;
+        }
+        if (b == SB) { *st = IAC_IN_SB; return 0; }
+        /* Other 2-byte commands (NOP, DM, BRK, IP, AO, AYT, EC, EL, GA) */
+        *st = IAC_NORMAL;
+        return 0;
+    case IAC_GOT_CMD: {
+        uint8_t reply_cmd = 0;
+        switch (*cmd) {
+        case WILL:
+            /* Client wants to do option `b`.  Refuse all except SGA. */
+            reply_cmd = (b == TELOPT_SGA) ? DO : DONT;
+            send_iac3(cfd, IAC, reply_cmd, b);
+            break;
+        case DO:
+            /* Client wants us to do option `b`.  We already advertised
+               WILL ECHO + WILL SGA in send_telnet_init; reply WONT for
+               anything else so the client stops asking. */
+            if (b != TELOPT_ECHO && b != TELOPT_SGA)
+                send_iac3(cfd, IAC, WONT, b);
+            break;
+        case WONT: case DONT:
+            /* Client refusing/disabling -- just acknowledge by not
+               continuing to advertise.  We don't track per-option state
+               so this is a no-op; safe because we initiate options that
+               telnet always accepts. */
+            break;
+        }
+        *st = IAC_NORMAL;
+        return 0;
+    }
+    case IAC_IN_SB:
+        if (b == IAC) *st = IAC_IN_SB_GOT_IAC;
+        return 0;
+    case IAC_IN_SB_GOT_IAC:
+        if (b == SE) *st = IAC_NORMAL;       /* end of subneg */
+        else         *st = IAC_IN_SB;        /* IAC IAC = literal 0xFF inside SB; ignore */
+        return 0;
+    }
+    return 0;
+}
+
 /* ───── server thread ───── */
 
 static void serve_client(sock_t cfd)
 {
+    iac_state_t iac_st  = IAC_NORMAL;
+    uint8_t     iac_cmd = 0;
+
     /* select() loop: 50 ms timeout so we can drain output_buf without
        blocking on read forever. */
     while (!shutdown_request) {
@@ -179,9 +287,11 @@ static void serve_client(sock_t cfd)
             if (n <= 0) break;        /* client disconnected */
             bytes_from_client += n;
             pthread_mutex_lock(&input_lock);
-            for (int i = 0; i < n; i++)
-                rb_put(input_buf, SCC_TCP_IN_SIZE, &input_head, input_tail,
-                       (uint8_t)buf[i]);
+            for (int i = 0; i < n; i++) {
+                if (iac_feed(cfd, &iac_st, &iac_cmd, (uint8_t)buf[i]))
+                    rb_put(input_buf, SCC_TCP_IN_SIZE,
+                           &input_head, input_tail, (uint8_t)buf[i]);
+            }
             pthread_mutex_unlock(&input_lock);
             if (scc_tcp_trace)
                 fprintf(stderr, "scc-tcp: recv %d bytes from client\n", n);
@@ -230,6 +340,12 @@ static void *server_thread_func(void *arg)
         snprintf(addr, sizeof(addr), "%s:%u",
                  inet_ntoa(caddr.sin_addr), (unsigned)ntohs(caddr.sin_port));
         fprintf(stderr, "scc-tcp: client connected from %s\n", addr);
+
+        /* Telnet IAC negotiation: WILL ECHO + WILL/DO SGA.  Sent before
+           the greeting so a real telnet client switches to remote-echo
+           character-at-a-time mode immediately and the user doesn't see
+           their keystrokes echoed twice during login. */
+        send_telnet_init(cfd);
 
         /* Greeting */
         const char *hi =
