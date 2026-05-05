@@ -136,11 +136,18 @@ static uint8_t  s_intreg;
      bit 6 = ENABLE_INT (R/W)
      bit 5 = PAR_TEST
      bit 4 = PAR_ENABLE
-     bits 3:0 = ERR_MASK (read-only)
-   The POST validation test (LED 0xF1) writes 0x40 and reads back the
-   high nibble; expects 0x40.  Storing the byte verbatim satisfies
-   that without modeling parity-error generation. */
+     bits 3:0 = ERR_MASK (read-only, lane indicator) */
+#define SUN3_MEMERR_INT_ACTIVE  0x80
+#define SUN3_MEMERR_ENABLE_INT  0x40
+#define SUN3_MEMERR_PAR_TEST    0x20
+#define SUN3_MEMERR_PAR_ENABLE  0x10
+#define SUN3_MEMERR_ERR_MASK    0x0F
 static uint8_t  s_memerr;
+/* Parity-test flag: set on a RAM write while PAR_TEST is on, checked
+   on the next RAM read with PAR_ENABLE on (per C# line 2258).  This
+   is the load-bearing piece of POST stage 0xF0 ("Memory parity error
+   test"). */
+static int      s_parity_test_written;
 
 /* Clock IRQ pending from ICM7170 (gated to IPL 5 or 7 by intreg). */
 static int      s_clock_pending;
@@ -673,9 +680,27 @@ static void sun3_obio_write(uint32_t pa, uint32_t value, int size)
         s_intreg = (uint8_t)value;
         sun3_intreg_eval();
         break;
-    case 0x080000:   /* memerr */
+    case 0x080000: {
+        /* MEMERR CSR at offset 0; latched VA register at offset 4.
+           A write to offset 4 (any value) acks the parity NMI -- per
+           PROM success path at 0x0FEFB56C which writes 0 to (FFF4004)
+           after handling the parity exception.  Writes to CSR (offset
+           0) update the value but DO NOT clear the latched parity
+           condition in RAM (which the C# tracks via _parityTestWritten
+           independently of the CSR). */
+        if (off == 0x04) {
+            /* Ack the latched parity error. */
+            s_memerr &= ~SUN3_MEMERR_INT_ACTIVE;
+            s_memerr &= ~SUN3_MEMERR_ERR_MASK;
+            s_parity_test_written = 0;
+            int_controller_clear(7);
+            break;
+        }
         s_memerr = (uint8_t)value;
+        if (!(s_memerr & SUN3_MEMERR_INT_ACTIVE))
+            int_controller_clear(7);
         break;
+    }
     case 0x100000:   /* PROM mirror is read-only */
     case 0x120000:   /* LANCE not implemented */
     case 0x140000:   /* SI not implemented */
@@ -735,6 +760,18 @@ static unsigned int sun3_cpu_read(int size, unsigned int address)
     case SUN3_PGTYPE_OBMEM: {
         /* RAM is at the bottom of OBMEM. */
         if (pa < MAX_RAM) {
+            /* Parity-error check (POST stage 0xF0).  If a RAM write
+               while PAR_TEST was set primed s_parity_test_written, and
+               PAR_ENABLE is now on, the next RAM read latches a lane
+               error in MEMERR and fires IPL 7.  See C# line 2258. */
+            if (s_parity_test_written
+                && (s_memerr & SUN3_MEMERR_PAR_ENABLE)
+                && !(s_memerr & SUN3_MEMERR_INT_ACTIVE)) {
+                uint8_t lane = (uint8_t)(0x08u >> (pa & 3u));
+                s_memerr |= (uint8_t)(SUN3_MEMERR_INT_ACTIVE | lane);
+                if (s_memerr & SUN3_MEMERR_ENABLE_INT)
+                    int_controller_set(7);
+            }
             if (size == 1) return g_ram[pa];
             if (size == 2) return ((uint32_t)g_ram[pa] << 8) | g_ram[pa + 1];
             return ((uint32_t)g_ram[pa]   << 24) |
@@ -795,6 +832,11 @@ static void sun3_cpu_write(int size, unsigned int address, unsigned int value)
     switch (s_last_pgtype) {
     case SUN3_PGTYPE_OBMEM:
         if (pa < MAX_RAM) {
+            /* If PAR_TEST is armed, this write plants a "bad parity"
+               marker -- the next RAM read with PAR_ENABLE on will
+               fire the parity-error NMI (POST stage 0xF0). */
+            if (s_memerr & SUN3_MEMERR_PAR_TEST)
+                s_parity_test_written = 1;
             if (size == 1)      g_ram[pa] = (uint8_t)value;
             else if (size == 2) { g_ram[pa] = (uint8_t)(value >> 8); g_ram[pa+1] = (uint8_t)value; }
             else                { g_ram[pa]   = (uint8_t)(value >> 24);
