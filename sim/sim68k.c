@@ -2269,6 +2269,8 @@ void m68k_write_memory_32(unsigned int address, unsigned int value)
 /* Sun-2 machine ops: Multibus 68010 with the existing Sun-2 PMMU,
    am9513 timer, mm58167 TOD, 3C400 Ethernet, NCR5380 SCSI on
    Multibus, bwtwo at OBMEM 0x100000. */
+static void sun2_kb_write_v(int v) { sun2_kb_write(v, 1); }
+
 const machine_ops_t sun2_ops = {
   .name           = "sun2",
   .family         = MACH_SUN2,
@@ -2279,6 +2281,7 @@ const machine_ops_t sun2_ops = {
   .cpu_write      = sun2_cpu_write,
   .device_tick    = sun2_device_tick,
   .irq_ack        = sun2_irq_ack,
+  .kb_write       = sun2_kb_write_v,
 };
 
 /* Active machine.  Set once at startup from the --mode CLI flag.

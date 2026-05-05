@@ -1802,8 +1802,15 @@ INLINE void m68ki_exception_buserr(void)
 
 	if(CPU_TYPE_IS_000(CPU_TYPE))
 		/*m68ki_stack_frame_buserr(REG_PC, sr, address, write, instruction, fc)*/;
-	else
+	else if(CPU_TYPE_IS_010(CPU_TYPE))
 		m68ki_stack_frame_1000(pc/*REG_PPC*/, sr, vector, address, write, fc);
+	else
+		/* 68020/030: Format A (short bus fault) — error at instruction
+		 * boundary, pc = restart address.  Format 8 is 68010-specific
+		 * and the 68020 RTE rejects it with a Format Error trap.
+		 * RetroCore C# leaves this as TODO; we generate the proper
+		 * 16-word Format A frame here. */
+		m68ki_stack_frame_1010(sr, vector, pc);
 
 	m68ki_jump_vector(vector);
 

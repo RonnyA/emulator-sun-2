@@ -43,6 +43,14 @@ typedef struct machine_ops_s {
 
     /* Interrupt-ack vector for a given IRQ level. */
     int  (*irq_ack)(int level);
+
+    /* Keyboard SCC TX handler -- called from the SCC shim when the CPU
+       writes a byte to the keyboard channel (zs1 chan A).  Per-machine
+       because Sun-3 needs a different reset response (queue 0xFF/0x04/
+       0x7F + write Type-4 byte directly to RAM at VA 0xFFFFE013) and
+       different auto-abort trigger (post-reset delay countdown vs.
+       Sun-2's bell-off). */
+    void (*kb_write)(int value);
 } machine_ops_t;
 
 extern const machine_ops_t *g_machine;

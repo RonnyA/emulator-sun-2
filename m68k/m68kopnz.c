@@ -3977,8 +3977,61 @@ rte_loop:
 				m68ki_jump(new_pc);
 				m68ki_set_sr(new_sr);
 				return;
+			case 0xa: /* Format A: short bus fault (68020/030) */
+				/* 16-word frame total: SR(1) + PC(2) + format(1) +
+				   12 internal words = 16. */
+				new_sr = m68ki_pull_16();
+				new_pc = m68ki_pull_32();
+				m68ki_fake_pull_16();	/* format word */
+				m68ki_fake_pull_16();	/* internal */
+				m68ki_fake_pull_16();	/* special status */
+				m68ki_fake_pull_16();	/* pipe stage C */
+				m68ki_fake_pull_16();	/* pipe stage B */
+				m68ki_fake_pull_32();	/* data cycle fault address */
+				m68ki_fake_pull_16();	/* internal */
+				m68ki_fake_pull_16();	/* internal */
+				m68ki_fake_pull_32();	/* data output buffer */
+				m68ki_fake_pull_16();	/* internal */
+				m68ki_fake_pull_16();	/* internal */
+				m68ki_jump(new_pc);
+				m68ki_set_sr(new_sr);
+				return;
+			case 0xb: /* Format B: long bus fault (68020/030) */
+				/* 46-word frame total: SR(1) + PC(2) + format(1) +
+				   42 internal words = 46. */
+				new_sr = m68ki_pull_16();
+				new_pc = m68ki_pull_32();
+				m68ki_fake_pull_16();	/* format word */
+				m68ki_fake_pull_16();	/* internal */
+				m68ki_fake_pull_16();	/* special status */
+				m68ki_fake_pull_16();	/* pipe stage C */
+				m68ki_fake_pull_16();	/* pipe stage B */
+				m68ki_fake_pull_32();	/* data cycle fault address */
+				m68ki_fake_pull_16();	/* internal */
+				m68ki_fake_pull_16();	/* internal */
+				m68ki_fake_pull_32();	/* data output buffer */
+				m68ki_fake_pull_32();	/* internal */
+				m68ki_fake_pull_32();	/* internal */
+				m68ki_fake_pull_32();	/* stage B address */
+				m68ki_fake_pull_32();	/* internal */
+				m68ki_fake_pull_32();	/* data input buffer */
+				m68ki_fake_pull_16();	/* internal */
+				m68ki_fake_pull_32();	/* internal */
+				m68ki_fake_pull_16();	/* version */
+				/* 18 words of internal registers (9 longs) */
+				m68ki_fake_pull_32();
+				m68ki_fake_pull_32();
+				m68ki_fake_pull_32();
+				m68ki_fake_pull_32();
+				m68ki_fake_pull_32();
+				m68ki_fake_pull_32();
+				m68ki_fake_pull_32();
+				m68ki_fake_pull_32();
+				m68ki_fake_pull_32();
+				m68ki_jump(new_pc);
+				m68ki_set_sr(new_sr);
+				return;
 		}
-		/* Not handling long or short bus fault */
 		m68ki_exception_format_error();
 		return;
 	}

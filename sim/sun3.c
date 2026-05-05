@@ -126,6 +126,15 @@ static uint8_t  s_buserr;
 
 /* Diagnostic register (front-panel LED display). */
 static uint8_t  s_diag;
+/* Last VA passed to MMU translation -- used by the OBIO 0x100000 PROM
+   mirror (per TME sun3-mmu.c and C# MachineSun3Memory.cs:2630-2641): the
+   PROM alias uses the VIRTUAL address's page frame to form the PROM
+   offset, NOT the physical address.  This is what lets the PROM read
+   its own data tables (e.g. spec-pages at PROM offset 0xd350) through
+   a PTE with PGFRAME=0x80 -- without this, all such reads land on
+   PROM[0..0x1FFF] and the PROM gets wildly wrong data, eventually
+   writing 0x20000000 to pagemap[0] mid-mmu_init_segments and crashing. */
+static uint32_t s_last_va;
 
 /* Interrupt register at OBIO 0x0A0000 (gates all IRQs). */
 static uint8_t  s_intreg;
@@ -424,6 +433,7 @@ static uint32_t sun3_mmu_translate(uint32_t va, unsigned int fc, int is_read)
     s_last_pgtype  = 0;
 
     va &= SUN3_VA_MASK;
+    s_last_va = va;  /* needed by OBIO PROM mirror */
 
     /* Decode VA. */
     uint32_t segindex = (va >> (SUN3_PAGE_LOG2 + 4)) & SUN3_SEG_INDEX_MASK;
@@ -646,9 +656,26 @@ static uint32_t sun3_obio_read(uint32_t pa, int size)
         return s_memerr;
     case 0x0A0000:   /* Interrupt register */
         return s_intreg;
-    case 0x100000:   /* Boot PROM mirror */
-        if (off < SUN3_PROM_SIZE) return g_rom[off];
-        return 0xFF;
+    case 0x100000: {
+        /* Boot PROM mirror at OBIO 0x100000.  Per TME sun3-mmu.c and
+           C# MachineSun3Memory.cs:2630-2641: the PROM alias uses the
+           VIRTUAL address's page frame to form the PROM offset, NOT
+           the physical address.  This lets PTEs like PGFRAME=0x80 map
+           ANY 8KB VA window in the 0xfef0000 range to its corresponding
+           PROM data, which is how the PROM reads its own tables. */
+        uint32_t prom_off = (s_last_va & ((SUN3_PROM_SIZE - 1u) & ~0x1FFFu))
+                          | (s_last_va & 0x1FFFu);
+        prom_off &= (SUN3_PROM_SIZE - 1u);
+        if (prom_off + (uint32_t)size <= SUN3_PROM_SIZE) {
+            if (size == 1) return g_rom[prom_off];
+            if (size == 2) return ((uint32_t)g_rom[prom_off] << 8) | g_rom[prom_off + 1];
+            return ((uint32_t)g_rom[prom_off]   << 24) |
+                   ((uint32_t)g_rom[prom_off+1] << 16) |
+                   ((uint32_t)g_rom[prom_off+2] << 8 ) |
+                              g_rom[prom_off+3];
+        }
+        return 0xFFFFFFFFu;
+    }
     case 0x120000:   /* LANCE Ethernet -- not implemented */
         return 0xFF;
     case 0x140000:   /* SI SCSI board -- not implemented */
@@ -825,7 +852,7 @@ static void sun3_cpu_write(int size, unsigned int address, unsigned int value)
     uint32_t pa = sun3_mmu_translate(address, g_fc, 0);
     if (s_last_fault) {
         s_buserr = s_last_proterr ? SUN3_BUSERR_PROTERR : SUN3_BUSERR_INVALID;
-        pending_buserr();   /* always; see read path comment above */
+        pending_buserr();
         return;
     }
 
@@ -886,6 +913,13 @@ static void sun3_machine_init(void)
     extern void scc_init_traces(void);
     scc_init_traces();
 
+    /* Sun-3 reuses Sun-2's SDL keyboard handler -- the Sun keyboard
+       scancode set is identical, and the SDL→Sun mapping table
+       (map_sdl_to_sun2kb) is filled by sun2_init().  Without this
+       call the table stays zero-initialised and every SDL keypress
+       maps to scancode 0 (= dropped). */
+    sun2_init();
+
     /* Bring the SDL window up at startup so the user sees the
        machine launched, even before the PROM writes any pixels.
        Lazy-init handles the framebuffer pointer + SDL setup. */
@@ -899,10 +933,110 @@ static void sun3_machine_init(void)
    not yet implemented for clock interrupts.  The PROM polls the
    tick counter at OBIO 0x600C2 directly via reads, so an explicit
    tick callback isn't needed for the banner-print phase. */
+static void sun3_auto_abort_tick(void);
 static void sun3_device_tick(void)
 {
     scc_update();
     icm7170_tick();
+    sun3_auto_abort_tick();
+}
+
+/* ============================================================== */
+/*  Keyboard / auto-abort                                          */
+/* ============================================================== */
+/*
+ * Per RetroCore MachineSun3Memory.cs:1775+:
+ *
+ *   - On RESET (cmd 0x01) the PROM expects three bytes back via the
+ *     SCC RX FIFO: 0xFF (reset-ack), 0x04 (Type-4 keyboard layout id),
+ *     0x7F (idle marker).
+ *
+ *   - The PROM ALSO expects to read the keyboard type byte from a
+ *     specific BSS location at VA 0xFFFFE013.  On real hardware the
+ *     NMI handler polls the SCC and stores the byte there, but during
+ *     the keyboard-probe window the PROM hasn't enabled CLK7 in the
+ *     interrupt register, so NMI never fires and the byte is never
+ *     stashed.  Workaround: write 0x04 directly to physical RAM at
+ *     the address VA 0xFFFFE013 maps to.
+ *
+ *   - Bell / LED / click commands (0x02..0x0B) are silent no-ops.
+ *
+ *   - Auto-abort works by starting a delay countdown on the keyboard
+ *     reset response.  When the countdown expires, inject the L1-A
+ *     scancode burst into the keyboard FIFO.  The PROM's keyboard
+ *     state machine at 0x0FEF3B08 only detects L1-A after init has
+ *     completed, hence the delay.
+ */
+extern void scc_in_push(int ch, int v);
+
+#define SUN_KEY_L1   0x01
+#define SUN_KEY_A    0x4D
+#define SUN_KEY_IDLE 0x7F
+
+static int s_auto_abort_enabled;
+static int s_auto_abort_done;
+static int s_auto_abort_countdown;   /* device_tick units; 0 = inactive */
+
+void sun3_set_auto_abort(int enabled) { s_auto_abort_enabled = enabled; }
+
+static void sun3_send_l1a(void)
+{
+    /* Press L1, press A, release A, release L1, idle. */
+    scc_in_push(3, SUN_KEY_L1);
+    scc_in_push(3, SUN_KEY_A);
+    scc_in_push(3, SUN_KEY_A   | 0x80);
+    scc_in_push(3, SUN_KEY_L1  | 0x80);
+    scc_in_push(3, SUN_KEY_IDLE);
+}
+
+static void sun3_kb_write(int v)
+{
+    /* Non-reset commands (bell, LED, click) are silent on real hw. */
+    if (v >= 0x02 && v <= 0x0B) return;
+
+    if (v == 0x01) {
+        /* RESET: reply 0xFF, 0x04, 0x7F via SCC RX. */
+        scc_in_push(3, 0xFF);
+        scc_in_push(3, 0x04);
+        scc_in_push(3, SUN_KEY_IDLE);
+
+        /* Write keyboard type 0x04 directly to RAM at VA 0xFFFFE013
+           because the PROM's NMI handler doesn't fire during this
+           probe window.  Translate via current MMU mapping (FC=5,
+           supervisor data).  Save and restore fault state so we don't
+           clobber an in-flight CPU fault. */
+        {
+            int saved_fault   = s_last_fault;
+            int saved_proterr = s_last_proterr;
+            uint8_t saved_pgtype = s_last_pgtype;
+            uint32_t saved_va = s_last_va;
+
+            uint32_t pa = sun3_mmu_translate(0x0FFFE013u, 5, 0);
+            if (!s_last_fault && pa < MAX_RAM)
+                g_ram[pa] = 0x04;
+
+            s_last_fault   = saved_fault;
+            s_last_proterr = saved_proterr;
+            s_last_pgtype  = saved_pgtype;
+            s_last_va      = saved_va;
+        }
+
+        /* Auto-abort: arm a delay so the L1-A burst lands AFTER the
+           PROM finishes keyboard init and is ready to detect Stop-A.
+           The device_tick fires once per CPU instruction; ~2 M ticks
+           matches the C# countdown. */
+        if (s_auto_abort_enabled && !s_auto_abort_done)
+            s_auto_abort_countdown = 2 * 1000 * 1000;
+    }
+}
+
+static void sun3_auto_abort_tick(void)
+{
+    if (s_auto_abort_countdown <= 0) return;
+    if (--s_auto_abort_countdown == 0 && !s_auto_abort_done) {
+        sun3_send_l1a();
+        s_auto_abort_done = 1;
+    }
 }
 
 /* IRQ acknowledge.  Sun-3/60 routes all IRQs through the interrupt
@@ -925,4 +1059,5 @@ const machine_ops_t sun3_ops = {
     .cpu_write      = sun3_cpu_write,
     .device_tick    = sun3_device_tick,
     .irq_ack        = sun3_irq_ack,
+    .kb_write       = sun3_kb_write,
 };

@@ -26,6 +26,7 @@
 #include "sim68k.h"
 #include "m68k.h"
 #include "sim.h"
+#include "machine.h"
 #include "scc.h"
 #include "scc_tcp.h"
 
@@ -585,8 +586,13 @@ static void shim_expansion_tx(scc_chip_t *chip, int chan, uint8_t byte)
 static void shim_kbd_tx(scc_chip_t *chip, int chan, uint8_t byte)
 {
     (void)chip;
-    /* zs1 chan A = kbd cmd queue.  Chan B = mouse (not modelled). */
-    if (chan == SCC_CH_A) sun2_kb_write(byte, 1);
+    /* zs1 chan A = kbd cmd queue.  Chan B = mouse (not modelled).
+       Dispatch to the per-machine handler -- Sun-3 needs a different
+       reset response than Sun-2 (RAM-side type byte + delayed L1-A). */
+    if (chan == SCC_CH_A) {
+        if (g_machine && g_machine->kb_write) g_machine->kb_write(byte);
+        else                                  sun2_kb_write(byte, 1);
+    }
 }
 
 static int shim_inited = 0;

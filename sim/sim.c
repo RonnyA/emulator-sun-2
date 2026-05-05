@@ -424,10 +424,14 @@ int main(int argc, char **argv)
       quiet++;
       break;
 
-    case 'A':
+    case 'A': {
+      extern void sun3_set_auto_abort(int);
       sun2_set_auto_abort(1);
-      printf("auto-abort enabled (first PROM bell-off → L1-A drops to monitor)\n");
+      sun3_set_auto_abort(1);
+      printf("auto-abort enabled (Sun-2: first PROM bell-off; "
+             "Sun-3: post-keyboard-reset delay → L1-A drops to monitor)\n");
       break;
+    }
 
     case 'R': {
       extern void trace_ring_init(int);
