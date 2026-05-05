@@ -199,7 +199,7 @@ sim68k.o: sim68k.c
 sun2.o: sun2.c
 	$(CC) -c $(CFLAGS) $<
 
-scc_tcp.o: scc_tcp.c scc_tcp.h
+scc_tcp.o: scc_tcp.c scc_tcp.h spsc_q.h
 	$(CC) -c $(CFLAGS) $<
 
 net_bpf.o: net_bpf.c net.h
