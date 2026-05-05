@@ -59,15 +59,21 @@ extern int eprom_size;
 extern const char *g_autotype;
 void sun2_autotype_tick(void);
 
-/* Sun-2 hardware mode — selected by --mode= on the command line.
-   Drives IDPROM machine type, bwtwo CSR JUMPER_HIRES bit, and SDL window size. */
+/* Hardware mode — selected by --mode= on the command line.
+   Covers both Sun-2 and Sun-3 variants in one table.  The struct name
+   stays sun2_mode_t for backwards compatibility with the rest of the
+   Sun-2 code that references it; Sun-3 entries reuse the same fields
+   (hires_jumper is ignored on Sun-3 since the bwtwo P4 register
+   carries display-id there). */
+struct machine_ops_s;
 typedef struct sun2_mode_s {
     const char *name;            /* CLI name */
     unsigned char idprom_machine;/* IDPROM byte 1 */
-    int hires_jumper;            /* CSR bit 8: 0 = 1152x900, 1 = 1024x1024 */
+    int hires_jumper;            /* CSR bit 8 (Sun-2 only) */
     int width;                   /* logical framebuffer width */
     int height;                  /* logical framebuffer height */
     const char *desc;            /* short description for usage/banner */
+    const struct machine_ops_s *ops;  /* per-machine bus / MMU vtable */
 } sun2_mode_t;
 
 extern const sun2_mode_t *g_mode;

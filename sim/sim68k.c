@@ -28,6 +28,7 @@
 #include "sim.h"
 #include "scc.h"
 #include "scc_tcp.h"
+#include "machine.h"
 
 
 /* Read/write macros */
@@ -1156,8 +1157,8 @@ void cpu_set_fc(unsigned int fc)
   g_fc = fc;
 }
 
-/* Called when the CPU acknowledges an interrupt */
-int cpu_irq_ack(int level)
+/* Sun-2 IRQ ack table.  Wired into sun2_ops.irq_ack. */
+static int sun2_irq_ack(int level)
 {
   switch(level)
     {
@@ -1179,6 +1180,13 @@ int cpu_irq_ack(int level)
       return e3c400_device_ack();
     }
   return M68K_INT_ACK_SPURIOUS;
+}
+
+/* Public dispatcher called by Musashi when the CPU acknowledges an
+   interrupt.  Routes to the active machine's IRQ ack table. */
+int cpu_irq_ack(int level)
+{
+  return g_machine->irq_ack(level);
 }
 
 
@@ -1238,17 +1246,25 @@ void nmi_device_reset(void)
 
 static unsigned int sdl_poll_delay;
 
-void io_update(void)
+/* Sun-2 device ticks.  Called from the top-level io_update via
+   g_machine->device_tick.  Generic concerns (SCC-TCP polling,
+   SDL render throttle) live in io_update itself, not here. */
+static void sun2_device_tick(void)
 {
-
-/* here, do your time-consuming job */
-
   am9513_update();
   mm58167_update();
   scc_update();
   e3c400_update();
   sun2_autotype_tick();
-  scc_tcp_poll();   /* drain bytes from any connected TCP client */
+}
+
+void io_update(void)
+{
+  /* Machine-specific device ticks. */
+  g_machine->device_tick();
+
+  /* Drain bytes from any connected TCP client (machine-agnostic). */
+  scc_tcp_poll();
 
   /* SDL render is wall-clock throttled to 50 fps.  The coarse counter
      bounds how often we call SDL_GetTicks (which would otherwise fire
@@ -1268,11 +1284,20 @@ void io_update(void)
 
 extern void scc_init_traces(void);
 
-void io_init(void)
+/* Sun-2 device init.  Called from io_init via g_machine->init.
+   Generic startup (SCC-TCP listener) lives in io_init itself. */
+static void sun2_machine_init(void)
 {
   e3c400_init();
   sun2_init();
   scc_init_traces();
+}
+
+void io_init(void)
+{
+  /* Machine-specific device init. */
+  g_machine->init();
+
   /* Start the SCC-TCP server if --scc-tcp[=PORT] was given.  If bind
      fails (e.g. another sim.exe is already holding the port -- common
      on Windows where taskkill of the previous sim leaves the FD in
@@ -1516,7 +1541,25 @@ unsigned int cpu_map_address(unsigned int address, unsigned int fc, int m, unsig
 
 extern void m68k_mark_buserr_fixup(unsigned access_address, int access_size);
 
+/* Public bus-read entry point.  Called by Musashi via the macros in
+   m68kconf.h (m68k_read_memory_8 -> cpu_read(1, A), etc.).  Routes to
+   the active machine's bus implementation through g_machine. */
 unsigned int cpu_read(int size, unsigned int address)
+{
+  return g_machine->cpu_read(size, address);
+}
+
+/* Public bus-write entry point. */
+void cpu_write(int size, unsigned int address, unsigned int value)
+{
+  g_machine->cpu_write(size, address, value);
+}
+
+/* Sun-2 specific bus read.  The internal recursion for unaligned 32-bit
+   reads still goes through the public cpu_read dispatcher so a future
+   machine that doesn't split this way works correctly -- but on Sun-2
+   it just lands back here via g_machine. */
+static unsigned int sun2_cpu_read(int size, unsigned int address)
 {
   unsigned int mtype, fault;
   unsigned int pa, value, pte;
@@ -1613,7 +1656,7 @@ unsigned int cpu_read(int size, unsigned int address)
   return value;
 }
 
-void cpu_write(int size, unsigned int address, unsigned int value)
+static void sun2_cpu_write(int size, unsigned int address, unsigned int value)
 {
   unsigned int mtype, fault;
   unsigned int pa, pte;
@@ -2059,7 +2102,7 @@ g_trace = 1;
 #ifndef M68K_V33
   m68k_init();
 #endif
-  m68k_set_cpu_type(M68K_CPU_TYPE_68010);
+  m68k_set_cpu_type(g_machine->m68k_cpu_type);
   m68k_pulse_reset();
 //  m68k_set_reg(M68K_REG_VBR, 0x00ef0000);
 //trace_all();
@@ -2217,6 +2260,30 @@ void m68k_write_memory_32(unsigned int address, unsigned int value)
 
 
 #endif
+
+/* ============================================================== */
+/*  Per-machine vtable bindings                                    */
+/* ============================================================== */
+
+/* Sun-2 machine ops: Multibus 68010 with the existing Sun-2 PMMU,
+   am9513 timer, mm58167 TOD, 3C400 Ethernet, NCR5380 SCSI on
+   Multibus, bwtwo at OBMEM 0x100000. */
+const machine_ops_t sun2_ops = {
+  .name           = "sun2",
+  .family         = MACH_SUN2,
+  .m68k_cpu_type  = M68K_CPU_TYPE_68010,
+  .init           = sun2_machine_init,
+  .reset          = NULL,
+  .cpu_read       = sun2_cpu_read,
+  .cpu_write      = sun2_cpu_write,
+  .device_tick    = sun2_device_tick,
+  .irq_ack        = sun2_irq_ack,
+};
+
+/* Active machine.  Set once at startup from the --mode CLI flag.
+   Defaults to Sun-2 so older command lines without --machine selection
+   keep working unchanged. */
+const machine_ops_t *g_machine = &sun2_ops;
 
 /* Local Variables:  */
 /* mode: c           */

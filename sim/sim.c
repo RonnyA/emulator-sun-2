@@ -41,6 +41,8 @@
 #include "sim.h"
 #include "net.h"
 #include "scc_tcp.h"
+#include "machine.h"
+#include "sun3.h"
 
 const char *g_net_iface = NULL;
 int g_net_dump = 0;
@@ -246,13 +248,14 @@ setup_tape(char *tf)
 }
 
 /* Mode table.  Each entry pins down the machine identity (IDPROM byte 1),
-   the bwtwo CSR JUMPER_HIRES jumper (which the PROM samples to choose
-   resolution at boot), and the corresponding logical FB size. */
+   the bwtwo CSR JUMPER_HIRES jumper (Sun-2 only), the corresponding logical
+   FB size, and the per-machine bus/MMU vtable. */
 static const sun2_mode_t sun2_modes[] = {
-    /* name        idprom hi w     h     description */
-    {"2/120",      0x01,   0, 1152, 900,  "Sun-2/120 Multibus, standard 1152x900 monitor"},
-    {"2/120-hi",   0x01,   1, 1024, 1024, "Sun-2/120 Multibus, hi-res jumper (1024x1024)"},
-    {"2/50",       0x02,   0, 1152, 900,  "Sun-2/50 VME, standard 1152x900 monitor"},
+    /* name        idprom hi w     h     description                                                  ops */
+    {"2/120",      0x01,   0, 1152, 900,  "Sun-2/120 Multibus, standard 1152x900 monitor",            &sun2_ops},
+    {"2/120-hi",   0x01,   1, 1024, 1024, "Sun-2/120 Multibus, hi-res jumper (1024x1024)",            &sun2_ops},
+    {"2/50",       0x02,   0, 1152, 900,  "Sun-2/50 VME, standard 1152x900 monitor",                  &sun2_ops},
+    {"3/60",       0x17,   0, 1152, 900,  "Sun-3/60 desktop, MC68020 + Sun MMU (PROM banner over telnet)", &sun3_ops},
 };
 static const int n_sun2_modes = sizeof(sun2_modes) / sizeof(sun2_modes[0]);
 
@@ -515,7 +518,17 @@ int main(int argc, char **argv)
     printf("mode: %s (idprom_machine=0x%02x, hires_jumper=%d, fb=%dx%d) — %s\n",
            g_mode->name, g_mode->idprom_machine, g_mode->hires_jumper,
            g_mode->width, g_mode->height, g_mode->desc);
-  idprom_setup(g_mode->idprom_machine);
+
+  /* Activate the per-machine bus / MMU vtable.  Default before this
+     line is &sun2_ops (set in sim68k.c at file scope) so older command
+     lines without --mode keep working unchanged. */
+  if (g_mode->ops) g_machine = g_mode->ops;
+
+  /* Machine-specific IDPROM setup. */
+  if (g_machine->family == MACH_SUN3)
+    sun3_idprom_set_machine(g_mode->idprom_machine);
+  else
+    idprom_setup(g_mode->idprom_machine);
 
   if (kernel_arg && boot_arg) {
     setup_kernel(kernel_arg, boot_arg);

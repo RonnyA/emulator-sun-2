@@ -114,7 +114,7 @@ endif
 # ---------------------------------------------------------------------
 # Object list
 # ---------------------------------------------------------------------
-OBJ = sim.o sim68k.o sun2.o scc.o scc_tcp.o am9513.o mm58167.o 3c400.o sc.o scsi.o utils.o \
+OBJ = sim.o sim68k.o sun2.o sun3.o scc.o scc_tcp.o am9513.o mm58167.o 3c400.o sc.o scsi.o utils.o \
 	$(NET_OBJ) \
 	m68kcpu.o m68kops.o m68kopac.o m68kopdm.o m68kopnz.o m68kdasm.o
 
@@ -197,6 +197,9 @@ sim68k.o: sim68k.c
 	$(CC) -c $(CFLAGS) $<
 
 sun2.o: sun2.c
+	$(CC) -c $(CFLAGS) $<
+
+sun3.o: sun3.c sun3.h machine.h
 	$(CC) -c $(CFLAGS) $<
 
 scc_tcp.o: scc_tcp.c scc_tcp.h spsc_q.h

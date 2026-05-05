@@ -57,10 +57,14 @@
 /* ============================= CONFIGURATION ============================ */
 /* ======================================================================== */
 
-/* Turn on if you want to use the following M68K variants */
+/* Turn on if you want to use the following M68K variants.
+   Sun-3/60 needs the 68020 (CACR / VBR / MOVES with byte size to An).
+   EC020 is also enabled because the Musashi macros gate several
+   020-only opcodes on CPU_TYPE_IS_EC020_PLUS, which falls back to 0
+   when EC020 is off. */
 #define M68K_EMULATE_010            OPT_ON
-#define M68K_EMULATE_EC020          OPT_OFF
-#define M68K_EMULATE_020            OPT_OFF
+#define M68K_EMULATE_EC020          OPT_ON
+#define M68K_EMULATE_020            OPT_ON
 
 
 /* If on, the CPU will call m68k_read_immediate_xx() for immediate addressing
