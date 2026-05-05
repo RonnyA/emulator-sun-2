@@ -146,6 +146,73 @@ extern void sdl_set_fbmem(unsigned char *p);
 extern void sdl_init(void);
 
 /* ============================================================== */
+/*  Intersil ICM7170 TOD clock (OBIO 0x060000)                     */
+/* ============================================================== */
+/*
+ * Reference: RetroCore Emulated.HW/Sun/Clock/Intersil7170.cs
+ *
+ * 18 byte-addressable registers at offsets 0x00..0x11.  Sun-3 uses
+ * addrShift = 0 (bus address = register index directly).
+ *
+ *   0x00 CSEC   centiseconds, AUTO-INCREMENTS ON READ -- the PROM
+ *              POST oscillator test reads CSEC twice and checksums;
+ *              if the value doesn't change, oscillator is "stuck"
+ *              and POST fails.  This is the load-bearing register.
+ *   0x01 HOUR   hours (0-23)
+ *   0x02 MIN    minutes
+ *   0x03 SEC    seconds
+ *   0x04 MON, 0x05 DAY, 0x06 YEAR (off from 1968), 0x07 DOW
+ *   0x08-0x0F   alarm compare registers
+ *   0x10 INT    interrupt status (read clears, write sets mask)
+ *   0x11 CMD    command register (write only; reads return 0xFF)
+ *               bit 4 INTENA, bit 3 RUN, bit 2 FMT24, bits 1:0 freq
+ */
+static uint8_t s_icm_regs[18];
+static uint8_t s_icm_cmd;
+static uint8_t s_icm_intmask;
+
+static uint8_t icm7170_read(uint32_t off)
+{
+    if (off >= 18) return 0xFF;
+    if (off == 0x10) {                   /* INT: read clears */
+        uint8_t v = s_icm_regs[0x10];
+        s_icm_regs[0x10] = 0;
+        return v;
+    }
+    if (off == 0x11) return 0xFF;        /* CMD is write-only */
+    if (off == 0x00) {                   /* CSEC auto-increments */
+        s_icm_regs[0x00]++;
+        if (s_icm_regs[0x00] >= 100) s_icm_regs[0x00] = 0;
+    }
+    return s_icm_regs[off];
+}
+
+static void icm7170_write(uint32_t off, uint8_t v)
+{
+    if (off >= 18) return;
+    if (off == 0x10) { s_icm_intmask = v & 0x7F; return; }
+    if (off == 0x11) { s_icm_cmd     = v; return; }
+    s_icm_regs[off] = v;
+}
+
+static void icm7170_reset(void)
+{
+    memset(s_icm_regs, 0, sizeof(s_icm_regs));
+    /* Plausible time-of-day: 1986-06-17 12:00:00.  The PROM normally
+       takes whatever the host gave us, so any sane value is fine. */
+    s_icm_regs[0x00] = 0;        /* CSEC */
+    s_icm_regs[0x01] = 12;       /* HOUR */
+    s_icm_regs[0x02] = 0;        /* MIN  */
+    s_icm_regs[0x03] = 0;        /* SEC  */
+    s_icm_regs[0x04] = 6;        /* MON  */
+    s_icm_regs[0x05] = 17;       /* DAY  */
+    s_icm_regs[0x06] = 18;       /* YEAR (1986 - 1968) */
+    s_icm_regs[0x07] = 2;        /* DOW (Tuesday) */
+    s_icm_cmd     = 0x08 | 0x04 | 0x03; /* RUN + FMT24 + freq=4.194MHz */
+    s_icm_intmask = 0;
+}
+
+/* ============================================================== */
 /*  bwtwo framebuffer (1152x900, 1 bpp)                            */
 /* ============================================================== */
 /*
@@ -457,15 +524,8 @@ static uint32_t sun3_obio_read(uint32_t pa, int size)
     case 0x040000:   /* EEPROM/NVRAM stub -- return 0xFF so PROM sees
                         unconfigured state and falls back to defaults */
         return 0xFF;
-    case 0x060000:   /* Intersil ICM7170 stub */
-        /* PROM polls the tick counter at offset 0xC2 for spin-waits.
-           Return a monotonically increasing byte so loops complete
-           promptly.  Full register set is a follow-up. */
-        if (off == 0xC2) {
-            static uint32_t tick;
-            return (uint32_t)(++tick & 0xFFu);
-        }
-        return 0;
+    case 0x060000:   /* Intersil ICM7170 TOD clock */
+        return icm7170_read(off);
     case 0x080000:   /* Memory error register stub */
         return 0;
     case 0x0A0000:   /* Interrupt register stub -- all bits clear */
@@ -496,7 +556,10 @@ static void sun3_obio_write(uint32_t pa, uint32_t value, int size)
         scc_chip_write(&g_scc_serial, off & 0x0F, (uint8_t)value);
         break;
     case 0x040000:   /* EEPROM stub -- ignore writes */
-    case 0x060000:   /* ICM7170 stub */
+        break;
+    case 0x060000:   /* ICM7170 TOD clock */
+        icm7170_write(off, (uint8_t)value);
+        break;
     case 0x080000:   /* memerr */
     case 0x0A0000:   /* intreg */
     case 0x100000:   /* PROM mirror is read-only */
@@ -640,6 +703,7 @@ static void sun3_machine_init(void)
     s_enable  = 0;       /* NOTBOOT=0 -> boot bypass active */
     s_buserr  = 0;
     s_diag    = 0;
+    icm7170_reset();
 
     /* Initialise SCC chip pair (zs0 console + zs1 keyboard).  The
        existing scc.c shim_init() also wires the TX callbacks
