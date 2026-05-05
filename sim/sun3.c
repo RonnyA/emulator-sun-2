@@ -610,7 +610,12 @@ static unsigned int sun3_cpu_read(int size, unsigned int address)
         s_buserr |= SUN3_BUSERR_VALID;
         if (s_last_proterr) s_buserr |= SUN3_BUSERR_PROTERR;
         else                s_buserr |= SUN3_BUSERR_TIMEOUT;
-        if (s_enable & SUN3_ENABLE_NOTBOOT) pending_buserr();
+        /* Raise bus error UNCONDITIONALLY -- the PROM POST relies on
+           bus errors firing during its RAM-probe and bus-error-validation
+           tests (LED stages 0xF7, 0xF4, 0xF1).  Suppressing in boot mode
+           was wrong; the C# reference (MachineSun3Memory.cs ReadMemory
+           line 2246) raises bus error regardless of NOTBOOT. */
+        pending_buserr();
         return 0;
     }
 
@@ -663,7 +668,7 @@ static void sun3_cpu_write(int size, unsigned int address, unsigned int value)
         s_buserr |= SUN3_BUSERR_VALID;
         if (s_last_proterr) s_buserr |= SUN3_BUSERR_PROTERR;
         else                s_buserr |= SUN3_BUSERR_TIMEOUT;
-        if (s_enable & SUN3_ENABLE_NOTBOOT) pending_buserr();
+        pending_buserr();   /* always; see read path comment above */
         return;
     }
 
