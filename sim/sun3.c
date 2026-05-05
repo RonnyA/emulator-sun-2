@@ -28,6 +28,7 @@
 #include "scc.h"
 #include "scc_tcp.h"
 #include "machine.h"
+#include "sun3_si.h"
 #include "sun3.h"
 
 /* ============================================================== */
@@ -678,8 +679,8 @@ static uint32_t sun3_obio_read(uint32_t pa, int size)
     }
     case 0x120000:   /* LANCE Ethernet -- not implemented */
         return 0xFF;
-    case 0x140000:   /* SI SCSI board -- not implemented */
-        return 0xFF;
+    case 0x140000:   /* SI SCSI board (NCR5380 + onboard DMA) */
+        return sun3_si_read(off, size);
     default:
         return 0xFF;
     }
@@ -730,7 +731,10 @@ static void sun3_obio_write(uint32_t pa, uint32_t value, int size)
     }
     case 0x100000:   /* PROM mirror is read-only */
     case 0x120000:   /* LANCE not implemented */
-    case 0x140000:   /* SI not implemented */
+        break;
+    case 0x140000:   /* SI SCSI board */
+        sun3_si_write(off, value, size);
+        break;
     default:
         break;
     }
@@ -919,6 +923,12 @@ static void sun3_machine_init(void)
        call the table stays zero-initialised and every SDL keypress
        maps to scancode 0 (= dropped). */
     sun2_init();
+
+    /* SI SCSI board (NCR5380 + onboard DMA) at OBIO 0x140000.  The
+       disk image was already attached to scsi.c by setup_disk() in
+       sim.c well before this init runs, so we just need to reset our
+       chip + board register state. */
+    sun3_si_init();
 
     /* Bring the SDL window up at startup so the user sees the
        machine launched, even before the PROM writes any pixels.

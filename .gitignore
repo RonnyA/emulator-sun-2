@@ -23,8 +23,16 @@ dist/
 
 # Runtime-staged media (created by `make sunosNN` / `make run`)
 media/disk/disk.img
+media/disk/disk360.img
+media/disk/HD0.sun360.sunos-4-1-1.img
 media/tape/tape
 media/tape/tape/*
+
+# Test / scratch logs
+*_test.log
+telnet.log
+spam*.log
+fb_snap.pgm
 
 # Claude Code project state
 .claude/

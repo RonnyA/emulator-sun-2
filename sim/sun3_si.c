@@ -1,0 +1,293 @@
+/*
+ * sun3_si.c -- Sun-3/60 SI SCSI board (onboard variant).
+ *
+ * Sits at OBIO 0x140000, IPL 2.  Combines an NCR5380 chip with a small
+ * onboard DMA controller (Sun's "si" board, not the VME variant).
+ *
+ * Register layout (per RetroCore Sun3SIBoard.cs and TME tme/bus/sun3-mainbus):
+ *
+ *   offset  size  name
+ *   0x00..0x07   NCR5380 chip registers (8 byte-wide regs)
+ *   0x08..0x0B  4  DMA address (big-endian u32)
+ *   0x0C..0x0F  4  DMA byte count (big-endian u32)
+ *   0x10..0x11  2  AM9516 UDC data    (chained DMA, optional)
+ *   0x12..0x13  2  AM9516 UDC address (chained DMA, optional)
+ *   0x14..0x15  2  FIFO data
+ *   0x16..0x17  2  FIFO byte count
+ *   0x18..0x19  2  CSR (control / status)
+ *   0x1A..0x1F  6  VME-only registers (BPR, IV/AM) -- ignored on onboard
+ *
+ * SCSI bus + disk side is delegated to the existing scsi.c chip code
+ * (the same code Sun-2's sc.c uses).  This file is just the NCR5380
+ * register decode + DMA glue.
+ *
+ * MVP scope: get the PROM past its si_open() probe so autoboot either
+ * succeeds or fails cleanly into the '>' monitor.  Full read-from-disk
+ * comes after.
+ */
+
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+
+#include "sim68k.h"
+#include "m68k.h"
+#include "sim.h"
+#include "scsi.h"
+#include "sun3_si.h"
+
+/* --- NCR5380 register layout -------------------------------------- */
+#define N5380_CSD          0  /* r: Current SCSI Data        */
+#define N5380_ODR          0  /* w: Output Data Register     */
+#define N5380_ICR          1  /* r/w: Initiator Command Reg  */
+#define N5380_MR           2  /* r/w: Mode Register          */
+#define N5380_TCR          3  /* r/w: Target Command Reg     */
+#define N5380_CSBS         4  /* r: Current SCSI Bus Status  */
+#define N5380_SER          4  /* w: Select Enable Register   */
+#define N5380_BSR          5  /* r: Bus and Status Register  */
+#define N5380_SDS          5  /* w: Start DMA Send           */
+#define N5380_IDR          6  /* r: Input Data Register      */
+#define N5380_SDTR         6  /* w: Start DMA Target Recv    */
+#define N5380_RPI          7  /* r: Reset Parity / Ints      */
+#define N5380_SDIR         7  /* w: Start DMA Initiator Recv */
+
+/* ICR bits */
+#define ICR_RST            0x80
+#define ICR_TEST_MODE      0x40
+#define ICR_DIFF_ENABLE    0x20
+#define ICR_ACK            0x10
+#define ICR_BUSY           0x08
+#define ICR_SEL            0x04
+#define ICR_ATN            0x02
+#define ICR_DATA_BUS       0x01
+
+/* --- SI CSR bits -------------------------------------------------- */
+#define SI_CSR_RESET_CTRL    0x0001
+#define SI_CSR_RESET_FIFO    0x0002
+#define SI_CSR_INT_ENABLE    0x0004
+#define SI_CSR_DMA_SEND      0x0008
+#define SI_CSR_INT_DMA       0x0100
+#define SI_CSR_INT_NCR5380   0x0200
+#define SI_CSR_FIFO_EMPTY    0x0400
+#define SI_CSR_FIFO_FULL     0x0800
+#define SI_CSR_DMA_BUS_ERROR 0x2000
+#define SI_CSR_DMA_CONFLICT  0x4000
+#define SI_CSR_ONBOARD_DMA   0x8000  /* DMA active */
+
+/* --- module state ------------------------------------------------- */
+static uint8_t  s_icr;
+static uint8_t  s_mr;
+static uint8_t  s_tcr;
+static uint8_t  s_ser;
+static uint16_t s_data;        /* SCSI bus data shadow */
+static uint16_t s_csr;
+static uint32_t s_dma_addr;
+static uint32_t s_dma_count;
+static uint16_t s_udc_data;
+static uint16_t s_udc_addr;
+static uint16_t s_fifo_count;
+
+/* Cached SCSI bus state from scsi.c, refreshed on every NCR5380
+   register access. */
+static unsigned int s_bus_state;
+static unsigned int s_bus_irq;
+
+/* Drive scsi.c's bus state machine.  Translate ICR + selected target
+   to SCSI bus output lines, call scsi_update(), latch input state. */
+static void si_pump(void)
+{
+    unsigned int out = 0;
+    if (s_icr & ICR_RST) out |= SCSI_BUS_RST;
+    if (s_icr & ICR_SEL) out |= SCSI_BUS_SEL;
+    if (s_icr & ICR_ACK) out |= SCSI_BUS_ACK;
+    if (s_icr & ICR_ATN) out |= SCSI_BUS_ATN;
+    /* BSY: NCR5380 asserts BSY when it owns the bus (after winning
+       arbitration / during target-mode); for initiator-mode passthrough
+       leave it driven by scsi.c. */
+
+    unsigned int in = 0, irq = 0;
+    uint16_t data16 = s_data;
+    scsi_update(&data16, out, &in, &irq);
+    s_data = data16;
+    s_bus_state = in;
+    s_bus_irq |= irq;
+}
+
+/* Translate SCSI bus state lines into NCR5380's CSBS register layout. */
+static uint8_t si_csbs(void)
+{
+    uint8_t v = 0;
+    if (s_bus_state & SCSI_BUS_RST) v |= 0x80;
+    if (s_bus_state & SCSI_BUS_BSY) v |= 0x40;
+    if (s_bus_state & SCSI_BUS_REQ) v |= 0x20;
+    if (s_bus_state & SCSI_BUS_MSG) v |= 0x10;
+    if (s_bus_state & SCSI_BUS_CD)  v |= 0x08;
+    if (s_bus_state & SCSI_BUS_IO)  v |= 0x04;
+    if (s_bus_state & SCSI_BUS_SEL) v |= 0x02;
+    /* bit 0 = DBP (parity); leave 0 */
+    return v;
+}
+
+/* Bus and Status Register: a mix of phase-match + irq state.  Minimum
+   to keep the PROM moving is to report phase-match when the requested
+   phase (TCR low 3 bits) equals the bus phase (MSG/CD/IO from CSBS). */
+static uint8_t si_bsr(void)
+{
+    uint8_t v = 0;
+    /* bit 7 = End of DMA */
+    /* bit 6 = DMA Request */
+    if (s_bus_state & SCSI_BUS_REQ) v |= 0x40;
+    /* bit 5 = Parity Error */
+    /* bit 4 = IRQ */
+    if (s_bus_irq) v |= 0x10;
+    /* bit 3 = Phase Match */
+    {
+        uint8_t want = s_tcr & 7;
+        uint8_t have = (uint8_t)(((s_bus_state & SCSI_BUS_MSG) ? 4 : 0) |
+                                 ((s_bus_state & SCSI_BUS_CD)  ? 2 : 0) |
+                                 ((s_bus_state & SCSI_BUS_IO)  ? 1 : 0));
+        if (want == have) v |= 0x08;
+    }
+    /* bit 2 = Busy Error */
+    /* bit 1 = ATN */
+    if (s_bus_state & SCSI_BUS_ATN) v |= 0x02;
+    /* bit 0 = ACK */
+    if (s_bus_state & SCSI_BUS_ACK) v |= 0x01;
+    return v;
+}
+
+/* --- public API -------------------------------------------------- */
+
+void sun3_si_init(void)
+{
+    s_icr = 0;
+    s_mr = 0;
+    s_tcr = 0;
+    s_ser = 0;
+    s_data = 0;
+    s_csr = SI_CSR_FIFO_EMPTY;
+    s_dma_addr = 0;
+    s_dma_count = 0;
+    s_udc_data = 0;
+    s_udc_addr = 0;
+    s_fifo_count = 0;
+    s_bus_state = 0;
+    s_bus_irq = 0;
+}
+
+uint32_t sun3_si_read(uint32_t off, int size)
+{
+    /* NCR5380 register window */
+    if (off < 8) {
+        si_pump();                        /* refresh bus snapshot */
+        switch (off) {
+        case N5380_CSD:  return s_data & 0xFF;
+        case N5380_ICR:  return s_icr;
+        case N5380_MR:   return s_mr;
+        case N5380_TCR:  return s_tcr;
+        case N5380_CSBS: return si_csbs();
+        case N5380_BSR:  return si_bsr();
+        case N5380_IDR:  return s_data & 0xFF;
+        case N5380_RPI:  s_bus_irq = 0; return 0;
+        }
+    }
+
+    /* SI DMA / CSR / UDC window */
+    if (off >= 0x08 && off < 0x0C) {
+        int shift = (3 - (int)(off - 0x08)) * 8;
+        return (s_dma_addr >> shift) & 0xFF;
+    }
+    if (off >= 0x0C && off < 0x10) {
+        int shift = (3 - (int)(off - 0x0C)) * 8;
+        return (s_dma_count >> shift) & 0xFF;
+    }
+    if (off == 0x10) return (s_udc_data >> 8) & 0xFF;
+    if (off == 0x11) return s_udc_data & 0xFF;
+    if (off == 0x12) return (s_udc_addr >> 8) & 0xFF;
+    if (off == 0x13) return s_udc_addr & 0xFF;
+    if (off == 0x16) return (s_fifo_count >> 8) & 0xFF;
+    if (off == 0x17) return s_fifo_count & 0xFF;
+    if (off == 0x18) {
+        /* CSR high byte (status side) */
+        return (s_csr >> 8) & 0xFF;
+    }
+    if (off == 0x19) return s_csr & 0xFF;
+
+    return 0xFF;
+}
+
+void sun3_si_write(uint32_t off, uint32_t value, int size)
+{
+    /* NCR5380 register window */
+    if (off < 8) {
+        switch (off) {
+        case N5380_ODR:  s_data = (s_data & 0xFF00) | (value & 0xFF); si_pump(); break;
+        case N5380_ICR:
+            s_icr = (uint8_t)value;
+            /* RST resets the SCSI bus → drop everything. */
+            si_pump();
+            break;
+        case N5380_MR:   s_mr  = (uint8_t)value; si_pump(); break;
+        case N5380_TCR:  s_tcr = (uint8_t)value; si_pump(); break;
+        case N5380_SER:  s_ser = (uint8_t)value; break;
+        case N5380_SDS:
+        case N5380_SDTR:
+        case N5380_SDIR:
+            /* Start DMA: SI DMA controller takes over.  Not yet
+               implemented -- mark DMA_BUS_ERROR so the PROM's si_dma
+               error path runs and it falls out of the boot. */
+            s_csr |= SI_CSR_DMA_BUS_ERROR;
+            break;
+        }
+        return;
+    }
+
+    /* SI DMA / CSR / UDC window */
+    if (off >= 0x08 && off < 0x0C) {
+        int shift = (3 - (int)(off - 0x08)) * 8;
+        s_dma_addr = (s_dma_addr & ~(0xFFu << shift)) | ((value & 0xFF) << shift);
+        return;
+    }
+    if (off >= 0x0C && off < 0x10) {
+        int shift = (3 - (int)(off - 0x0C)) * 8;
+        s_dma_count = (s_dma_count & ~(0xFFu << shift)) | ((value & 0xFF) << shift);
+        return;
+    }
+    if (off == 0x10) { s_udc_data = (s_udc_data & 0x00FF) | ((value & 0xFF) << 8); return; }
+    if (off == 0x11) { s_udc_data = (s_udc_data & 0xFF00) | (value & 0xFF); return; }
+    if (off == 0x12) { s_udc_addr = (s_udc_addr & 0x00FF) | ((value & 0xFF) << 8); return; }
+    if (off == 0x13) { s_udc_addr = (s_udc_addr & 0xFF00) | (value & 0xFF); return; }
+    if (off == 0x16) { s_fifo_count = (s_fifo_count & 0x00FF) | ((value & 0xFF) << 8); return; }
+    if (off == 0x17) { s_fifo_count = (s_fifo_count & 0xFF00) | (value & 0xFF); return; }
+    if (off == 0x18) {
+        /* CSR write: only bits 0..4 are writable on the onboard variant */
+        uint16_t mask = 0x001F;
+        uint16_t newhi = (uint16_t)((value & 0xFF) << 8);
+        s_csr = (s_csr & ~(mask & 0xFF00)) | (newhi & mask);
+        if (s_csr & SI_CSR_RESET_CTRL) {
+            /* Reset the controller: clear status bits, drop SCSI bus. */
+            s_icr = 0;
+            s_mr = 0;
+            s_tcr = 0;
+            s_csr &= 0x001F;            /* preserve writable bits */
+            s_csr |= SI_CSR_FIFO_EMPTY;
+            s_bus_irq = 0;
+            si_pump();
+        }
+        return;
+    }
+    if (off == 0x19) {
+        uint16_t mask = 0x001F;
+        s_csr = (s_csr & ~mask) | (value & mask);
+        if (s_csr & SI_CSR_RESET_CTRL) {
+            s_icr = 0;
+            s_mr = 0;
+            s_tcr = 0;
+            s_csr &= 0x001F;
+            s_csr |= SI_CSR_FIFO_EMPTY;
+            s_bus_irq = 0;
+            si_pump();
+        }
+        return;
+    }
+}
