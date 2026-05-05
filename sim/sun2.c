@@ -505,6 +505,14 @@ void sun2_fb_alloc(void)
   }
 }
 
+/* Point the SDL renderer at an externally-owned framebuffer (for
+   Sun-3 etc.) instead of allocating Sun-2's own.  Caller is expected
+   to call sdl_init() afterwards to bring up the SDL window. */
+void sdl_set_fbmem(unsigned char *p)
+{
+    fbmem = p;
+}
+
 unsigned int sun2_video_read(unsigned int address, int size)
 {
   unsigned int *p32;

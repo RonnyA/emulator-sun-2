@@ -141,6 +141,98 @@ extern scc_chip_t g_scc_kbd;
 /* Pending bus-error helper (provided by sim68k.c). */
 extern void pending_buserr(void);
 
+/* SDL framebuffer hooks (provided by sun2.c). */
+extern void sdl_set_fbmem(unsigned char *p);
+extern void sdl_init(void);
+
+/* ============================================================== */
+/*  bwtwo framebuffer (1152x900, 1 bpp)                            */
+/* ============================================================== */
+/*
+ * Sun-3/60 bwtwo lives on the P4 bus at PA 0xFF000000.  The actual
+ * memory layout per RetroCore's SunBwTwo.cs (Sun-3/60 case in
+ * MachineSun3Memory.cs:648-660):
+ *
+ *   PA 0xFF000000 + 0x000000   VRAM (128 KB; 1152*900/8 = 129 600 bytes)
+ *   PA 0xFF000000 + 0x1C0000   monitor-sense byte: 0x80 = standard
+ *                              1152x900, 0x00 = hires 1600x1280
+ *   PA 0xFF300000              P4 register -- explicitly NOT decoded
+ *                              on real Sun-3/60 hardware; SunOS
+ *                              bwtwo.c probes here, expects bus error,
+ *                              and falls back to the non-P4 path.
+ *
+ * We accept reads/writes anywhere in the 0xFF000000 + 0x200000 window
+ * and route to vram or sense byte; everything else returns 0xFF /
+ * silently absorbs writes (matches "unmapped" behaviour without
+ * raising bus error, which is good enough until SunOS actually probes
+ * 0xFF300000).
+ */
+#define SUN3_BWTWO_BASE        0xFF000000u
+#define SUN3_BWTWO_LEN         0x00200000u
+#define SUN3_BWTWO_FB_SIZE     (128 * 1024)        /* 0x20000 */
+#define SUN3_BWTWO_RES_OFFSET  0x001C0000u          /* monitor sense */
+
+static unsigned char sun3_fbmem[SUN3_BWTWO_FB_SIZE];
+static int           sun3_fb_inited;
+
+static void sun3_fb_lazy_init(void)
+{
+    if (sun3_fb_inited) return;
+    sun3_fb_inited = 1;
+    memset(sun3_fbmem, 0, sizeof(sun3_fbmem));
+    sdl_set_fbmem(sun3_fbmem);
+    sdl_init();
+}
+
+/* Returns 1 if the PA is inside the bwtwo window (caller dispatched
+   the access and should not fall through to "OBMEM unmapped"). */
+static int sun3_bwtwo_read(uint32_t pa, int size, uint32_t *out)
+{
+    if (pa < SUN3_BWTWO_BASE || pa >= SUN3_BWTWO_BASE + SUN3_BWTWO_LEN)
+        return 0;
+    sun3_fb_lazy_init();
+    uint32_t off = pa - SUN3_BWTWO_BASE;
+    if (off < SUN3_BWTWO_FB_SIZE) {
+        if (size == 1) { *out = sun3_fbmem[off]; return 1; }
+        if (size == 2) { *out = ((uint32_t)sun3_fbmem[off] << 8)
+                              |  sun3_fbmem[off + 1]; return 1; }
+        *out = ((uint32_t)sun3_fbmem[off]   << 24)
+             | ((uint32_t)sun3_fbmem[off+1] << 16)
+             | ((uint32_t)sun3_fbmem[off+2] << 8 )
+             |  sun3_fbmem[off+3];
+        return 1;
+    }
+    if (off >= SUN3_BWTWO_RES_OFFSET && off < SUN3_BWTWO_RES_OFFSET + 4) {
+        /* monitor sense: 0x80 = 1152x900 standard.  Same byte for
+           every read in this 4-byte window (PROM only checks the top
+           bit). */
+        *out = (size == 1) ? 0x80u : 0x80808080u;
+        return 1;
+    }
+    *out = 0xFFFFFFFFu;
+    return 1;
+}
+
+static int sun3_bwtwo_write(uint32_t pa, uint32_t value, int size)
+{
+    if (pa < SUN3_BWTWO_BASE || pa >= SUN3_BWTWO_BASE + SUN3_BWTWO_LEN)
+        return 0;
+    sun3_fb_lazy_init();
+    uint32_t off = pa - SUN3_BWTWO_BASE;
+    if (off < SUN3_BWTWO_FB_SIZE) {
+        if (size == 1)      sun3_fbmem[off] = (uint8_t)value;
+        else if (size == 2) { sun3_fbmem[off]   = (uint8_t)(value >> 8);
+                              sun3_fbmem[off+1] = (uint8_t)value; }
+        else                { sun3_fbmem[off]   = (uint8_t)(value >> 24);
+                              sun3_fbmem[off+1] = (uint8_t)(value >> 16);
+                              sun3_fbmem[off+2] = (uint8_t)(value >> 8);
+                              sun3_fbmem[off+3] = (uint8_t)value; }
+        return 1;
+    }
+    /* monitor sense and other regions: silently absorb. */
+    return 1;
+}
+
 /* ============================================================== */
 /*  IDPROM                                                         */
 /* ============================================================== */
@@ -461,8 +553,7 @@ static unsigned int sun3_cpu_read(int size, unsigned int address)
 
     switch (s_last_pgtype) {
     case SUN3_PGTYPE_OBMEM: {
-        /* RAM is at the bottom of OBMEM.  bwtwo / framebuffer at
-           higher OBMEM addresses (0xFF000000) is a future feature. */
+        /* RAM is at the bottom of OBMEM. */
         if (pa < MAX_RAM) {
             if (size == 1) return g_ram[pa];
             if (size == 2) return ((uint32_t)g_ram[pa] << 8) | g_ram[pa + 1];
@@ -480,6 +571,11 @@ static unsigned int sun3_cpu_read(int size, unsigned int address)
                    ((uint32_t)g_rom[off+1] << 16) |
                    ((uint32_t)g_rom[off+2] << 8 ) |
                     g_rom[off+3];
+        }
+        /* bwtwo at PA 0xFF000000. */
+        {
+            uint32_t v;
+            if (sun3_bwtwo_read(pa, size, &v)) return v;
         }
         return 0xFFFFFFFFu;
     }
@@ -517,7 +613,10 @@ static void sun3_cpu_write(int size, unsigned int address, unsigned int value)
                                   g_ram[pa+1] = (uint8_t)(value >> 16);
                                   g_ram[pa+2] = (uint8_t)(value >> 8);
                                   g_ram[pa+3] = (uint8_t)value; }
+            break;
         }
+        /* bwtwo writes (PA 0xFF000000+). */
+        if (sun3_bwtwo_write(pa, value, size)) break;
         /* Writes to PROM region: silently dropped. */
         break;
     case SUN3_PGTYPE_OBIO:
@@ -548,6 +647,11 @@ static void sun3_machine_init(void)
        want for Sun-3 as well. */
     extern void scc_init_traces(void);
     scc_init_traces();
+
+    /* Bring the SDL window up at startup so the user sees the
+       machine launched, even before the PROM writes any pixels.
+       Lazy-init handles the framebuffer pointer + SDL setup. */
+    sun3_fb_lazy_init();
 
     /* IDPROM is set up in main() before sim68k() runs (machine_type
        is selected by --mode), so we don't touch s_idprom here. */
