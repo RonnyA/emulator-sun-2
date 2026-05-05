@@ -130,6 +130,21 @@ static uint8_t  s_diag;
 /* Interrupt register at OBIO 0x0A0000 (gates all IRQs). */
 static uint8_t  s_intreg;
 
+/* Memory-error register at OBIO 0x080000.  Per C# constants
+   (MachineSun3Memory.cs:421-427):
+     bit 7 = INT_ACTIVE (read-only)
+     bit 6 = ENABLE_INT (R/W)
+     bit 5 = PAR_TEST
+     bit 4 = PAR_ENABLE
+     bits 3:0 = ERR_MASK (read-only)
+   The POST validation test (LED 0xF1) writes 0x40 and reads back the
+   high nibble; expects 0x40.  Storing the byte verbatim satisfies
+   that without modeling parity-error generation. */
+static uint8_t  s_memerr;
+
+/* Clock IRQ pending from ICM7170 (gated to IPL 5 or 7 by intreg). */
+static int      s_clock_pending;
+
 /* IDPROM: 32 bytes.  Byte 1 = machine type, byte 14 = XOR checksum
    over bytes 0..13 (and 15..30 are mostly serial / date / scratch). */
 static uint8_t  s_idprom[32];
@@ -191,12 +206,17 @@ static uint8_t s_icm_regs[18];
 static uint8_t s_icm_cmd;
 static uint8_t s_icm_intmask;
 
+/* Forward decl -- intreg eval is below. */
+static void sun3_intreg_eval(void);
+
 static uint8_t icm7170_read(uint32_t off)
 {
     if (off >= 18) return 0xFF;
     if (off == 0x10) {                   /* INT: read clears */
         uint8_t v = s_icm_regs[0x10];
         s_icm_regs[0x10] = 0;
+        s_clock_pending = 0;             /* clock IRQ cleared by ack */
+        sun3_intreg_eval();
         return v;
     }
     if (off == 0x11) return 0xFF;        /* CMD is write-only */
@@ -211,8 +231,33 @@ static void icm7170_write(uint32_t off, uint8_t v)
 {
     if (off >= 18) return;
     if (off == 0x10) { s_icm_intmask = v & 0x7F; return; }
-    if (off == 0x11) { s_icm_cmd     = v; return; }
+    if (off == 0x11) {
+        s_icm_cmd = v;
+        /* INTENA may have changed -- re-eval pending IRQ. */
+        sun3_intreg_eval();
+        return;
+    }
     s_icm_regs[off] = v;
+}
+
+/* Periodic ICM7170 tick.  Called from sun3_device_tick on every CPU
+   instruction; after a configurable counter, fires the HSEC interrupt
+   if CMD.INTENA + intmask.HSEC are both set.  Counter chosen so the
+   POST clock test (LED 0xF5) sees an IRQ within its busy-wait window
+   of ~16M iterations. */
+#define SUN3_ICM_HSEC_PERIOD 4096u
+
+static void icm7170_tick(void)
+{
+    static unsigned int counter;
+    if (++counter < SUN3_ICM_HSEC_PERIOD) return;
+    counter = 0;
+    if ((s_icm_cmd & 0x10) == 0) return;           /* INTENA off */
+    if ((s_icm_intmask & 0x02) == 0) return;       /* HSEC mask off */
+    /* Set INT.HSEC + INT.PENDING and fire CLOCK signal toward intreg. */
+    s_icm_regs[0x10] |= 0x02 | 0x80;
+    s_clock_pending = 1;
+    sun3_intreg_eval();
 }
 
 static void icm7170_reset(void)
@@ -539,6 +584,8 @@ static void sun3_ctl_write(uint32_t address, uint32_t value, int size)
  * timer interrupt to IPL 5/7.
  */
 static uint8_t s_intreg_irq_state;  /* bitmask of currently-asserted IPLs */
+/* s_clock_pending is declared earlier (just below s_diag) so the
+   ICM7170 helpers can reference it. */
 
 static void sun3_intreg_eval(void)
 {
@@ -548,17 +595,22 @@ static void sun3_intreg_eval(void)
         if (s_intreg & SUN3_IREG_SOFT_INT_1) want |= (1u << 1);
         if (s_intreg & SUN3_IREG_SOFT_INT_2) want |= (1u << 2);
         if (s_intreg & SUN3_IREG_SOFT_INT_3) want |= (1u << 3);
+        /* Clock IRQ from ICM7170 -- gated by CLOCK_ENAB_5 (IPL 5) or
+           CLOCK_ENAB_7 (IPL 7, NMI).  POST stage 0xF5 routes via 5. */
+        if (s_clock_pending && (s_intreg & SUN3_IREG_CLOCK_ENAB_5))
+            want |= (1u << 5);
+        if (s_clock_pending && (s_intreg & SUN3_IREG_CLOCK_ENAB_7))
+            want |= (1u << 7);
     }
-    /* Edge transitions per IPL: assert what's newly set, clear what's
-       newly cleared.  Levels 5 and 7 are driven by the ICM7170 (TODO). */
-    for (int lvl = 1; lvl <= 3; lvl++) {
+    /* Edge transitions per IPL. */
+    for (int lvl = 1; lvl <= 7; lvl++) {
         uint8_t bit = (1u << lvl);
         if ((want & bit) && !(s_intreg_irq_state & bit))
             int_controller_set(lvl);
         else if (!(want & bit) && (s_intreg_irq_state & bit))
             int_controller_clear(lvl);
     }
-    s_intreg_irq_state = (s_intreg_irq_state & ~0x0E) | (want & 0x0E);
+    s_intreg_irq_state = want;
 }
 
 /* ============================================================== */
@@ -583,8 +635,8 @@ static uint32_t sun3_obio_read(uint32_t pa, int size)
         return 0xFF;
     case 0x060000:   /* Intersil ICM7170 TOD clock */
         return icm7170_read(off);
-    case 0x080000:   /* Memory error register stub */
-        return 0;
+    case 0x080000:   /* Memory error register */
+        return s_memerr;
     case 0x0A0000:   /* Interrupt register */
         return s_intreg;
     case 0x100000:   /* Boot PROM mirror */
@@ -622,6 +674,8 @@ static void sun3_obio_write(uint32_t pa, uint32_t value, int size)
         sun3_intreg_eval();
         break;
     case 0x080000:   /* memerr */
+        s_memerr = (uint8_t)value;
+        break;
     case 0x100000:   /* PROM mirror is read-only */
     case 0x120000:   /* LANCE not implemented */
     case 0x140000:   /* SI not implemented */
@@ -806,6 +860,7 @@ static void sun3_machine_init(void)
 static void sun3_device_tick(void)
 {
     scc_update();
+    icm7170_tick();
 }
 
 /* IRQ acknowledge.  Sun-3/60 routes all IRQs through the interrupt
