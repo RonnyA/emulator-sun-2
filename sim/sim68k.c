@@ -377,11 +377,12 @@ void io_write(int size, unsigned int pa, unsigned int value)
 #define SUN2_BUSERROR_VMEBUSERR	0x40
 #define SUN2_BUSERROR_VALID	0x80
 
-#if 1
-#define INTS_ENABLED	(sysen_reg & SUN2_SYSENABLE_EN_INT)
-#else
-#define INTS_ENABLED	(1)
-#endif
+/* IRQ gating.  On Sun-2 the system-enable register's EN_INT bit gates
+   all IRQs centrally.  On Sun-3 the equivalent gating happens inside
+   the OBIO interrupt register (0x0A0000) before int_controller_set is
+   called -- so for Sun-3 we always let IRQs through here. */
+#define INTS_ENABLED \
+    (g_machine->family == MACH_SUN2 ? (sysen_reg & SUN2_SYSENABLE_EN_INT) : 1)
 
 
 unsigned int buserr_reg;

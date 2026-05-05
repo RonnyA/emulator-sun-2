@@ -78,13 +78,26 @@
 #define SUN3_ENABLE_FPP         0x40
 #define SUN3_ENABLE_NOTBOOT     0x80
 
-/* Bus error register bits. */
-#define SUN3_BUSERR_PARERR_L    0x01
-#define SUN3_BUSERR_PARERR_U    0x02
-#define SUN3_BUSERR_TIMEOUT     0x04
-#define SUN3_BUSERR_PROTERR     0x08
-#define SUN3_BUSERR_VMEBUSERR   0x40
-#define SUN3_BUSERR_VALID       0x80
+/* Interrupt register bits at OBIO 0x0A0000.  Per C# MachineSun3Memory.cs:413. */
+#define SUN3_IREG_INTS_ENAB     0x01
+#define SUN3_IREG_SOFT_INT_1    0x02
+#define SUN3_IREG_SOFT_INT_2    0x04
+#define SUN3_IREG_SOFT_INT_3    0x08
+#define SUN3_IREG_VIDEO_ENAB    0x10
+#define SUN3_IREG_CLOCK_ENAB_5  0x20
+#define SUN3_IREG_CLOCK_ENAB_7  0x80
+
+/* Bus error register bits.  Per C# MachineSun3Memory.cs:502-508 -- these
+   are the actual Sun-3-specific bits (NOT the generic BusErrorFlags enum
+   in HelperEnum.cs which uses a different layout).  The PROM POST RAM
+   probe checks (BUSERR & 0xFC) == 0x20 -- i.e. it expects TIMEOUT=0x20. */
+#define SUN3_BUSERR_WATCHDOG    0x01    /* bit 0: Watchdog or user reset */
+#define SUN3_BUSERR_FPAENERR    0x04    /* bit 2: FPA enable error */
+#define SUN3_BUSERR_FPABERR     0x08    /* bit 3: FPA bus error */
+#define SUN3_BUSERR_VMEBUSERR   0x10    /* bit 4: VME bus error */
+#define SUN3_BUSERR_TIMEOUT     0x20    /* bit 5: address nonexistent */
+#define SUN3_BUSERR_PROTERR     0x40    /* bit 6: MMU protection error */
+#define SUN3_BUSERR_INVALID     0x80    /* bit 7: MMU page invalid */
 
 /* PROM placement.  PROM is mapped at PA 0x0FEF0000 (size 64 KB) by
    convention; in boot mode (NOTBOOT=0) FC=6 reads bypass the MMU and
@@ -114,6 +127,9 @@ static uint8_t  s_buserr;
 /* Diagnostic register (front-panel LED display). */
 static uint8_t  s_diag;
 
+/* Interrupt register at OBIO 0x0A0000 (gates all IRQs). */
+static uint8_t  s_intreg;
+
 /* IDPROM: 32 bytes.  Byte 1 = machine type, byte 14 = XOR checksum
    over bytes 0..13 (and 15..30 are mostly serial / date / scratch). */
 static uint8_t  s_idprom[32];
@@ -140,6 +156,10 @@ extern scc_chip_t g_scc_kbd;
 
 /* Pending bus-error helper (provided by sim68k.c). */
 extern void pending_buserr(void);
+
+/* CPU-side interrupt controller (provided by sim68k.c). */
+extern void int_controller_set(unsigned int value);
+extern void int_controller_clear(unsigned int value);
 
 /* SDL framebuffer hooks (provided by sun2.c). */
 extern void sdl_set_fbmem(unsigned char *p);
@@ -505,6 +525,43 @@ static void sun3_ctl_write(uint32_t address, uint32_t value, int size)
 }
 
 /* ============================================================== */
+/*  Interrupt routing                                              */
+/* ============================================================== */
+/*
+ * Sun-3 routes all IRQs through OBIO 0x0A0000 (the interrupt
+ * register).  The PROM POST stage 0xF6 (Software interrupt level 1)
+ * tests this by writing INTS_ENAB | SOFT_INT_1 to the register and
+ * waiting for the level-1 IRQ to fire.
+ *
+ * Per RetroCore MachineSun3Memory.cs:412+, the soft-int bits gate
+ * directly: SOFT_INT_1 + INTS_ENAB → IPL 1, SOFT_INT_2 → IPL 2,
+ * SOFT_INT_3 → IPL 3.  Clock bits CLOCK_ENAB_5/7 gate the ICM7170's
+ * timer interrupt to IPL 5/7.
+ */
+static uint8_t s_intreg_irq_state;  /* bitmask of currently-asserted IPLs */
+
+static void sun3_intreg_eval(void)
+{
+    int ints_on = (s_intreg & SUN3_IREG_INTS_ENAB) != 0;
+    uint8_t want = 0;
+    if (ints_on) {
+        if (s_intreg & SUN3_IREG_SOFT_INT_1) want |= (1u << 1);
+        if (s_intreg & SUN3_IREG_SOFT_INT_2) want |= (1u << 2);
+        if (s_intreg & SUN3_IREG_SOFT_INT_3) want |= (1u << 3);
+    }
+    /* Edge transitions per IPL: assert what's newly set, clear what's
+       newly cleared.  Levels 5 and 7 are driven by the ICM7170 (TODO). */
+    for (int lvl = 1; lvl <= 3; lvl++) {
+        uint8_t bit = (1u << lvl);
+        if ((want & bit) && !(s_intreg_irq_state & bit))
+            int_controller_set(lvl);
+        else if (!(want & bit) && (s_intreg_irq_state & bit))
+            int_controller_clear(lvl);
+    }
+    s_intreg_irq_state = (s_intreg_irq_state & ~0x0E) | (want & 0x0E);
+}
+
+/* ============================================================== */
 /*  OBIO dispatch (post-MMU PA in OBIO space)                      */
 /* ============================================================== */
 
@@ -528,8 +585,8 @@ static uint32_t sun3_obio_read(uint32_t pa, int size)
         return icm7170_read(off);
     case 0x080000:   /* Memory error register stub */
         return 0;
-    case 0x0A0000:   /* Interrupt register stub -- all bits clear */
-        return 0;
+    case 0x0A0000:   /* Interrupt register */
+        return s_intreg;
     case 0x100000:   /* Boot PROM mirror */
         if (off < SUN3_PROM_SIZE) return g_rom[off];
         return 0xFF;
@@ -560,8 +617,11 @@ static void sun3_obio_write(uint32_t pa, uint32_t value, int size)
     case 0x060000:   /* ICM7170 TOD clock */
         icm7170_write(off, (uint8_t)value);
         break;
+    case 0x0A0000:   /* Interrupt register */
+        s_intreg = (uint8_t)value;
+        sun3_intreg_eval();
+        break;
     case 0x080000:   /* memerr */
-    case 0x0A0000:   /* intreg */
     case 0x100000:   /* PROM mirror is read-only */
     case 0x120000:   /* LANCE not implemented */
     case 0x140000:   /* SI not implemented */
@@ -607,9 +667,7 @@ static unsigned int sun3_cpu_read(int size, unsigned int address)
     /* MMU-translated access. */
     uint32_t pa = sun3_mmu_translate(address, g_fc, 1);
     if (s_last_fault) {
-        s_buserr |= SUN3_BUSERR_VALID;
-        if (s_last_proterr) s_buserr |= SUN3_BUSERR_PROTERR;
-        else                s_buserr |= SUN3_BUSERR_TIMEOUT;
+        s_buserr = s_last_proterr ? SUN3_BUSERR_PROTERR : SUN3_BUSERR_INVALID;
         /* Raise bus error UNCONDITIONALLY -- the PROM POST relies on
            bus errors firing during its RAM-probe and bus-error-validation
            tests (LED stages 0xF7, 0xF4, 0xF1).  Suppressing in boot mode
@@ -645,14 +703,24 @@ static unsigned int sun3_cpu_read(int size, unsigned int address)
             uint32_t v;
             if (sun3_bwtwo_read(pa, size, &v)) return v;
         }
-        return 0xFFFFFFFFu;
+        /* Anything else in OBMEM space is unmapped -- bus-error.
+           The PROM POST stage 0xF7 ("RAM probe (bus error)") at PROM
+           offset 0xB104 maps VA 0x2000 to a PA > installed RAM and
+           READS it, expecting a bus error to fire.  See
+           ram_probe_and_fill_routine in Ghidra at 0x0FEFB0E0+. */
+        s_buserr = SUN3_BUSERR_TIMEOUT;
+        pending_buserr();
+        return 0;
     }
     case SUN3_PGTYPE_OBIO:
         return sun3_obio_read(pa, size);
     case SUN3_PGTYPE_VME_D16:
     case SUN3_PGTYPE_VME_D32:
     default:
-        return 0xFFFFFFFFu;
+        /* Unmapped page-type or unimplemented VME -- bus error. */
+        s_buserr = SUN3_BUSERR_TIMEOUT;
+        pending_buserr();
+        return 0;
     }
 }
 
@@ -665,9 +733,7 @@ static void sun3_cpu_write(int size, unsigned int address, unsigned int value)
 
     uint32_t pa = sun3_mmu_translate(address, g_fc, 0);
     if (s_last_fault) {
-        s_buserr |= SUN3_BUSERR_VALID;
-        if (s_last_proterr) s_buserr |= SUN3_BUSERR_PROTERR;
-        else                s_buserr |= SUN3_BUSERR_TIMEOUT;
+        s_buserr = s_last_proterr ? SUN3_BUSERR_PROTERR : SUN3_BUSERR_INVALID;
         pending_buserr();   /* always; see read path comment above */
         return;
     }
@@ -683,14 +749,21 @@ static void sun3_cpu_write(int size, unsigned int address, unsigned int value)
                                   g_ram[pa+3] = (uint8_t)value; }
             break;
         }
+        /* PROM region: silently absorb (read-only). */
+        if (pa >= SUN3_PROM_BASE && pa < SUN3_PROM_BASE + SUN3_PROM_SIZE)
+            break;
         /* bwtwo writes (PA 0xFF000000+). */
         if (sun3_bwtwo_write(pa, value, size)) break;
-        /* Writes to PROM region: silently dropped. */
+        /* Anything else: bus error, same as the read path. */
+        s_buserr = SUN3_BUSERR_TIMEOUT;
+        pending_buserr();
         break;
     case SUN3_PGTYPE_OBIO:
         sun3_obio_write(pa, value, size);
         break;
     default:
+        s_buserr = SUN3_BUSERR_TIMEOUT;
+        pending_buserr();
         break;
     }
 }
@@ -736,12 +809,13 @@ static void sun3_device_tick(void)
 }
 
 /* IRQ acknowledge.  Sun-3/60 routes all IRQs through the interrupt
-   register at OBIO 0x0A0000.  For the banner-print MVP we only need
-   the SCC ack path; other levels return spurious. */
+   register at OBIO 0x0A0000.  Soft int / clock IRQs use auto-vectors;
+   the SCC at IPL 6 uses its own vector via scc_device_ack. */
 static int sun3_irq_ack(int level)
 {
     if (level == 6) return scc_device_ack(1);   /* zs SCC at IPL 6 on Sun-3 */
-    return M68K_INT_ACK_SPURIOUS;
+    /* Soft ints (IPL 1/2/3) and clock (IPL 5/7) use auto-vector. */
+    return M68K_INT_ACK_AUTOVECTOR;
 }
 
 const machine_ops_t sun3_ops = {
