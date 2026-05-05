@@ -1250,9 +1250,19 @@ void io_update(void)
   sun2_autotype_tick();
   scc_tcp_poll();   /* drain bytes from any connected TCP client */
 
-  if (sdl_poll_delay++ == 10000) {
+  /* SDL render is wall-clock throttled to 50 fps.  The coarse counter
+     bounds how often we call SDL_GetTicks (which would otherwise fire
+     per emulated 68010 instruction).  At ~21 M isn/s peak the inner
+     check still runs ~20 k times/sec -- well below SDL_GetTicks cost. */
+  if (++sdl_poll_delay >= 1000) {
+    extern uint32_t SDL_GetTicks(void);
+    static uint32_t last_render_ms;
     sdl_poll_delay = 0;
-    sdl_poll();
+    uint32_t now = SDL_GetTicks();
+    if ((uint32_t)(now - last_render_ms) >= 20) {   /* 50 fps */
+      last_render_ms = now;
+      sdl_poll();
+    }
   }
 }
 
