@@ -116,34 +116,25 @@ int _scsi_inquiry(int id, unsigned char *cmd, int cmd_size, unsigned char **pbuf
     /* vendor / product / revision strings — left zero-padded, sufficient
        for PROM identification purposes (RetroCore Vendor=Product="" works). */
   } else {
-    /* Disk INQUIRY.  We can't pretend to be a hardcoded drive type
-       (e.g. Micropolis 1375 = 132 MB) because the SunOS sd driver
-       maps the INQUIRY product string to a hardcoded geometry table
-       and computes partition offsets from that — if the disk image
-       is bigger or has a different layout than the matched preset,
-       mounts panic with "vfs_mountroot: cannot mount root".  Instead
-       generate a vendor/product that DOESN'T match any preset, with
-       a generous length, so the driver falls back to the disk-label-
-       derived geometry.  "SUN" + size string from the disk label
-       does the trick on Sun-3 (matches what real SUN-branded SCSI
-       disks ship with). */
+    /* Direct-access disk INQUIRY.  Match the C# RetroCore Sun3Disk
+       preset (SCSIDevicePresets.cs:130-146) byte-for-byte — that
+       string is what their working Sun-3/60 boot uses, so the SunOS
+       sd driver in this kernel image is happy with it.
+         vendor   = "RETROCORE"
+         product  = "Virtual Disk    " (padded to 16)
+         revision = "1.0 " (padded to 4)
+       SCSI-1 CCS (response format 1) keeps the kernel's parse path
+       on the legacy code path that reads the disk label for geometry
+       rather than looking up the product string in a hardcoded table. */
     u->data[0] = 0x00;        /* peripheral device type: direct-access disk */
     u->data[1] = 0x00;        /* RMB=0 (fixed media) */
     u->data[2] = 0x01;        /* ANSI version: SCSI-1 */
     u->data[3] = 0x01;        /* response data format: SCSI-1/CCS */
     u->data[4] = 91;          /* additional length (95 - 4) */
     memset(&u->data[8], ' ', 28);
-    memcpy(&u->data[8],  "SUN     ", 8);
-    /* product ID = label vendor string (e.g. "SUN1.0G"), padded. */
-    {
-      char prod[16];
-      memset(prod, ' ', sizeof(prod));
-      size_t L = strlen(u->disk_label_text);
-      if (L > 16) L = 16;
-      memcpy(prod, u->disk_label_text, L);
-      memcpy(&u->data[16], prod, 16);
-    }
-    memcpy(&u->data[32], "0001",     4);   /* product revision */
+    memcpy(&u->data[8],  "RETROCORE",       9);
+    memcpy(&u->data[16], "Virtual Disk   ", 15);   /* 16 bytes incl trailing space */
+    memcpy(&u->data[32], "1.0 ",            4);
   }
 
   *pbuf = u->data;
@@ -940,6 +931,62 @@ scsi_bus_data = 0;
 	    break;
 	  default:
 	    printf("scsi: command1 %02x?", scsi_cmd_buf[0]);
+	    break;
+	  }
+	}
+	break;
+      case 2:
+	/* 10-byte SCSI commands (group 2: 0x20..0x2F).  CDB is 10 bytes
+	   total — wait for full CDB before dispatch. */
+	if (scsi_cmd_size == 10) {
+	  unsigned char *pbuf;
+	  int psiz;
+	  if (trace_scsi)
+	    printf("scsi: command2 done; size %d, cmd[0] %02x\n",
+		   scsi_cmd_size, scsi_cmd_buf[0]);
+	  *pirq = 1;
+	  sc_reset_odd_len();
+	  switch (scsi_cmd_buf[0]) {
+	  case 0x25: /* READ CAPACITY (10) */
+	    if (trace_scsi) printf("scsi: command READ CAPACITY\n");
+	    if (_scsi_read_capacity(id_selected, scsi_cmd_buf, 10, &pbuf, &psiz)) {
+	      abortf("scsi: read_capacity failed\n");
+	    }
+	    sc_dma_read_data(pbuf, psiz);
+	    _scsi_set_phase(PHASE_STATUS, 0);
+	    break;
+	  case 0x28: /* READ (10) */ {
+	    /* Decode 10-byte CDB into a synthetic 6-byte form so we
+	       can reuse _scsi_read_block().  10-byte format:
+	         [0]opcode [1]flags [2..5]LBA(BE32) [6]reserved
+	         [7..8]xfer_len(BE16) [9]control */
+	    int sblock = ((unsigned)scsi_cmd_buf[2] << 24)
+			| ((unsigned)scsi_cmd_buf[3] << 16)
+			| ((unsigned)scsi_cmd_buf[4] << 8)
+			|  (unsigned)scsi_cmd_buf[5];
+	    int scount = ((unsigned)scsi_cmd_buf[7] << 8)
+			|  (unsigned)scsi_cmd_buf[8];
+	    if (trace_scsi)
+	      printf("scsi: command READ(10) lba=0x%x count=%d\n", sblock, scount);
+	    /* Build a synthetic READ(6) CDB. */
+	    unsigned char cdb6[6];
+	    cdb6[0] = 0x08;
+	    cdb6[1] = (sblock >> 16) & 0x1F;
+	    cdb6[2] = (sblock >> 8)  & 0xFF;
+	    cdb6[3] =  sblock        & 0xFF;
+	    cdb6[4] = scount > 255 ? 0 : (unsigned char)scount;
+	    cdb6[5] = 0;
+	    if (_scsi_read_block(id_selected, cdb6, 6, &pbuf, &psiz)) {
+	      abortf("scsi: read(10) failed\n");
+	    }
+	    sc_dma_read_data(pbuf, psiz);
+	    _scsi_set_phase(PHASE_STATUS, 0);
+	    break;
+	  }
+	  default:
+	    printf("scsi: command2 %02x?\n", scsi_cmd_buf[0]);
+	    sc_dma_complete_no_xfer();
+	    _scsi_set_phase(PHASE_STATUS, 0);
 	    break;
 	  }
 	}

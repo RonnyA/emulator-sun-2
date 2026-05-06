@@ -657,18 +657,31 @@ static uint32_t sun3_obio_read(uint32_t pa, int size)
         return scc_chip_read(&g_scc_kbd, off & 0x0F);
     case 0x020000:   /* zs0 SCC (console) */
         return scc_chip_read(&g_scc_serial, off & 0x0F);
-    case 0x040000:
-        /* EEPROM/NVRAM stub.  Most bytes return 0xFF (= unconfigured)
-           so the PROM falls back to its built-in defaults.  Special
-           case offset 0x1F (EE_CONSOLE): when --no-kbd is in effect
-           we want both PROM and SunOS to pick ttya as console (not
-           the framebuffer), so override that byte to EED_CONS_TTYA
-           (0x10) per RetroCore MachineSun3Memory.cs:1035.  Without
-           this the PROM ignores --no-kbd's intent and routes its
-           messages to the bwtwo framebuffer. */
-        if ((off & 0x07FF) == 0x001F && g_no_kbd)
-            return 0x10;       /* EED_CONS_TTYA */
+    case 0x040000: {
+        /* EEPROM/NVRAM stub.  Layout per RetroCore MachineSun3Memory.cs:
+             0x019..0x01A   boot-device name (2 ASCII, e.g. "sd")
+             0x01B          boot controller number
+             0x01C          boot unit number
+             0x01D          boot partition (0..7 = a..h)
+             0x01F          console device (0x00=BW / 0x10=TTYA / etc.)
+             ...rest        unconfigured (0xFF)
+           Without correct boot-device info the SunOS Sun-3 kernel
+           rejects the boot loader's rootdev hint, falls back to the
+           NFS / diskless-boot path, hits "whoami: zero ifp" because
+           we have no Ethernet, and panics with vfs_mountroot.  Stub
+           the boot device to "sd0a" and let the host override the
+           console byte via --no-kbd. */
+        uint32_t off_lo = off & 0x07FFu;
+        switch (off_lo) {
+        case 0x019: return 's';
+        case 0x01A: return 'd';
+        case 0x01B: return 0;          /* controller 0 */
+        case 0x01C: return 0;          /* unit 0 */
+        case 0x01D: return 0;          /* partition a */
+        case 0x01F: return g_no_kbd ? 0x10 /* TTYA */ : 0x00 /* BW */;
+        }
         return 0xFF;
+    }
     case 0x060000:   /* Intersil ICM7170 TOD clock */
         return icm7170_read(off);
     case 0x080000:   /* Memory error register */
