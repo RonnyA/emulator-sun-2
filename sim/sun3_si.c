@@ -155,37 +155,39 @@ static void si_irq_eval(void)
 static int s_pmtch_last_phase = -2;        /* invalidate at startup */
 static int s_pmtch_last_mr_dma;
 
-/* Fire IRQ on phase mismatch when mr.DMA is set.  Edge-triggered to
-   avoid a level-trigger storm: latch on either (a) mr.DMA rising
-   while phase mismatches tcr, or (b) phase changing while mr.DMA is
-   already on and the new phase mismatches tcr.  Critical: the SunOS
-   si_putdata epilogue sets mr.DMA AFTER the target has already moved
-   to STATUS, so we must still fire on the mr.DMA rising edge alone. */
-static int s_pmtch_armed;       /* IRQ delivered for current mismatch */
+/* Fire IRQ on transition INTO STATUS or MSG_IN phase when mr.DMA is
+   set.  These are the canonical "command completion needed"
+   transitions the SunOS si driver waits for in interrupt mode.
+   Triggering on any phase mismatch (e.g. CDB→DATA_IN with TCR still
+   set to TCR_UNSPECIFIED) produces spurious IRQs the kernel handles
+   prematurely, manifesting as a NULL-deref bus error deep in mountroot.
+
+   Edge-triggered + armed-once per command.  Re-arm at bus free. */
+static int s_pmtch_armed;
 
 static void si_eval_phase_irq_edge(void)
 {
     int dma_now = (s_mr & 0x02) ? 1 : 0;
     int p       = scsi3_phase();
     int prev_p  = s_pmtch_last_phase;
-    int prev_d  = s_pmtch_last_mr_dma;
 
     s_pmtch_last_mr_dma = dma_now;
     s_pmtch_last_phase  = p;
 
-    /* Re-arm when bus goes free or mr.DMA drops. */
-    if (p < 0 || !dma_now) { s_pmtch_armed = 0; return; }
-
-    int rising = (!prev_d && dma_now) || (prev_p != p);
-    if (!rising || s_pmtch_armed) return;
-
-    uint8_t want = s_tcr & 7;
-    uint8_t have = (uint8_t)p;
-    if (want == have) return;
+    /* Re-arm on bus free. */
+    if (p < 0) { s_pmtch_armed = 0; return; }
+    if (!dma_now) return;
+    if (s_pmtch_armed) return;
+    /* Skip when the kernel hasn't enabled SI-board interrupts.  In
+       polled mode (autoconf scsi_slave) the kernel keeps INT_ENABLE
+       off; spuriously latching INT_NCR5380 here corrupts the polled
+       SBC_IP polling logic. */
+    if (!(s_csr & SI_CSR_INT_ENABLE)) return;
+    if (p != 3 /* STATUS */ && p != 7 /* MSG_IN */) return;
+    if (p == prev_p) return;                      /* must be a transition */
 
     if (trace_scsi)
-        fprintf(stderr, "[si] phase mismatch tcr=%X phase=%X -> IRQ\n",
-                want, have);
+        fprintf(stderr, "[si] phase->%X (status/msg-in) mr.DMA=1 INT_EN=1 -> IRQ\n", p);
     s_csr |= SI_CSR_INT_NCR5380;
     s_bus_irq = 1;
     s_pmtch_armed = 1;
