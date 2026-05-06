@@ -367,10 +367,12 @@ int main(int argc, char **argv)
       {"scc-tcp",         optional_argument, 0,  'S' },
       {"scc-boards",      required_argument, 0,  'B' },
       {"no-kbd",          no_argument,       0,  'K' },
+      {"trace-si",        no_argument,       0,  'I' },
+      {"trace-scsi",      no_argument,       0,  'C' },
       {0,                 0,                 0,   0  }
     };
 
-    c = getopt_long(argc, argv, "d:k:p:t:m:T:i:qAR:X:LDS::KB:", long_options, &option_index);
+    c = getopt_long(argc, argv, "d:k:p:t:m:T:i:qAR:X:LDS::KB:IC", long_options, &option_index);
     if (c == -1)
       break;
 
@@ -445,6 +447,22 @@ int main(int argc, char **argv)
       extern unsigned int trace_ring_trigger_addr;
       trace_ring_trigger_addr = (unsigned int)strtoul(optarg, NULL, 0);
       printf("trace-ring: trigger addr set to 0x%x (0=any bus error)\n", trace_ring_trigger_addr);
+      break;
+    }
+
+    case 'I': {
+      extern int trace_si;
+      trace_si = 1;
+      setvbuf(stderr, NULL, _IONBF, 0);
+      setvbuf(stdout, NULL, _IONBF, 0);
+      fprintf(stderr, "trace-si: enabled (unbuffered)\n");
+      break;
+    }
+
+    case 'C': {
+      extern int trace_scsi;
+      trace_scsi = 1;
+      fprintf(stderr, "trace-scsi: enabled\n");
       break;
     }
 

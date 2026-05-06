@@ -914,8 +914,20 @@ static uint32_t sun3_dvma_to_va(uint32_t dvma_addr)
     return 0x0F000000u | (dvma_addr & 0x00FFFFFFu);
 }
 
+/* Sun-3 SI DMA: when System Enable.SDVMA bit is clear, the DMA controller
+   accesses raw physical memory (bypassing the MMU) using the 24-bit DVMA
+   address as a direct PA.  When SDVMA is set, the address goes through
+   the MMU as a supervisor-data VA at 0x0F000000 + dvma_addr.  This matches
+   RetroCore ScsiDmaRead/Write (MachineSun3Memory.cs:734-799). */
+uint8_t sun3_get_enable(void) { return s_enable; }
+
 unsigned char sun3_dvma_read_byte(uint32_t dvma_addr)
 {
+    if ((s_enable & SUN3_ENABLE_SDVMA) == 0) {
+        uint32_t pa = dvma_addr & 0x00FFFFFFu;
+        if (pa >= MAX_RAM) return 0xFF;
+        return g_ram[pa];
+    }
     uint32_t va = sun3_dvma_to_va(dvma_addr);
     uint32_t pa = sun3_mmu_translate(va, 5, 1);
     if (s_last_fault) return 0xFF;
@@ -926,6 +938,12 @@ unsigned char sun3_dvma_read_byte(uint32_t dvma_addr)
 
 void sun3_dvma_write_byte(uint32_t dvma_addr, unsigned char val)
 {
+    if ((s_enable & SUN3_ENABLE_SDVMA) == 0) {
+        uint32_t pa = dvma_addr & 0x00FFFFFFu;
+        if (pa >= MAX_RAM) return;
+        g_ram[pa] = val;
+        return;
+    }
     uint32_t va = sun3_dvma_to_va(dvma_addr);
     uint32_t pa = sun3_mmu_translate(va, 5, 0);
     if (s_last_fault) return;

@@ -31,7 +31,7 @@ SIM = sim/sim$(EXE_EXT)
 # things like `make run 7 RUN_VERSION=20` (variable assignments are
 # not in MAKECMDGOALS so they don't get captured).
 # ---------------------------------------------------------------------
-RUN_TARGETS := run run-trace run-tcp run-serial run-multi
+RUN_TARGETS := run run-trace run-tcp run-serial run-multi run-sun3 run-sun3-serial
 ifneq (,$(filter $(RUN_TARGETS),$(MAKECMDGOALS)))
     RUN_ARGS := $(wordlist 2,$(words $(MAKECMDGOALS)),$(MAKECMDGOALS))
     ifneq (,$(RUN_ARGS))
@@ -61,7 +61,7 @@ ifdef BOARDS
     SCC_BOARDS_FLAG := --scc-boards=$(BOARDS)
 endif
 
-.PHONY: all release sunos20 sunos32 sunos35 run run-trace run-tcp run-serial run-multi net-list clean help fetch-sdl2 fetch-npcap-sdk
+.PHONY: all release sunos20 sunos32 sunos35 run run-trace run-tcp run-serial run-multi run-sun3 run-sun3-serial net-list clean help fetch-sdl2 fetch-npcap-sdk
 
 all:
 	$(MAKE) -C m68k all
@@ -139,6 +139,45 @@ run-serial: all
 run-multi: all
 	@$(MAKE) --no-print-directory run TCP=9900 BOARDS=4 $(filter-out run-multi,$(RUN_ARGS))
 
+# ---------------------------------------------------------------------
+# Sun-3/60 targets.  Different machine type (--mode=3/60), different
+# PROM (Rev 3.0.1 64KB), different default disk (disk360.img — a 1GB
+# Sun "SUN1.0G" image carrying SunOS 4.1.1).  POST + banner + auto-boot
+# work; SunOS kernel boots through device probing and panics at
+# vfs_mountroot.  See git log for status.
+#
+# media/disk/disk360.img is .gitignored — populate it from
+# media/disk/HD0.sun360.sunos-4-1-1.img (the staging file) the first
+# time you run.
+# ---------------------------------------------------------------------
+SUN3_PROM = media/rom/sun3-60-v3.0.1.bin
+SUN3_DISK = media/disk/disk360.img
+SUN3_DISK_SRC = media/disk/HD0.sun360.sunos-4-1-1.img
+
+# Stage the Sun-3 disk image (cp from the upstream snapshot).
+$(SUN3_DISK):
+	@if [ ! -f "$(SUN3_DISK_SRC)" ]; then \
+	    echo "ERROR: $(SUN3_DISK_SRC) not present.  Drop your Sun-3 SunOS"; \
+	    echo "       4.1.1 disk image there and re-run, or symlink it from"; \
+	    echo "       another path."; \
+	    exit 1; \
+	fi
+	cp "$(SUN3_DISK_SRC)" "$(SUN3_DISK)"
+
+# GUI + keyboard + scc-tcp.  F12 in the SDL window sends L1-A.
+run-sun3: all $(SUN3_DISK)
+	$(if $(filter .exe,$(EXE_EXT)),@if [ -f external/SDL2/x86_64-w64-mingw32/bin/SDL2.dll ] && [ ! -f sim/SDL2.dll ]; then cp external/SDL2/x86_64-w64-mingw32/bin/SDL2.dll sim/SDL2.dll; fi)
+	$(SIM) --mode=3/60 --prom=$(SUN3_PROM) --disk=$(SUN3_DISK) \
+	       $(SCC_TCP_FLAG) -q $(filter-out run-sun3,$(RUN_ARGS))
+
+# Serial-only Sun-3/60: console on ttya via --scc-tcp.  PROM and SunOS
+# kernel both route their messages through telnet/nc.
+run-sun3-serial: all $(SUN3_DISK)
+	$(if $(filter .exe,$(EXE_EXT)),@if [ -f external/SDL2/x86_64-w64-mingw32/bin/SDL2.dll ] && [ ! -f sim/SDL2.dll ]; then cp external/SDL2/x86_64-w64-mingw32/bin/SDL2.dll sim/SDL2.dll; fi)
+	$(SIM) --mode=3/60 --prom=$(SUN3_PROM) --disk=$(SUN3_DISK) \
+	       --no-kbd --scc-tcp=$(if $(TCP),$(TCP),9900) -q \
+	       $(filter-out run-sun3-serial,$(RUN_ARGS))
+
 # List host network interfaces visible to the active backend.  Useful
 # for picking what to pass to --net-iface or SUN2_NET_IFACE.
 net-list: all
@@ -167,10 +206,12 @@ fetch-npcap-sdk:
 	@sh scripts/fetch-npcap-sdk.sh
 
 help:
-	@echo "sun-2 emulator build"
+	@echo "sun-2 / sun-3/60 emulator build"
 	@echo "  make             Build for the host (default)"
 	@echo "  make release     Same as 'make' (kept for CI symmetry)"
 	@echo "  make clean       Remove build artifacts"
+	@echo
+	@echo "Sun-2 (default machine, --mode=2/120):"
 	@echo "  make run         Build, stage default disk, and run (quiet)"
 	@echo "  make run N       Same, with --net-iface=N (index from --net-list,"
 	@echo "                   or a literal interface name like eth0)"
@@ -186,14 +227,34 @@ help:
 	@echo "  make run BOARDS=N  Same as run with --scc-boards=N (0..4)"
 	@echo "  make run-trace   Same as run but with full bus-error / vector trace"
 	@echo "  make run-trace N Trace mode with --net-iface=N"
-	@echo "  make net-list    Print available host network interfaces"
-	@echo "                   (then pass one with 'make run N' or"
-	@echo "                    --net-iface=NAME or SUN2_NET_IFACE=NAME)"
 	@echo "  make run RUN_VERSION=20|32|35"
 	@echo "                   Stage that SunOS image instead of the default 3.2"
 	@echo "  make sunos20     Stage SunOS 2.0 disk + tape (no run)"
 	@echo "  make sunos32     Stage SunOS 3.2 disk + tape (no run)"
 	@echo "  make sunos35     Stage SunOS 3.5 disk (no run)"
+	@echo
+	@echo "Sun-3/60 (--mode=3/60, MC68020 + Sun MMU + SI SCSI):"
+	@echo "  make run-sun3    GUI + keyboard + scc-tcp on 9900.  F12 in SDL"
+	@echo "                   window sends L1-A (drop to PROM monitor)."
+	@echo "                   Reads the disk from media/disk/disk360.img,"
+	@echo "                   auto-staging from HD0.sun360.sunos-4-1-1.img"
+	@echo "                   on first run if needed."
+	@echo "  make run-sun3 -- --auto-abort"
+	@echo "                   Same with --auto-abort: PROM auto-boot is L1-A'd"
+	@echo "                   straight to the '>' monitor prompt.  Use the SDL"
+	@echo "                   window to type, or telnet to localhost:9900."
+	@echo "  make run-sun3-serial"
+	@echo "                   Headless Sun-3/60: --no-kbd + --scc-tcp=9900."
+	@echo "                   Both PROM and SunOS kernel route their console"
+	@echo "                   messages through telnet/nc with no SDL needed."
+	@echo "                   Connect: telnet localhost 9900   (pick ttya)"
+	@echo "  make run-sun3-serial TCP=N"
+	@echo "                   Same with custom TCP port."
+	@echo
+	@echo "Misc:"
+	@echo "  make net-list    Print available host network interfaces"
+	@echo "                   (then pass one with 'make run N' or"
+	@echo "                    --net-iface=NAME or SUN2_NET_IFACE=NAME)"
 	@echo "  make fetch-sdl2  Download SDL2 MinGW devel into external/SDL2/"
 	@echo "                   (only needed for local Windows / w64devkit builds)"
 	@echo "  make fetch-npcap-sdk"

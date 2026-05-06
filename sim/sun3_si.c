@@ -87,6 +87,14 @@ static uint16_t s_udc_data;
 static uint16_t s_udc_addr;
 static uint16_t s_fifo_count;
 
+/* NCR5380 arbitration state.  Kernel SI driver (unlike the PROM) sets
+   MR.ARBITRATE (bit 0 of MR) before each selection and polls ICR for
+   AIP (bit 6) to assert, then de-assert with LA (bit 5)=0 indicating
+   arbitration won.  Simulate single-initiator arbitration: when the
+   kernel sets ARBITRATE the first ICR read returns AIP=1, subsequent
+   reads return AIP=0/LA=0 (won) until ARBITRATE is cleared. */
+static int s_arb_state;   /* 0=idle, 1=arming AIP, 2=AIP-seen (won) */
+
 /* AM9516 UDC indirect register file.  PROM writes the register index
    to s_udc_addr (low byte = 0..0x3F), then writes the data to
    s_udc_data; the low-byte commit copies s_udc_data into s_udc_regs
@@ -98,6 +106,11 @@ static uint16_t s_udc_regs[64];
    register access. */
 static unsigned int s_bus_state;
 static unsigned int s_bus_irq;
+
+/* NCR5380 END_OF_DMA latch (BSR bit 7).  Set when the SI chain transfer
+   completes; cleared by reading BSR or RPI.  RetroCore Sun3SIBoard.cs
+   (line 786 _ncr.eop_w(1)) and the SunOS si driver poll this. */
+static int s_end_of_dma;
 
 /* Buffer pending DMA (Sun-3 path): scsi.c calls sc_dma_read_data /
    sc_dma_write_data immediately after parsing the CDB, but the Sun-3
@@ -116,7 +129,14 @@ static void si_pump(void)
 {
     unsigned int out = 0;
     if (s_icr & ICR_RST) out |= SCSI_BUS_RST;
-    if (s_icr & ICR_SEL) out |= SCSI_BUS_SEL;
+    /* During arbitrated selection (kernel SI driver) the host first
+       asserts BSY+SEL with own ID on the data bus, then writes target
+       ID to ODR, then drops BSY to release the target to respond.
+       scsi.c samples target ID at SEL rise — so don't propagate SEL
+       until initiator-BSY drops, otherwise scsi.c sees own ID alone
+       and concludes no target was selected.  PROM uses non-arbitrated
+       selection (no BSY asserted) so this gating is a no-op there. */
+    if ((s_icr & ICR_SEL) && !(s_icr & ICR_BUSY)) out |= SCSI_BUS_SEL;
     if (s_icr & ICR_ACK) out |= SCSI_BUS_ACK;
     if (s_icr & ICR_ATN) out |= SCSI_BUS_ATN;
     /* BSY: NCR5380 asserts BSY when it owns the bus (after winning
@@ -166,6 +186,9 @@ static void si_handshake_ack(int ack_was_set)
         if (phase == SCSI_BUS_CD) {
             /* COMMAND OUT: host -> target */
             scsi_write_cmd_byte(s_data & 0xFF);
+        } else if (phase == (SCSI_BUS_MSG | SCSI_BUS_CD)) {
+            /* MESSAGE OUT: host -> target (IDENTIFY) */
+            scsi_write_cmd_byte(s_data & 0xFF);
         } else if (phase == (SCSI_BUS_CD | SCSI_BUS_IO)) {
             /* STATUS IN: target -> host */
             s_data = (s_data & 0xFF00) | (scsi_read_cmd_byte() & 0xFF);
@@ -209,6 +232,7 @@ static uint8_t si_bsr(void)
 {
     uint8_t v = 0;
     /* bit 7 = End of DMA */
+    if (s_end_of_dma) v |= 0x80;
     /* bit 6 = DMA Request */
     if (s_bus_state & SCSI_BUS_REQ) v |= 0x40;
     /* bit 5 = Parity Error */
@@ -255,6 +279,12 @@ static void si_irq_eval(void)
 
 extern int trace_scsi;
 
+/* SI-level kernel-driver trace.  Toggled by --trace-si CLI flag.
+   Logs UDC chain runs, BCR/CSR writes, and pending-buf state so we can
+   compare PROM vs kernel-driver SI usage. */
+int trace_si = 0;
+static unsigned long s_si_seq = 0;
+
 /* Read the AM9516 chain block at the address held in UDC regs 0x26
    (high 8 bits of bits 23:16) and 0x22 (low 16 bits), and replay the
    pending DMA from sc_dma_read_data / sc_dma_write_data.
@@ -274,6 +304,11 @@ static void si_udc_run_chain(void)
     if (!s_pending_buf || s_pending_size <= 0) {
         /* PROM triggered DMA but scsi.c never produced a buffer for
            this command.  Mark DMA done so we don't hang. */
+        if (trace_si)
+            fprintf(stderr, "[si #%lu] CHAIN-RUN with NO pending buf "
+                    "(udc[0x22]=%04X udc[0x26]=%04X bcr=%u)\n",
+                    s_si_seq++, s_udc_regs[0x22], s_udc_regs[0x26],
+                    (unsigned)s_fifo_count);
         s_csr |= SI_CSR_INT_DMA | SI_CSR_FIFO_EMPTY;
         return;
     }
@@ -302,22 +337,51 @@ static void si_udc_run_chain(void)
         /* Target -> host: copy from stashed buffer to RAM at real_va. */
         for (int i = 0; i < n; i++)
             sun3_dvma_write_byte(real_va + (uint32_t)i, s_pending_buf[i]);
+        /* Post-DMA: read back from MEMORY (via DVMA path again, same VA
+           and context the kernel will use) to verify the data we just
+           wrote is actually there for the kernel to find. */
+        if (trace_si && n == 512) {
+            uint8_t r0 = sun3_dvma_read_byte(real_va + 0);
+            uint8_t r1 = sun3_dvma_read_byte(real_va + 1);
+            uint8_t r508 = sun3_dvma_read_byte(real_va + 508);
+            uint8_t r509 = sun3_dvma_read_byte(real_va + 509);
+            fprintf(stderr, "[si]   POST-DMA readback @va=%08X: %02X%02X..%02X%02X (expect 5375 .. DABE)\n",
+                    real_va, r0, r1, r508, r509);
+        }
     } else {
         /* Host -> target: copy from RAM into stashed buffer. */
         for (int i = 0; i < n; i++)
             s_pending_buf[i] = sun3_dvma_read_byte(real_va + (uint32_t)i);
     }
 
-    /* Done.  Update DMA + FIFO state so PROM's si_dma_recv loop exits.
-       The PROM's si_wait16() poll after start-DMA waits on
-       SI_CSR_INT_NCR5380 (the chip's end-of-DMA interrupt) — set it
-       too so the wait exits.  s_bus_irq is the underlying NCR5380 IRQ
-       latch; sample it into BSR via si_bsr(). */
+    if (trace_si) {
+        fprintf(stderr, "[si #%lu] CHAIN-RUN %s va=%08X n=%d (bcr=%u "
+                "pending_size=%d) chainblk@%06X cb02=%02X cb04=%02X cb05=%02X\n",
+                s_si_seq++, s_pending_is_read ? "READ":"WRITE",
+                real_va, n, (unsigned)s_fifo_count, s_pending_size,
+                chain_addr, cb02_hi, cb04_hi, cb04_lo);
+        if (s_pending_is_read) {
+            fprintf(stderr, "[si #%lu]   first16:", s_si_seq++);
+            int dump = n < 16 ? n : 16;
+            for (int i = 0; i < dump; i++)
+                fprintf(stderr, " %02X", s_pending_buf[i]);
+            fprintf(stderr, "\n");
+        }
+    }
+
+    /* Done.  Update DMA + FIFO state.  Per RetroCore Sun3SIBoard.cs:786-792
+       and TME, ONBOARD SI does NOT set INT_DMA on completion -- the SunOS
+       si driver treats DMA_IP (DMA in progress, indicated by INT_DMA) as
+       an abnormal condition (si_cmdwait re-polls).  The completion signal
+       for onboard is INT_NCR5380 from the NCR5380's end-of-DMA / phase-
+       mismatch IRQ.  PROM polls INT_NCR5380 directly so that's also
+       sufficient.  FIFO_EMPTY signals "transfer drained" for both. */
     s_dma_addr = real_va + (uint32_t)n;
     s_fifo_count  = 0;
-    s_csr |= SI_CSR_INT_DMA | SI_CSR_INT_NCR5380 | SI_CSR_FIFO_EMPTY;
+    s_csr |= SI_CSR_INT_NCR5380 | SI_CSR_FIFO_EMPTY;
     s_csr &= ~(uint16_t)SI_CSR_DMA_BUS_ERROR;
     s_bus_irq = 1;
+    s_end_of_dma = 1;     /* NCR5380 BSR.END_OF_DMA */
     si_irq_eval();
 
     /* Pending buffer consumed. */
@@ -332,6 +396,9 @@ void sun3_si_stash_dma_read(unsigned char *buf, int siz)
     s_pending_buf = buf;
     s_pending_size = siz;
     s_pending_is_read = 1;
+    if (trace_si)
+        fprintf(stderr, "[si #%lu] STASH READ buf=%p siz=%d\n",
+                s_si_seq++, (void*)buf, siz);
 }
 
 void sun3_si_stash_dma_write(unsigned char *buf, int siz)
@@ -339,6 +406,9 @@ void sun3_si_stash_dma_write(unsigned char *buf, int siz)
     s_pending_buf = buf;
     s_pending_size = siz;
     s_pending_is_read = 0;
+    if (trace_si)
+        fprintf(stderr, "[si #%lu] STASH WRITE buf=%p siz=%d\n",
+                s_si_seq++, (void*)buf, siz);
 }
 
 /* --- public API -------------------------------------------------- */
@@ -359,16 +429,33 @@ void sun3_si_init(void)
     s_fifo_count = 0;
     s_bus_state = 0;
     s_bus_irq = 0;
+    s_arb_state = 0;
 }
 
 uint32_t sun3_si_read(uint32_t off, int size)
 {
+    if (trace_si)
+        fprintf(stderr, "[si #%lu] R off=%02X size=%d\n",
+                s_si_seq++, off, size);
     /* NCR5380 register window */
     if (off < 8) {
         si_pump();                        /* refresh bus snapshot */
         switch (off) {
         case N5380_CSD:  return s_data & 0xFF;
-        case N5380_ICR:  return s_icr;
+        case N5380_ICR: {
+            /* Read view of ICR: write-bits + arbitration status.
+               bit 6 = AIP (Arbitration In Progress)
+               bit 5 = LA  (Lost Arbitration) */
+            uint8_t v = s_icr;
+            if (s_mr & 0x01) {              /* ARBITRATE active */
+                if (s_arb_state == 1) {
+                    v |= 0x40;              /* AIP=1 (in progress) */
+                    s_arb_state = 2;
+                }
+                /* state 2: AIP=0, LA=0 -> won (single initiator) */
+            }
+            return v;
+        }
         case N5380_MR:   return s_mr;
         case N5380_TCR:  return s_tcr;
         case N5380_CSBS: return si_csbs();
@@ -383,6 +470,7 @@ uint32_t sun3_si_read(uint32_t off, int size)
                return without re-firing. */
             s_bus_irq = 0;
             s_csr &= ~(uint16_t)(SI_CSR_INT_NCR5380 | SI_CSR_INT_DMA);
+            s_end_of_dma = 0;
             si_irq_eval();
             return 0;
         }
@@ -414,6 +502,9 @@ uint32_t sun3_si_read(uint32_t off, int size)
 
 void sun3_si_write(uint32_t off, uint32_t value, int size)
 {
+    if (trace_si)
+        fprintf(stderr, "[si #%lu] W off=%02X val=%04X size=%d\n",
+                s_si_seq++, off, (unsigned)value, size);
     /* NCR5380 register window */
     if (off < 8) {
         switch (off) {
@@ -425,7 +516,18 @@ void sun3_si_write(uint32_t off, uint32_t value, int size)
             si_handshake_ack(ack_was);
             break;
         }
-        case N5380_MR:   s_mr  = (uint8_t)value; si_pump(); break;
+        case N5380_MR: {
+            uint8_t old_mr = s_mr;
+            s_mr = (uint8_t)value;
+            /* MR.ARBITRATE rising edge: arm the AIP indication.
+               Falling edge: reset arbitration state. */
+            if (!(old_mr & 0x01) && (s_mr & 0x01))
+                s_arb_state = 1;
+            else if ((old_mr & 0x01) && !(s_mr & 0x01))
+                s_arb_state = 0;
+            si_pump();
+            break;
+        }
         case N5380_TCR:  s_tcr = (uint8_t)value; si_pump(); break;
         case N5380_SER:  s_ser = (uint8_t)value; break;
         case N5380_SDS:
@@ -487,15 +589,27 @@ void sun3_si_write(uint32_t off, uint32_t value, int size)
     if (off == 0x16) {
         if (size >= 2) s_fifo_count = (uint16_t)value;
         else           s_fifo_count = (s_fifo_count & 0x00FF) | ((value & 0xFF) << 8);
+        if (trace_si)
+            fprintf(stderr, "[si #%lu] BCR<- %u (size=%d)\n",
+                    s_si_seq++, (unsigned)s_fifo_count, size);
         return;
     }
-    if (off == 0x17) { s_fifo_count = (s_fifo_count & 0xFF00) | (value & 0xFF); return; }
+    if (off == 0x17) {
+        s_fifo_count = (s_fifo_count & 0xFF00) | (value & 0xFF);
+        if (trace_si)
+            fprintf(stderr, "[si #%lu] BCR.lo<- %u\n",
+                    s_si_seq++, (unsigned)s_fifo_count);
+        return;
+    }
     /* CSR write at offset 0x18 (word) / 0x19 (low-byte).  Only bits
        0..4 are host-writable on the onboard variant (TME, RetroCore
        Sun3SIBoard.cs); everything else is status / cleared by reset.
        RESET_CTRL and RESET_FIFO are momentary triggers — process the
        reset action, then clear the trigger bits so they don't latch. */
     if (off == 0x18 || off == 0x19) {
+        if (trace_si)
+            fprintf(stderr, "[si #%lu] CSR<- 0x%04X (off=%X size=%d) old=%04X\n",
+                    s_si_seq++, (unsigned)value, off, size, s_csr);
         const uint16_t mask = 0x001F;     /* writable bits */
         uint16_t new_writable;
         if (off == 0x18 && size >= 2) {
@@ -507,6 +621,8 @@ void sun3_si_write(uint32_t off, uint32_t value, int size)
         }
         s_csr = (s_csr & ~mask) | new_writable;
 
+        if (trace_si && (s_csr & SI_CSR_RESET_FIFO))
+            fprintf(stderr, "[si #%lu]   FIFO_RES pulse\n", s_si_seq++);
         if (s_csr & SI_CSR_RESET_CTRL) {
             /* Reset the chip: clear NCR5380 + all interrupt / error
                status, drop the SCSI bus.  FIFO_EMPTY back on. */

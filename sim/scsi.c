@@ -769,9 +769,28 @@ scsi_bus_data = 0;
     if (trace_scsi > 1) printf("scsi: PHASE_SELECTION (%d)\n", time_in_state);
 
     if ((scsi_bus_state & SCSI_BUS_SEL) == 0) {
-      scsi_bus_state |= SCSI_BUS_BSY;
-      _scsi_set_phase(PHASE_COMMAND, 1);
-      if (trace_scsi > 1) printf("scsi: PHASE_SELECTION, no SEL -> COMMAND\n");
+      /* SEL drop with no target asserting BSY (unrecognised target) means
+         selection failed -- drop straight to BUS_FREE so the host driver's
+         selection-timeout path can run.  Only assert BSY+go-COMMAND when
+         a known target accepted the selection (id 0 for sd0, id 4 for
+         the Sun-2 second target). */
+      if (id_selected == 0 || id_selected == 4) {
+        scsi_bus_state |= SCSI_BUS_BSY;
+        /* Select-with-attention: kernel SI driver asserts ATN before
+           dropping SEL to request a MESSAGE OUT phase for IDENTIFY.
+           PROM-style selection leaves ATN low so we go straight to
+           COMMAND. */
+        if (scsi_bus_state & SCSI_BUS_ATN) {
+          _scsi_set_phase(PHASE_MESSAGE_OUT, 1);
+          if (trace_scsi) printf("scsi: SELECT-w-ATN -> MESSAGE_OUT\n");
+        } else {
+          _scsi_set_phase(PHASE_COMMAND, 1);
+          if (trace_scsi > 1) printf("scsi: PHASE_SELECTION, no SEL -> COMMAND\n");
+        }
+      } else {
+        _scsi_set_phase(PHASE_BUS_FREE, 0);
+        if (trace_scsi > 1) printf("scsi: PHASE_SELECTION, no SEL, no target -> BUS-FREE\n");
+      }
     }
 
     if ((scsi_bus_state & (SCSI_BUS_SEL|SCSI_BUS_BSY)) == 0 && time_in_state > 2) {
@@ -1028,7 +1047,23 @@ scsi_bus_data = 0;
     break;
 
   case PHASE_MESSAGE_OUT:
-    printf("scsi: MESSAGE_OUT\n");
+    if (trace_scsi > 1) printf("scsi: MESSAGE_OUT (%d) cmd_written=%d\n",
+                               time_in_state, scsi_cmd_has_been_written);
+    if (time_in_state == 1) {
+      _scsi_set_state();
+      scsi_bus_state |= SCSI_BUS_REQ;
+      scsi_cmd_has_been_written = 0;
+      scsi_cmd_size = 0;
+    } else if (scsi_cmd_has_been_written > 0) {
+      /* IDENTIFY (or other 1-byte message) received -- drop REQ and
+         transition to COMMAND phase to receive the CDB. */
+      if (trace_scsi) printf("scsi: MSG_OUT got byte 0x%02x -> COMMAND\n",
+                             scsi_cmd_buf[0] & 0xFF);
+      scsi_bus_state &= ~SCSI_BUS_REQ;
+      scsi_cmd_has_been_written = 0;
+      scsi_cmd_size = 0;
+      _scsi_set_phase(PHASE_COMMAND, 1);
+    }
     break;
   }
 }
