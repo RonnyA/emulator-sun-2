@@ -92,6 +92,8 @@ static uint16_t s_fifo_count;
 static unsigned int s_bus_state;
 static unsigned int s_bus_irq;
 
+extern unsigned int scsi_read_cmd_byte(void);
+
 /* Drive scsi.c's bus state machine.  Translate ICR + selected target
    to SCSI bus output lines, call scsi_update(), latch input state. */
 static void si_pump(void)
@@ -105,12 +107,68 @@ static void si_pump(void)
        arbitration / during target-mode); for initiator-mode passthrough
        leave it driven by scsi.c. */
 
-    unsigned int in = 0, irq = 0;
+    /* During SELECTION, real SCSI puts {initiator_bit | target_bit} on
+       the data lines (Sun-3 PROM uses 0x81 = init=7 + target=0).  The
+       shared scsi.c code, however, only matches the bare target bit
+       (0x01 / 0x10) — that pattern is what Sun-2's SC chip drives.
+       Mask off the initiator bit only while SEL is asserted so scsi.c
+       recognises the target id; everything else (data phase bytes etc)
+       passes through unchanged. */
     uint16_t data16 = s_data;
+    if (s_icr & ICR_SEL)
+        data16 &= 0x7F;
+
+    unsigned int in = 0, irq = 0;
     scsi_update(&data16, out, &in, &irq);
     s_data = data16;
     s_bus_state = in;
     s_bus_irq |= irq;
+}
+
+/* Faked REQ-drop-after-ACK: scsi.c keeps SCSI_BUS_REQ continuously
+   asserted while in a transfer phase, but the PROM expects per-byte
+   handshake (REQ↑ → host ACK → REQ↓ → host ACK↓ → REQ↑ for next byte).
+   We simulate that by latching a "REQ is dropped" bit when ACK was
+   just asserted, and clearing it when ACK is released.  s_csbs() ANDs
+   this with the live bus_state's REQ. */
+static int s_req_suppressed;
+
+/* Handshake byte transfer: NCR5380 host puts data on ODR, then asserts
+   ACK to clock the byte into the target.  scsi.c does not model the
+   per-byte REQ/ACK handshake — it provides byte-level entry points
+   (scsi_write_cmd_byte / scsi_read_cmd_byte) and tracks phase via the
+   bus state.  Detect ACK transitions here, route the byte by the
+   current bus phase, and toggle the REQ suppression so the PROM sees
+   a clean handshake. */
+static void si_handshake_ack(int ack_was_set)
+{
+    int ack_now = (s_icr & ICR_ACK) ? 1 : 0;
+    if (!ack_was_set && ack_now) {
+        /* Rising edge of ACK -- clock the byte. */
+        unsigned int phase = s_bus_state & (SCSI_BUS_MSG | SCSI_BUS_CD | SCSI_BUS_IO);
+
+        if (phase == SCSI_BUS_CD) {
+            /* COMMAND OUT: host -> target */
+            scsi_write_cmd_byte(s_data & 0xFF);
+        } else if (phase == (SCSI_BUS_CD | SCSI_BUS_IO)) {
+            /* STATUS IN: target -> host */
+            s_data = (s_data & 0xFF00) | (scsi_read_cmd_byte() & 0xFF);
+        } else if (phase == (SCSI_BUS_MSG | SCSI_BUS_CD | SCSI_BUS_IO)) {
+            /* MESSAGE IN: target -> host (1-byte command-complete) */
+            s_data = (s_data & 0xFF00) | (scsi_read_cmd_byte() & 0xFF);
+        } else if (phase == SCSI_BUS_IO) {
+            /* DATA IN: not in handshake mode -- handled via DMA path */
+        } else if (phase == 0) {
+            /* DATA OUT: not in handshake mode -- handled via DMA path */
+        }
+        si_pump();
+        s_req_suppressed = 1;
+    } else if (ack_was_set && !ack_now) {
+        /* Falling edge of ACK -- target re-asserts REQ for next byte
+           (or has already moved on to the next phase). */
+        s_req_suppressed = 0;
+        si_pump();
+    }
 }
 
 /* Translate SCSI bus state lines into NCR5380's CSBS register layout. */
@@ -119,7 +177,7 @@ static uint8_t si_csbs(void)
     uint8_t v = 0;
     if (s_bus_state & SCSI_BUS_RST) v |= 0x80;
     if (s_bus_state & SCSI_BUS_BSY) v |= 0x40;
-    if (s_bus_state & SCSI_BUS_REQ) v |= 0x20;
+    if ((s_bus_state & SCSI_BUS_REQ) && !s_req_suppressed) v |= 0x20;
     if (s_bus_state & SCSI_BUS_MSG) v |= 0x10;
     if (s_bus_state & SCSI_BUS_CD)  v |= 0x08;
     if (s_bus_state & SCSI_BUS_IO)  v |= 0x04;
@@ -158,8 +216,11 @@ static uint8_t si_bsr(void)
 
 /* --- public API -------------------------------------------------- */
 
+extern int trace_scsi;
+
 void sun3_si_init(void)
 {
+    /* trace_scsi = 1; */
     s_icr = 0;
     s_mr = 0;
     s_tcr = 0;
@@ -222,11 +283,13 @@ void sun3_si_write(uint32_t off, uint32_t value, int size)
     if (off < 8) {
         switch (off) {
         case N5380_ODR:  s_data = (s_data & 0xFF00) | (value & 0xFF); si_pump(); break;
-        case N5380_ICR:
+        case N5380_ICR: {
+            int ack_was = (s_icr & ICR_ACK) ? 1 : 0;
             s_icr = (uint8_t)value;
-            /* RST resets the SCSI bus → drop everything. */
             si_pump();
+            si_handshake_ack(ack_was);
             break;
+        }
         case N5380_MR:   s_mr  = (uint8_t)value; si_pump(); break;
         case N5380_TCR:  s_tcr = (uint8_t)value; si_pump(); break;
         case N5380_SER:  s_ser = (uint8_t)value; break;
