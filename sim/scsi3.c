@@ -271,9 +271,14 @@ static void dispatch_cdb(void)
       enter_data_in(0);
       return;
     }
-    /* Other commands to a non-existent LUN: reject with CHECK COND. */
+    /* Other commands to a non-existent LUN: reject with CHECK
+       CONDITION + arrange a proper sense so the kernel's REQUEST
+       SENSE that follows sees ILLEGAL_REQUEST / LUN_NOT_SUPPORTED. */
+    scsi_disk_set_sense(s_target_id,
+                        SCSI_SK_ILLEGAL_REQUEST,
+                        SCSI_ASC_LOGICAL_UNIT_NOT_SUPPORTED, 0);
     s_status = 0x02;
-    LOG("dispatch op=%02X lun=%d -> CHECK CONDITION\n", op, s_lun);
+    LOG("dispatch op=%02X lun=%d -> CHECK CONDITION (LUN_NOT_SUPPORTED)\n", op, s_lun);
     enter_status(0);
     return;
   }

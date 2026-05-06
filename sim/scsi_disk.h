@@ -33,9 +33,40 @@ struct scsi_unit_s {
   unsigned char status[3];
   unsigned int block_no;
   unsigned char data[512 * MAX_SCSI_BLOCKS];
+
+  /* Pending REQUEST SENSE state for direct-access disks.  Set by the
+     bus layer (scsi3.c / scsi.c) when a command returns CHECK
+     CONDITION; consumed + cleared by the next REQUEST SENSE.
+     Defaults to NO_SENSE / no additional info. */
+  unsigned char sense_key;     /* low 4 bits of byte 2 */
+  unsigned char sense_asc;     /* byte 12 */
+  unsigned char sense_ascq;    /* byte 13 */
 };
 
 extern struct scsi_unit_s scsi_units[8];
+
+/* Sense-key constants (scsi/generic/sense.h:85-100). */
+#define SCSI_SK_NO_SENSE        0x00
+#define SCSI_SK_RECOVERABLE     0x01
+#define SCSI_SK_NOT_READY       0x02
+#define SCSI_SK_ILLEGAL_REQUEST 0x05
+#define SCSI_SK_UNIT_ATTENTION  0x06
+
+/* Common Additional Sense Codes. */
+#define SCSI_ASC_NO_ADDITIONAL_INFO       0x00
+#define SCSI_ASC_LOGICAL_UNIT_NOT_SUPPORTED 0x25
+#define SCSI_ASC_INVALID_OPCODE           0x20
+
+/* Helper: mark a CHECK CONDITION on the unit so the kernel's
+   subsequent REQUEST SENSE returns the right key/ASC/ASCQ. */
+static inline void scsi_disk_set_sense(int id, unsigned char key,
+                                       unsigned char asc, unsigned char ascq)
+{
+  scsi_units[id].sense_key  = key;
+  scsi_units[id].sense_asc  = asc;
+  scsi_units[id].sense_ascq = ascq;
+  scsi_units[id].status[0]  = 0x02;      /* CHECK CONDITION */
+}
 
 /* SCSI command backing.  Each fills *pbuf/*psiz with the response
    payload (for data-in CDBs) or accepts the host buffer (for data-out

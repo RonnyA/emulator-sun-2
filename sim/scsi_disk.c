@@ -477,6 +477,38 @@ int _scsi_request_sense(int id, unsigned char *cmd, int cmd_size, unsigned char 
   xfer_size = 16;
   memset(&scsi_units[id].data, 0, 512);
 
+  /* Direct-access disk: build a valid SCSI-2 fixed-format extended
+     sense response.  Without this the buffer was all zeros, which
+     SunOS's sense parser dereferences a NULL pointer on (NULL fault
+     address bus error after mountroot).  Format mirrors RetroCore's
+     SCSIFullDevice.set_sense_data() byte-for-byte. */
+  if (!u->tape) {
+    int alloc_len = cmd[4];
+    if (alloc_len == 0) alloc_len = 4;            /* SCSI-1 default */
+    if (alloc_len > 18) alloc_len = 18;
+
+    memset(u->data, 0, 18);
+    u->data[0] = 0x70;                            /* response code, valid=0 */
+    u->data[2] = u->sense_key & 0x0F;             /* sense key (low 4 bits) */
+    u->data[7] = 10;                              /* additional length */
+    u->data[12] = u->sense_asc;
+    u->data[13] = u->sense_ascq;
+
+    if (trace_scsi)
+      printf("scsi%d: REQUEST_SENSE [disk] alloc=%d key=%X asc=%02X ascq=%02X\n",
+             id, alloc_len, u->sense_key, u->sense_asc, u->sense_ascq);
+
+    /* SCSI: REQUEST SENSE clears the pending sense after delivery. */
+    u->sense_key  = 0;
+    u->sense_asc  = 0;
+    u->sense_ascq = 0;
+    u->status[0]  = 0x00;                         /* GOOD */
+
+    *pbuf = u->data;
+    *psiz = alloc_len;
+    return 0;
+  }
+
   /* tape? */
   if (u->tape) {
     /* Match RetroCore SCSIFullDevice.cs:set_sense_data byte-for-byte.
