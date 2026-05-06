@@ -100,6 +100,20 @@ int _scsi_inquiry(int id, unsigned char *cmd, int cmd_size, unsigned char **pbuf
     u->data[4] = 91;          /* additional length (95 - 4) */
     /* vendor / product / revision strings — left zero-padded, sufficient
        for PROM identification purposes (RetroCore Vendor=Product="" works). */
+  } else {
+    /* Disk: identify as a Micropolis 1375 (RetroCore C# preset, which
+       Sun-3/60 happily probes during boot).  Sun-2 historically didn't
+       look at vendor/product strings for boot, so this also works for
+       Sun-2.  Strings are space-padded to their fixed-width slots. */
+    u->data[0] = 0x00;        /* peripheral device type: direct-access disk */
+    u->data[1] = 0x00;        /* RMB=0 (fixed media) */
+    u->data[2] = 0x01;        /* ANSI version: SCSI-1 */
+    u->data[3] = 0x01;        /* response data format: SCSI-1/CCS */
+    u->data[4] = 91;          /* additional length (95 - 4) */
+    memset(&u->data[8], ' ', 28);
+    memcpy(&u->data[8],  "MICROPOL", 8);   /* T10 vendor ID */
+    memcpy(&u->data[16], "1375",     4);   /* product ID */
+    memcpy(&u->data[32], "B0C",      3);   /* product revision */
   }
 
   *pbuf = u->data;

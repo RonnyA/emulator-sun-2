@@ -288,11 +288,16 @@ static void si_udc_run_chain(void)
             s_pending_buf[i] = sun3_dvma_read_byte(real_va + (uint32_t)i);
     }
 
-    /* Done.  Update DMA + FIFO state so PROM's si_dma_recv loop exits. */
+    /* Done.  Update DMA + FIFO state so PROM's si_dma_recv loop exits.
+       The PROM's si_wait16() poll after start-DMA waits on
+       SI_CSR_INT_NCR5380 (the chip's end-of-DMA interrupt) — set it
+       too so the wait exits.  s_bus_irq is the underlying NCR5380 IRQ
+       latch; sample it into BSR via si_bsr(). */
     s_dma_addr = real_va + (uint32_t)n;
     s_fifo_count  = 0;
-    s_csr |= SI_CSR_INT_DMA | SI_CSR_FIFO_EMPTY;
+    s_csr |= SI_CSR_INT_DMA | SI_CSR_INT_NCR5380 | SI_CSR_FIFO_EMPTY;
     s_csr &= ~(uint16_t)SI_CSR_DMA_BUS_ERROR;
+    s_bus_irq = 1;
 
     /* Pending buffer consumed. */
     s_pending_buf = NULL;
@@ -368,7 +373,7 @@ uint32_t sun3_si_read(uint32_t off, int size)
     if (off == 0x16) return (s_fifo_count >> 8) & 0xFF;
     if (off == 0x17) return s_fifo_count & 0xFF;
     if (off == 0x18) {
-        /* CSR high byte (status side) */
+        if (size >= 2) return s_csr;
         return (s_csr >> 8) & 0xFF;
     }
     if (off == 0x19) return s_csr & 0xFF;
@@ -395,10 +400,10 @@ void sun3_si_write(uint32_t off, uint32_t value, int size)
         case N5380_SDS:
         case N5380_SDTR:
         case N5380_SDIR:
-            /* Start DMA: SI DMA controller takes over.  Not yet
-               implemented -- mark DMA_BUS_ERROR so the PROM's si_dma
-               error path runs and it falls out of the boot. */
-            s_csr |= SI_CSR_DMA_BUS_ERROR;
+            /* Start-DMA register writes: real DMA work is driven by
+               the SI/UDC chain mechanism (see si_udc_run_chain).  The
+               write here is just the host arming the NCR5380 chip
+               for the DMA cycle that the SI board will run. */
             break;
         }
         return;
@@ -454,49 +459,37 @@ void sun3_si_write(uint32_t off, uint32_t value, int size)
         return;
     }
     if (off == 0x17) { s_fifo_count = (s_fifo_count & 0xFF00) | (value & 0xFF); return; }
-    if (off == 0x18) {
-        if (size >= 2) {
-            /* word write to CSR -- bits 0..4 are the writable mask on
-               the onboard variant (TME / RetroCore). */
-            uint16_t mask = 0x001F;
-            s_csr = (s_csr & ~mask) | (value & mask);
-            if (s_csr & SI_CSR_RESET_CTRL) {
-                s_icr = 0; s_mr = 0; s_tcr = 0;
-                s_csr &= 0x001F;
-                s_csr |= SI_CSR_FIFO_EMPTY;
-                s_bus_irq = 0;
-                si_pump();
-            }
+    /* CSR write at offset 0x18 (word) / 0x19 (low-byte).  Only bits
+       0..4 are host-writable on the onboard variant (TME, RetroCore
+       Sun3SIBoard.cs); everything else is status / cleared by reset.
+       RESET_CTRL and RESET_FIFO are momentary triggers — process the
+       reset action, then clear the trigger bits so they don't latch. */
+    if (off == 0x18 || off == 0x19) {
+        const uint16_t mask = 0x001F;     /* writable bits */
+        uint16_t new_writable;
+        if (off == 0x18 && size >= 2) {
+            new_writable = (uint16_t)(value & mask);
+        } else if (off == 0x18 /* size 1, high byte: nothing writable */) {
             return;
+        } else /* off == 0x19, low byte */ {
+            new_writable = (uint16_t)(value & mask);
         }
-        /* CSR write: only bits 0..4 are writable on the onboard variant */
-        uint16_t mask = 0x001F;
-        uint16_t newhi = (uint16_t)((value & 0xFF) << 8);
-        s_csr = (s_csr & ~(mask & 0xFF00)) | (newhi & mask);
+        s_csr = (s_csr & ~mask) | new_writable;
+
         if (s_csr & SI_CSR_RESET_CTRL) {
-            /* Reset the controller: clear status bits, drop SCSI bus. */
-            s_icr = 0;
-            s_mr = 0;
-            s_tcr = 0;
-            s_csr &= 0x001F;            /* preserve writable bits */
+            /* Reset the chip: clear NCR5380 + all interrupt / error
+               status, drop the SCSI bus.  FIFO_EMPTY back on. */
+            s_icr = 0; s_mr = 0; s_tcr = 0;
+            s_csr &= ~(uint16_t)(SI_CSR_INT_DMA | SI_CSR_INT_NCR5380 |
+                                 SI_CSR_DMA_BUS_ERROR | SI_CSR_DMA_CONFLICT);
             s_csr |= SI_CSR_FIFO_EMPTY;
             s_bus_irq = 0;
+            s_pending_buf = NULL;
+            s_pending_size = 0;
             si_pump();
         }
-        return;
-    }
-    if (off == 0x19) {
-        uint16_t mask = 0x001F;
-        s_csr = (s_csr & ~mask) | (value & mask);
-        if (s_csr & SI_CSR_RESET_CTRL) {
-            s_icr = 0;
-            s_mr = 0;
-            s_tcr = 0;
-            s_csr &= 0x001F;
-            s_csr |= SI_CSR_FIFO_EMPTY;
-            s_bus_irq = 0;
-            si_pump();
-        }
+        /* RESET_CTRL / RESET_FIFO are momentary — clear after handling. */
+        s_csr &= ~(uint16_t)(SI_CSR_RESET_CTRL | SI_CSR_RESET_FIFO);
         return;
     }
 }
