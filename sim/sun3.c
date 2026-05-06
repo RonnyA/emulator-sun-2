@@ -677,7 +677,13 @@ static uint32_t sun3_obio_read(uint32_t pa, int size)
         }
         return 0xFFFFFFFFu;
     }
-    case 0x120000:   /* LANCE Ethernet -- not implemented */
+    case 0x120000:
+        /* LANCE Ethernet -- not implemented.  Bus-error so the SunOS
+           kernel's le0 probe sees "no device installed" and falls
+           through cleanly instead of waiting for an IDON interrupt
+           that will never arrive. */
+        s_buserr = SUN3_BUSERR_TIMEOUT;
+        pending_buserr();
         return 0xFF;
     case 0x140000:   /* SI SCSI board (NCR5380 + onboard DMA) */
         return sun3_si_read(off, size);
@@ -730,7 +736,11 @@ static void sun3_obio_write(uint32_t pa, uint32_t value, int size)
         break;
     }
     case 0x100000:   /* PROM mirror is read-only */
-    case 0x120000:   /* LANCE not implemented */
+        break;
+    case 0x120000:
+        /* LANCE Ethernet -- bus-error writes too (see read path). */
+        s_buserr = SUN3_BUSERR_TIMEOUT;
+        pending_buserr();
         break;
     case 0x140000:   /* SI SCSI board */
         sun3_si_write(off, value, size);
