@@ -952,6 +952,27 @@ void sun3_dvma_write_byte(uint32_t dvma_addr, unsigned char val)
     g_ram[pa] = val;
 }
 
+/* Diagnostic: read a byte at supervisor-data VA via the MMU in the
+   CURRENT context.  This is what the kernel CPU sees when it dereferences
+   a kernel pointer.  Returns 0xFF on fault.  Out-param *fault_out is set
+   on translation fault (NULL ok).  Used to verify whether DMA-written
+   bytes are visible at the kernel's expected VA. */
+unsigned char sun3_kernel_read_byte(uint32_t va, int *fault_out)
+{
+    uint32_t pa = sun3_mmu_translate(va, 5, 1);
+    if (fault_out) *fault_out = s_last_fault ? 1 : 0;
+    if (s_last_fault) return 0xFF;
+    if (s_last_pgtype != SUN3_PGTYPE_OBMEM) {
+        if (fault_out) *fault_out = 2;
+        return 0xFF;
+    }
+    if (pa >= MAX_RAM) {
+        if (fault_out) *fault_out = 3;
+        return 0xFF;
+    }
+    return g_ram[pa];
+}
+
 static void sun3_cpu_write(int size, unsigned int address, unsigned int value)
 {
     if (g_fc == 3) {
