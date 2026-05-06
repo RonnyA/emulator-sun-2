@@ -39,6 +39,21 @@ struct scsi_unit_s {
   int residual;          /* tape: residual byte count from last short read */
   int tape;
   int ro;
+  /* Disk geometry parsed from the Sun disk label at sector 0 of the
+     attached image (set by scsi_set_disk_image).  Populates the
+     INQUIRY / MODE_SENSE / READ_CAPACITY responses so the SunOS sd
+     driver computes correct partition offsets — without this it
+     looks up the INQUIRY product string in its hardcoded table and
+     uses geometry that mismatches the actual disk image, then reads
+     the filesystem superblock from the wrong LBA and panics with
+     "vfs_mountroot: cannot mount root". */
+  unsigned int disk_cyl;
+  unsigned int disk_alt_cyl;
+  unsigned int disk_hd;
+  unsigned int disk_sec;
+  unsigned int disk_sec_size;
+  unsigned long long disk_total_blocks;
+  char disk_label_text[40];     /* "Sun1.0G cyl 1703 alt 2 hd 15 sec 80" */
   unsigned char status[3];
   unsigned int block_no;
   unsigned char data[512*MAX_SCSI_BLOCKS];
@@ -101,19 +116,34 @@ int _scsi_inquiry(int id, unsigned char *cmd, int cmd_size, unsigned char **pbuf
     /* vendor / product / revision strings — left zero-padded, sufficient
        for PROM identification purposes (RetroCore Vendor=Product="" works). */
   } else {
-    /* Disk: identify as a Micropolis 1375 (RetroCore C# preset, which
-       Sun-3/60 happily probes during boot).  Sun-2 historically didn't
-       look at vendor/product strings for boot, so this also works for
-       Sun-2.  Strings are space-padded to their fixed-width slots. */
+    /* Disk INQUIRY.  We can't pretend to be a hardcoded drive type
+       (e.g. Micropolis 1375 = 132 MB) because the SunOS sd driver
+       maps the INQUIRY product string to a hardcoded geometry table
+       and computes partition offsets from that — if the disk image
+       is bigger or has a different layout than the matched preset,
+       mounts panic with "vfs_mountroot: cannot mount root".  Instead
+       generate a vendor/product that DOESN'T match any preset, with
+       a generous length, so the driver falls back to the disk-label-
+       derived geometry.  "SUN" + size string from the disk label
+       does the trick on Sun-3 (matches what real SUN-branded SCSI
+       disks ship with). */
     u->data[0] = 0x00;        /* peripheral device type: direct-access disk */
     u->data[1] = 0x00;        /* RMB=0 (fixed media) */
     u->data[2] = 0x01;        /* ANSI version: SCSI-1 */
     u->data[3] = 0x01;        /* response data format: SCSI-1/CCS */
     u->data[4] = 91;          /* additional length (95 - 4) */
     memset(&u->data[8], ' ', 28);
-    memcpy(&u->data[8],  "MICROPOL", 8);   /* T10 vendor ID */
-    memcpy(&u->data[16], "1375",     4);   /* product ID */
-    memcpy(&u->data[32], "B0C",      3);   /* product revision */
+    memcpy(&u->data[8],  "SUN     ", 8);
+    /* product ID = label vendor string (e.g. "SUN1.0G"), padded. */
+    {
+      char prod[16];
+      memset(prod, ' ', sizeof(prod));
+      size_t L = strlen(u->disk_label_text);
+      if (L > 16) L = 16;
+      memcpy(prod, u->disk_label_text, L);
+      memcpy(&u->data[16], prod, 16);
+    }
+    memcpy(&u->data[32], "0001",     4);   /* product revision */
   }
 
   *pbuf = u->data;
@@ -152,39 +182,157 @@ int _scsi_mode_select(int id, unsigned char *cmd, int cmd_size, unsigned char **
 int _scsi_mode_sense(int id, unsigned char *cmd, int cmd_size, unsigned char **pbuf, int *psiz)
 {
   struct scsi_unit_s *u;
-  int ret;
-  off_t offset;
-  int pc, pagecode, spagecode, allocationlen, xfer_size;
+  int pagecode, allocationlen;
 
   u = &scsi_units[id];
-  pc = (cmd[2] & 0xc0) >> 6;
   pagecode = cmd[2] & 0x3f;
-  spagecode = cmd[3];
   allocationlen = cmd[4];
 
-  if (trace_scsi) printf("_scsi_mode_sense(id=%d) pc %x pagecode %x spagecode %x, allocationlen %x\n", id, pc, pagecode, spagecode, allocationlen);
+  if (trace_scsi)
+    printf("_scsi_mode_sense(id=%d) pc %x pagecode %x spagecode %x, "
+           "allocationlen %x\n",
+           id, (cmd[2] & 0xc0) >> 6, pagecode, cmd[3], allocationlen);
 
-  xfer_size = 96;
   memset(&u->data, 0, 512);
 
-  // data len
-  // medium type
-  // dev spec
-  // blk desc len
-  // density
-  // nblocks[3];
-  // reserved
-  // blklen[3]
-
-  /* tape? */
   if (u->tape) {
     if (trace_scsi) printf("_scsi_mode_sense() tape\n");
-//    u->data[0] = 0x01;
+    *pbuf = u->data;
+    *psiz = 96;
+    return 0;
   }
+
+  /* SCSI MODE_SENSE(6) response for direct-access disk:
+   *   bytes 0..3   parameter header
+   *   bytes 4..11  block descriptor (8 bytes)
+   *   bytes 12..   mode page(s)
+   *
+   * The SunOS Sun-3 sd driver wants page 0x03 (Format Parameters)
+   * and page 0x04 (Rigid Disk Drive Geometry) for partition layout.
+   * Build them from the disk-label-derived geometry stashed in
+   * u->disk_cyl / u->disk_hd / u->disk_sec.
+   */
+  unsigned int blocks  = (unsigned int)u->disk_total_blocks;
+  unsigned int bsize   = u->disk_sec_size ? u->disk_sec_size : 512;
+  unsigned int cyl     = u->disk_cyl ? u->disk_cyl : 1703;
+  unsigned int alt_cyl = u->disk_alt_cyl;
+  unsigned int hd      = u->disk_hd  ? u->disk_hd  : 15;
+  unsigned int sec     = u->disk_sec ? u->disk_sec : 80;
+
+  /* Header */
+  u->data[0] = 0;              /* mode data length (filled below) */
+  u->data[1] = 0x00;           /* medium type: 0 = generic disk */
+  u->data[2] = 0x00;           /* device-specific (no WP, no caching info) */
+  u->data[3] = 0x08;           /* block descriptor length = 8 */
+
+  /* Block descriptor: density(1) + nblocks(3) + reserved(1) + blocklen(3) */
+  u->data[4] = 0x00;           /* density code: default */
+  u->data[5] = (blocks >> 16) & 0xFF;
+  u->data[6] = (blocks >> 8)  & 0xFF;
+  u->data[7] =  blocks        & 0xFF;
+  u->data[8] = 0x00;
+  u->data[9]  = (bsize >> 16) & 0xFF;
+  u->data[10] = (bsize >> 8)  & 0xFF;
+  u->data[11] =  bsize        & 0xFF;
+
+  int off = 12;
+
+  /* Page 0x03 -- Format Parameters (24 bytes including 2-byte header) */
+  if (pagecode == 0x00 || pagecode == 0x03 || pagecode == 0x3F) {
+    u->data[off + 0]  = 0x03;                /* page code */
+    u->data[off + 1]  = 0x16;                /* page length (22) */
+    u->data[off + 2]  = (hd  >> 8) & 0xFF;   /* tracks per zone */
+    u->data[off + 3]  =  hd        & 0xFF;
+    u->data[off + 4]  = 0;                   /* alt sectors per zone */
+    u->data[off + 5]  = 0;
+    u->data[off + 6]  = 0;                   /* alt tracks per zone */
+    u->data[off + 7]  = 0;
+    u->data[off + 8]  = (alt_cyl >> 8) & 0xFF; /* alt tracks per LUN */
+    u->data[off + 9]  =  alt_cyl       & 0xFF;
+    u->data[off + 10] = (sec >> 8) & 0xFF;   /* sectors per track */
+    u->data[off + 11] =  sec       & 0xFF;
+    u->data[off + 12] = (bsize >> 8) & 0xFF; /* data bytes per sector */
+    u->data[off + 13] =  bsize       & 0xFF;
+    u->data[off + 14] = 0;                   /* interleave */
+    u->data[off + 15] = 1;
+    u->data[off + 16] = 0;                   /* track skew */
+    u->data[off + 17] = 0;
+    u->data[off + 18] = 0;                   /* cylinder skew */
+    u->data[off + 19] = 0;
+    u->data[off + 20] = 0x40;                /* HSEC = hard sectoring */
+    u->data[off + 21] = 0;
+    u->data[off + 22] = 0;
+    u->data[off + 23] = 0;
+    off += 24;
+  }
+
+  /* Page 0x04 -- Rigid Disk Drive Geometry (24 bytes) */
+  if (pagecode == 0x00 || pagecode == 0x04 || pagecode == 0x3F) {
+    u->data[off + 0]  = 0x04;
+    u->data[off + 1]  = 0x16;
+    u->data[off + 2]  = (cyl >> 16) & 0xFF;  /* # cylinders (24-bit) */
+    u->data[off + 3]  = (cyl >> 8)  & 0xFF;
+    u->data[off + 4]  =  cyl        & 0xFF;
+    u->data[off + 5]  =  hd & 0xFF;           /* # heads */
+    u->data[off + 6]  = 0;                    /* start cyl write precomp */
+    u->data[off + 7]  = 0;
+    u->data[off + 8]  = 0;
+    u->data[off + 9]  = 0;                    /* start cyl reduced wc */
+    u->data[off + 10] = 0;
+    u->data[off + 11] = 0;
+    u->data[off + 12] = 0;                    /* drive step rate */
+    u->data[off + 13] = 0;
+    u->data[off + 14] = (cyl >> 16) & 0xFF;   /* landing zone cyl */
+    u->data[off + 15] = (cyl >> 8)  & 0xFF;
+    u->data[off + 16] =  cyl        & 0xFF;
+    u->data[off + 17] = 0;                    /* RPL */
+    u->data[off + 18] = 0;
+    u->data[off + 19] = 0;
+    u->data[off + 20] = (3600 >> 8) & 0xFF;   /* medium rotation rate */
+    u->data[off + 21] =  3600       & 0xFF;
+    u->data[off + 22] = 0;
+    u->data[off + 23] = 0;
+    off += 24;
+  }
+
+  /* Patch in mode-data length (header byte 0 is "data length minus
+     the length byte itself"). */
+  u->data[0] = (uint8_t)(off - 1);
+
+  int xfer_size = off;
+  if (allocationlen > 0 && allocationlen < xfer_size)
+    xfer_size = allocationlen;
 
   *pbuf = u->data;
   *psiz = xfer_size;
 
+  return 0;
+}
+
+/* SCSI READ_CAPACITY(10) response: 4-byte LBA of last block + 4-byte
+   block size (both big-endian).  The SunOS sd driver uses this to
+   determine total disk capacity for partition validation. */
+static int _scsi_read_capacity(int id, unsigned char *cmd, int cmd_size,
+                               unsigned char **pbuf, int *psiz)
+{
+  struct scsi_unit_s *u = &scsi_units[id];
+  unsigned int last_lba = (unsigned int)((u->disk_total_blocks > 0) ?
+                          (u->disk_total_blocks - 1) : 0);
+  unsigned int bsize = u->disk_sec_size ? u->disk_sec_size : 512;
+  if (trace_scsi)
+    printf("_scsi_read_capacity(id=%d) last_lba=%u (0x%x) bsize=%u\n",
+           id, last_lba, last_lba, bsize);
+  memset(u->data, 0, 8);
+  u->data[0] = (last_lba >> 24) & 0xFF;
+  u->data[1] = (last_lba >> 16) & 0xFF;
+  u->data[2] = (last_lba >> 8)  & 0xFF;
+  u->data[3] =  last_lba        & 0xFF;
+  u->data[4] = (bsize >> 24) & 0xFF;
+  u->data[5] = (bsize >> 16) & 0xFF;
+  u->data[6] = (bsize >> 8)  & 0xFF;
+  u->data[7] =  bsize        & 0xFF;
+  *pbuf = u->data;
+  *psiz = 8;
   return 0;
 }
 
@@ -980,6 +1128,75 @@ int _scsi_next_file(int unit)
 }
 
 
+/* Parse the Sun disk label at sector 0 to recover real geometry.
+   Sun-style ASCII info string is "<vendor> cyl <C> alt <A> hd <H>
+   sec <S>".  Magic 0xDABE is at byte offset 0x1FC (508) of the
+   first 512-byte sector.  Falls back to "guess from file size with
+   a 512-byte sector" if parsing fails. */
+static void scsi_parse_disk_label(struct scsi_unit_s *u, const char *fname)
+{
+  unsigned char buf[512];
+  FILE *f = fopen(fname, "rb");
+
+  /* Defaults: 512-byte sectors, geometry from file size. */
+  u->disk_sec_size = 512;
+
+  struct stat st;
+  if (stat(fname, &st) == 0)
+    u->disk_total_blocks = (unsigned long long)st.st_size / 512ULL;
+  else
+    u->disk_total_blocks = 0;
+
+  /* Default geometry: pretend a 1GB Sun drive (1703/15/80) — the
+     SunOS sd driver only really cares that cyl*hd*sec*512 covers
+     the partition layout, and that the Sun magic is present. */
+  u->disk_cyl = 1703;
+  u->disk_alt_cyl = 2;
+  u->disk_hd = 15;
+  u->disk_sec = 80;
+  strcpy(u->disk_label_text, "SUN1.0G");
+
+  if (!f) return;
+  size_t n = fread(buf, 1, sizeof(buf), f);
+  fclose(f);
+  if (n < 512) return;
+
+  /* Validate Sun label magic 0xDABE at offset 0x1FC (BE). */
+  if (!(buf[0x1FC] == 0xDA && buf[0x1FD] == 0xBE)) {
+    if (trace_scsi)
+      printf("scsi: '%s' has no Sun magic 0xDABE; using defaults\n", fname);
+    return;
+  }
+
+  /* Parse the ASCII info field "<vendor> cyl <C> alt <A> hd <H> sec <S>"
+     -- terminated by NUL within the first 128 bytes. */
+  char info[128];
+  memcpy(info, buf, 128);
+  info[127] = '\0';
+  int c = 0, a = 0, h = 0, s = 0;
+  if (sscanf(info, "%39[^c]cyl %d alt %d hd %d sec %d",
+             u->disk_label_text, &c, &a, &h, &s) >= 4) {
+    /* Trim trailing space from vendor portion. */
+    int len = (int)strlen(u->disk_label_text);
+    while (len > 0 && u->disk_label_text[len - 1] == ' ')
+      u->disk_label_text[--len] = '\0';
+    if (c > 0) u->disk_cyl = (unsigned)c;
+    if (a > 0) u->disk_alt_cyl = (unsigned)a;
+    if (h > 0) u->disk_hd = (unsigned)h;
+    if (s > 0) u->disk_sec = (unsigned)s;
+    /* Use geometry to compute total user blocks (alt cylinders are
+       reserved for spare-track remap). */
+    u->disk_total_blocks = (unsigned long long)u->disk_cyl
+                         * u->disk_hd * u->disk_sec;
+    if (trace_scsi)
+      printf("scsi%d: disk label '%s' cyl=%u alt=%u hd=%u sec=%u "
+             "(%llu blocks)\n",
+             (int)(u - scsi_units), u->disk_label_text,
+             u->disk_cyl, u->disk_alt_cyl, u->disk_hd, u->disk_sec,
+             u->disk_total_blocks);
+  }
+}
+
 int scsi_set_disk_image(int unit, char *fname)
 {
   scsi_units[unit].fname[0] = strdup(fname);
@@ -987,6 +1204,7 @@ int scsi_set_disk_image(int unit, char *fname)
   scsi_units[unit].fileno = -1;
   scsi_units[unit].tape = 0;
   scsi_units[unit].ro = 0;
+  scsi_parse_disk_label(&scsi_units[unit], fname);
 
   /* */
 //  trace_scsi = 1;
