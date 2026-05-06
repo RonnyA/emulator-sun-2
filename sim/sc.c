@@ -12,6 +12,8 @@
 #include "m68k.h"
 #include "sim.h"
 #include "scsi.h"
+#include "machine.h"
+#include "sun3_si.h"
 
 extern int trace_mmu;
 extern int trace_sc;
@@ -235,6 +237,15 @@ void sc_dma_read_data(unsigned char *buf, int bufsiz)
   int i;
   extern unsigned char g_ram[];
 
+  /* Sun-3 SI uses an AM9516 UDC chained DMA — the PROM hasn't programmed
+     the chain block by the time scsi.c calls us, so we just stash the
+     buffer and let sun3_si.c replay the copy when the PROM writes UDC
+     reg 0x2E = 0x00A0 (chain master enable). */
+  if (g_machine && g_machine->family == MACH_SUN3) {
+    sun3_si_stash_dma_read(buf, bufsiz);
+    return;
+  }
+
   extern int trace_armed;
   unsigned short dc_before = sc_dma_count;
   if (trace_sc && bufsiz <= 32)
@@ -302,6 +313,12 @@ void sc_dma_write_data(unsigned char *buf, int bufsiz)
 {
   int i;
   extern unsigned char g_ram[];
+
+  /* Sun-3 SI: stash and replay on UDC trigger (see sc_dma_read_data). */
+  if (g_machine && g_machine->family == MACH_SUN3) {
+    sun3_si_stash_dma_write(buf, bufsiz);
+    return;
+  }
 
   if (0) {
     unsigned int va, pa, mtype, fault, pte;

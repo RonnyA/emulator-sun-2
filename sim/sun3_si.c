@@ -87,10 +87,26 @@ static uint16_t s_udc_data;
 static uint16_t s_udc_addr;
 static uint16_t s_fifo_count;
 
+/* AM9516 UDC indirect register file.  PROM writes the register index
+   to s_udc_addr (low byte = 0..0x3F), then writes the data to
+   s_udc_data; the low-byte commit copies s_udc_data into s_udc_regs
+   at the indexed slot.  Reg 0x2E = command; writing 0x00A0 (master
+   enable / chain-start) is what kicks the actual DMA. */
+static uint16_t s_udc_regs[64];
+
 /* Cached SCSI bus state from scsi.c, refreshed on every NCR5380
    register access. */
 static unsigned int s_bus_state;
 static unsigned int s_bus_irq;
+
+/* Buffer pending DMA (Sun-3 path): scsi.c calls sc_dma_read_data /
+   sc_dma_write_data immediately after parsing the CDB, but the Sun-3
+   PROM hasn't programmed the UDC chain block yet — the actual transfer
+   is deferred until the PROM writes UDC reg 0x2E = 0x00A0.  Stash the
+   pointer and length here for replay at that trigger. */
+static unsigned char *s_pending_buf;
+static int            s_pending_size;
+static int            s_pending_is_read;   /* 1 = data IN (target->host), 0 = OUT */
 
 extern unsigned int scsi_read_cmd_byte(void);
 
@@ -214,9 +230,92 @@ static uint8_t si_bsr(void)
     return v;
 }
 
-/* --- public API -------------------------------------------------- */
+extern unsigned char sun3_dvma_read_byte(uint32_t va);
+extern void          sun3_dvma_write_byte(uint32_t va, unsigned char v);
 
 extern int trace_scsi;
+
+/* Read the AM9516 chain block at the address held in UDC regs 0x26
+   (high 8 bits of bits 23:16) and 0x22 (low 16 bits), and replay the
+   pending DMA from sc_dma_read_data / sc_dma_write_data.
+   Chain block layout (per RetroCore Sun3SIBoard.cs:646-712 and
+   confirmed against TME sun3-mainbus.c):
+     +0x00  16-bit  mode/command (0x0182 read / 0x0282 write)
+     +0x02  16-bit  high(addr_high<<8 | UDC_ADDR_INFO=0x40)
+     +0x04  16-bit  addr_low
+     +0x06  16-bit  word_count
+     +0x08  16-bit  reserved
+     +0x0A  16-bit  channel command
+   The real DMA target VA = (cb02_hi << 16) | (cb04_hi << 8) | cb04_lo.
+   Length comes from the SI FIFO_COUNT_L register (0x16), not from the
+   chain block. */
+static void si_udc_run_chain(void)
+{
+    if (!s_pending_buf || s_pending_size <= 0) {
+        /* PROM triggered DMA but scsi.c never produced a buffer for
+           this command.  Mark DMA done so we don't hang. */
+        s_csr |= SI_CSR_INT_DMA | SI_CSR_FIFO_EMPTY;
+        return;
+    }
+
+    uint32_t chain_hi_byte = (uint32_t)(s_udc_regs[0x26] >> 8);
+    uint32_t chain_lo      = (uint32_t)s_udc_regs[0x22];
+    uint32_t chain_addr    = (chain_hi_byte << 16) | chain_lo;
+
+    /* Walk chain block: addr_hi at +0x02 (high byte), addr_lo at +0x04..0x05 */
+    uint8_t cb02_hi = sun3_dvma_read_byte(chain_addr + 0x02);
+    /*uint8_t cb02_lo = sun3_dvma_read_byte(chain_addr + 0x03);*/  /* UDC_ADDR_INFO flag */
+    uint8_t cb04_hi = sun3_dvma_read_byte(chain_addr + 0x04);
+    uint8_t cb04_lo = sun3_dvma_read_byte(chain_addr + 0x05);
+
+    uint32_t real_va = ((uint32_t)cb02_hi << 16)
+                     | ((uint32_t)cb04_hi << 8)
+                     |  (uint32_t)cb04_lo;
+
+    /* Byte count: PROM stages it in SI FIFO_COUNT_L (offset 0x16).  If
+       that wasn't programmed (stays 0), fall back to the stashed
+       buffer length so a 1-sector boot read still works. */
+    int n = (int)s_fifo_count;
+    if (n <= 0 || n > s_pending_size) n = s_pending_size;
+
+    if (s_pending_is_read) {
+        /* Target -> host: copy from stashed buffer to RAM at real_va. */
+        for (int i = 0; i < n; i++)
+            sun3_dvma_write_byte(real_va + (uint32_t)i, s_pending_buf[i]);
+    } else {
+        /* Host -> target: copy from RAM into stashed buffer. */
+        for (int i = 0; i < n; i++)
+            s_pending_buf[i] = sun3_dvma_read_byte(real_va + (uint32_t)i);
+    }
+
+    /* Done.  Update DMA + FIFO state so PROM's si_dma_recv loop exits. */
+    s_dma_addr = real_va + (uint32_t)n;
+    s_fifo_count  = 0;
+    s_csr |= SI_CSR_INT_DMA | SI_CSR_FIFO_EMPTY;
+    s_csr &= ~(uint16_t)SI_CSR_DMA_BUS_ERROR;
+
+    /* Pending buffer consumed. */
+    s_pending_buf = NULL;
+    s_pending_size = 0;
+}
+
+/* Called from sc.c when scsi.c wants to do a DMA transfer.  Sun-3
+   defers the actual copy until the PROM triggers the UDC. */
+void sun3_si_stash_dma_read(unsigned char *buf, int siz)
+{
+    s_pending_buf = buf;
+    s_pending_size = siz;
+    s_pending_is_read = 1;
+}
+
+void sun3_si_stash_dma_write(unsigned char *buf, int siz)
+{
+    s_pending_buf = buf;
+    s_pending_size = siz;
+    s_pending_is_read = 0;
+}
+
+/* --- public API -------------------------------------------------- */
 
 void sun3_si_init(void)
 {
@@ -316,13 +415,60 @@ void sun3_si_write(uint32_t off, uint32_t value, int size)
         s_dma_count = (s_dma_count & ~(0xFFu << shift)) | ((value & 0xFF) << shift);
         return;
     }
-    if (off == 0x10) { s_udc_data = (s_udc_data & 0x00FF) | ((value & 0xFF) << 8); return; }
-    if (off == 0x11) { s_udc_data = (s_udc_data & 0xFF00) | (value & 0xFF); return; }
-    if (off == 0x12) { s_udc_addr = (s_udc_addr & 0x00FF) | ((value & 0xFF) << 8); return; }
+    /* AM9516 UDC indirect register file.  PROM almost always uses
+       16-bit (move.w) accesses to UDC_DATA / UDC_ADDR — see si_wr#137..
+       144 in the boot trace: `move.w #0x002E, (0x12,A5)` then
+       `move.w #0x00A0, (0x10,A5)`.  Handle word-sized writes by
+       committing the whole value at once, but also support byte-sized
+       accesses (the low-byte write is what commits the latched value
+       into s_udc_regs[]).  Reg 0x2E = channel command; writing 0xA0
+       there (master enable / chain-start) kicks the actual DMA. */
+    if (off == 0x10) {
+        if (size >= 2) s_udc_data = (uint16_t)value;
+        else           s_udc_data = (s_udc_data & 0x00FF) | ((value & 0xFF) << 8);
+        if (size >= 2) {
+            uint8_t reg_idx = (uint8_t)(s_udc_addr & 0x3F);
+            s_udc_regs[reg_idx] = s_udc_data;
+            if (reg_idx == 0x2E && (s_udc_data == 0x00A0 || (s_udc_data >> 8) == 0xA0))
+                si_udc_run_chain();
+        }
+        return;
+    }
+    if (off == 0x11) {
+        s_udc_data = (s_udc_data & 0xFF00) | (value & 0xFF);
+        uint8_t reg_idx = (uint8_t)(s_udc_addr & 0x3F);
+        s_udc_regs[reg_idx] = s_udc_data;
+        if (reg_idx == 0x2E && (s_udc_data == 0x00A0 || (s_udc_data >> 8) == 0xA0))
+            si_udc_run_chain();
+        return;
+    }
+    if (off == 0x12) {
+        if (size >= 2) s_udc_addr = (uint16_t)value;
+        else           s_udc_addr = (s_udc_addr & 0x00FF) | ((value & 0xFF) << 8);
+        return;
+    }
     if (off == 0x13) { s_udc_addr = (s_udc_addr & 0xFF00) | (value & 0xFF); return; }
-    if (off == 0x16) { s_fifo_count = (s_fifo_count & 0x00FF) | ((value & 0xFF) << 8); return; }
+    if (off == 0x16) {
+        if (size >= 2) s_fifo_count = (uint16_t)value;
+        else           s_fifo_count = (s_fifo_count & 0x00FF) | ((value & 0xFF) << 8);
+        return;
+    }
     if (off == 0x17) { s_fifo_count = (s_fifo_count & 0xFF00) | (value & 0xFF); return; }
     if (off == 0x18) {
+        if (size >= 2) {
+            /* word write to CSR -- bits 0..4 are the writable mask on
+               the onboard variant (TME / RetroCore). */
+            uint16_t mask = 0x001F;
+            s_csr = (s_csr & ~mask) | (value & mask);
+            if (s_csr & SI_CSR_RESET_CTRL) {
+                s_icr = 0; s_mr = 0; s_tcr = 0;
+                s_csr &= 0x001F;
+                s_csr |= SI_CSR_FIFO_EMPTY;
+                s_bus_irq = 0;
+                si_pump();
+            }
+            return;
+        }
         /* CSR write: only bits 0..4 are writable on the onboard variant */
         uint16_t mask = 0x001F;
         uint16_t newhi = (uint16_t)((value & 0xFF) << 8);

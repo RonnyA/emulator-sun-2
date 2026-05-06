@@ -846,6 +846,40 @@ static unsigned int sun3_cpu_read(int size, unsigned int address)
     }
 }
 
+/* DVMA helpers for the SI SCSI board's chain-block walker.  The PROM
+   stages an AM9516 chain block in DVMA-mapped memory, then triggers
+   the UDC.  The 24-bit DVMA address (e.g. 0xF04000) gets folded into
+   VA 0x0F000000 | (dvma & 0x00FFFFFF) and then translated through the
+   regular Sun-3 MMU using FC=5 (supervisor data) — same translation
+   the CPU would do for an explicit memory read.  Matches RetroCore
+   ScsiDmaRead/ScsiDmaWrite (MachineSun3Memory.cs:734-799).  Only
+   OBMEM/RAM destinations are supported; anything else returns 0xFF /
+   drops the write. */
+static uint32_t sun3_dvma_to_va(uint32_t dvma_addr)
+{
+    return 0x0F000000u | (dvma_addr & 0x00FFFFFFu);
+}
+
+unsigned char sun3_dvma_read_byte(uint32_t dvma_addr)
+{
+    uint32_t va = sun3_dvma_to_va(dvma_addr);
+    uint32_t pa = sun3_mmu_translate(va, 5, 1);
+    if (s_last_fault) return 0xFF;
+    if (s_last_pgtype != SUN3_PGTYPE_OBMEM) return 0xFF;
+    if (pa >= MAX_RAM) return 0xFF;
+    return g_ram[pa];
+}
+
+void sun3_dvma_write_byte(uint32_t dvma_addr, unsigned char val)
+{
+    uint32_t va = sun3_dvma_to_va(dvma_addr);
+    uint32_t pa = sun3_mmu_translate(va, 5, 0);
+    if (s_last_fault) return;
+    if (s_last_pgtype != SUN3_PGTYPE_OBMEM) return;
+    if (pa >= MAX_RAM) return;
+    g_ram[pa] = val;
+}
+
 static void sun3_cpu_write(int size, unsigned int address, unsigned int value)
 {
     if (g_fc == 3) {
