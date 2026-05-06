@@ -613,12 +613,21 @@ static void sun3_intreg_eval(void)
         if (s_intreg & SUN3_IREG_SOFT_INT_1) want |= (1u << 1);
         if (s_intreg & SUN3_IREG_SOFT_INT_2) want |= (1u << 2);
         if (s_intreg & SUN3_IREG_SOFT_INT_3) want |= (1u << 3);
-        /* Clock IRQ from ICM7170 -- gated by CLOCK_ENAB_5 (IPL 5) or
-           CLOCK_ENAB_7 (IPL 7, NMI).  POST stage 0xF5 routes via 5. */
-        if (s_clock_pending && (s_intreg & SUN3_IREG_CLOCK_ENAB_5))
-            want |= (1u << 5);
-        if (s_clock_pending && (s_intreg & SUN3_IREG_CLOCK_ENAB_7))
-            want |= (1u << 7);
+        /* Clock IRQ from ICM7170 -- routed to ONE level: prefer
+           CLOCK_ENAB_5 (IPL 5, the normal scheduler tick), only fall
+           back to CLOCK_ENAB_7 (IPL 7, NMI) if bit 5 isn't set.  This
+           matches RetroCore C# OnClockInterrupt() (sun3 source) — the
+           SunOS kernel writes intreg=0xA1 = INTS_ENAB | CLOCK_ENAB_5
+           | CLOCK_ENAB_7 to enable clock, and ROUTING BOTH would fire
+           an NMI on every tick and trap the CPU in the PROM exception
+           handler ("Exception 0x7C at 0x0FEF03CC" loop).  Real hardware
+           also picks 5-or-7, not both. */
+        if (s_clock_pending) {
+            if (s_intreg & SUN3_IREG_CLOCK_ENAB_5)
+                want |= (1u << 5);
+            else if (s_intreg & SUN3_IREG_CLOCK_ENAB_7)
+                want |= (1u << 7);
+        }
     }
     /* Edge transitions per IPL. */
     for (int lvl = 1; lvl <= 7; lvl++) {
@@ -648,8 +657,17 @@ static uint32_t sun3_obio_read(uint32_t pa, int size)
         return scc_chip_read(&g_scc_kbd, off & 0x0F);
     case 0x020000:   /* zs0 SCC (console) */
         return scc_chip_read(&g_scc_serial, off & 0x0F);
-    case 0x040000:   /* EEPROM/NVRAM stub -- return 0xFF so PROM sees
-                        unconfigured state and falls back to defaults */
+    case 0x040000:
+        /* EEPROM/NVRAM stub.  Most bytes return 0xFF (= unconfigured)
+           so the PROM falls back to its built-in defaults.  Special
+           case offset 0x1F (EE_CONSOLE): when --no-kbd is in effect
+           we want both PROM and SunOS to pick ttya as console (not
+           the framebuffer), so override that byte to EED_CONS_TTYA
+           (0x10) per RetroCore MachineSun3Memory.cs:1035.  Without
+           this the PROM ignores --no-kbd's intent and routes its
+           messages to the bwtwo framebuffer. */
+        if ((off & 0x07FF) == 0x001F && g_no_kbd)
+            return 0x10;       /* EED_CONS_TTYA */
         return 0xFF;
     case 0x060000:   /* Intersil ICM7170 TOD clock */
         return icm7170_read(off);
@@ -657,6 +675,14 @@ static uint32_t sun3_obio_read(uint32_t pa, int size)
         return s_memerr;
     case 0x0A0000:   /* Interrupt register */
         return s_intreg;
+    case 0x0C0000:
+        /* Intel 82586 (ie0) Ethernet -- not implemented.  Bus-error
+           so SunOS's ie0 probe takes the "no device installed" path
+           rather than spinning waiting for an init response that
+           never arrives ("ie0: init failed: iscp busy no cnr"). */
+        s_buserr = SUN3_BUSERR_TIMEOUT;
+        pending_buserr();
+        return 0xFF;
     case 0x100000: {
         /* Boot PROM mirror at OBIO 0x100000.  Per TME sun3-mmu.c and
            C# MachineSun3Memory.cs:2630-2641: the PROM alias uses the
@@ -710,7 +736,7 @@ static void sun3_obio_write(uint32_t pa, uint32_t value, int size)
     case 0x060000:   /* ICM7170 TOD clock */
         icm7170_write(off, (uint8_t)value);
         break;
-    case 0x0A0000:   /* Interrupt register */
+    case 0x0A0000:
         s_intreg = (uint8_t)value;
         sun3_intreg_eval();
         break;
@@ -736,6 +762,11 @@ static void sun3_obio_write(uint32_t pa, uint32_t value, int size)
         break;
     }
     case 0x100000:   /* PROM mirror is read-only */
+        break;
+    case 0x0C0000:
+        /* ie0 Intel 82586 Ethernet writes -- bus-error so SunOS gives up. */
+        s_buserr = SUN3_BUSERR_TIMEOUT;
+        pending_buserr();
         break;
     case 0x120000:
         /* LANCE Ethernet -- bus-error writes too (see read path). */
@@ -1045,6 +1076,14 @@ static void sun3_send_l1a(void)
 
 static void sun3_kb_write(int v)
 {
+    /* --no-kbd: pretend no keyboard is attached so the PROM's reset
+       reply times out, the PROM declares "no keyboard found", and
+       both PROM + SunOS kernel route their console to ttya (= the
+       SCC channel reachable over --scc-tcp).  Without this the PROM
+       sees the reset reply, picks the framebuffer console, and the
+       boot messages never reach the serial port. */
+    if (g_no_kbd) return;
+
     /* Non-reset commands (bell, LED, click) are silent on real hw. */
     if (v >= 0x02 && v <= 0x0B) return;
 
