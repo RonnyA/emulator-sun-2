@@ -127,12 +127,69 @@ static void si_irq_eval(void)
                 (s_csr & (SI_CSR_INT_DMA | SI_CSR_INT_NCR5380 |
                           SI_CSR_DMA_BUS_ERROR))) ? 1 : 0;
     if (want && !s_irq_asserted) {
+        if (trace_scsi)
+            fprintf(stderr, "[si] IRQ assert (csr=%04X)\n", s_csr);
         int_controller_set(2);
         s_irq_asserted = 1;
     } else if (!want && s_irq_asserted) {
+        if (trace_scsi)
+            fprintf(stderr, "[si] IRQ clear (csr=%04X)\n", s_csr);
         int_controller_clear(2);
         s_irq_asserted = 0;
     }
+}
+
+/* NCR 5380 phase-mismatch IRQ.  Per spec § 4.7: bsr.IRQ is asserted
+   when the target's current phase (cbsr MSG/CD/IO bits) differs from
+   what the initiator has programmed in tcr, AND mr.DMA = 1.  This is
+   how the SunOS si driver gets a kernel interrupt when the target
+   advances from COMMAND to STATUS (or DATA to STATUS) on an
+   interrupt-mode command.  The chip raises IRQ; we mirror that into
+   the SI board's INT_NCR5380 (= SBC_IP) so si_irq_eval() can fire
+   IPL 2 to the CPU.
+
+   Edge-triggered: latch on transitions (mr.DMA rising while
+   mismatched, or phase change while mr.DMA on) -- never continuously
+   re-assert across multiple CBSR reads or it produces an IRQ storm
+   the kernel can't drain. */
+static int s_pmtch_last_phase = -2;        /* invalidate at startup */
+static int s_pmtch_last_mr_dma;
+
+/* Fire IRQ on phase mismatch when mr.DMA is set.  Edge-triggered to
+   avoid a level-trigger storm: latch on either (a) mr.DMA rising
+   while phase mismatches tcr, or (b) phase changing while mr.DMA is
+   already on and the new phase mismatches tcr.  Critical: the SunOS
+   si_putdata epilogue sets mr.DMA AFTER the target has already moved
+   to STATUS, so we must still fire on the mr.DMA rising edge alone. */
+static int s_pmtch_armed;       /* IRQ delivered for current mismatch */
+
+static void si_eval_phase_irq_edge(void)
+{
+    int dma_now = (s_mr & 0x02) ? 1 : 0;
+    int p       = scsi3_phase();
+    int prev_p  = s_pmtch_last_phase;
+    int prev_d  = s_pmtch_last_mr_dma;
+
+    s_pmtch_last_mr_dma = dma_now;
+    s_pmtch_last_phase  = p;
+
+    /* Re-arm when bus goes free or mr.DMA drops. */
+    if (p < 0 || !dma_now) { s_pmtch_armed = 0; return; }
+
+    int rising = (!prev_d && dma_now) || (prev_p != p);
+    if (!rising || s_pmtch_armed) return;
+
+    uint8_t want = s_tcr & 7;
+    uint8_t have = (uint8_t)p;
+    if (want == have) return;
+
+    if (trace_scsi)
+        fprintf(stderr, "[si] phase mismatch tcr=%X phase=%X -> IRQ\n",
+                want, have);
+    s_csr |= SI_CSR_INT_NCR5380;
+    s_bus_irq = 1;
+    s_pmtch_armed = 1;
+    si_irq_eval();
 }
 
 /* Push current initiator-driven SCSI signals + ODR data into scsi3. */
@@ -309,8 +366,12 @@ uint32_t sun3_si_read(uint32_t off, int size)
         }
         case N5380_MR:   return s_mr;
         case N5380_TCR:  return s_tcr;
-        case N5380_CSBS: return si_csbs();
-        case N5380_BSR:  return si_bsr();
+        case N5380_CSBS:
+            si_eval_phase_irq_edge();
+            return si_csbs();
+        case N5380_BSR:
+            si_eval_phase_irq_edge();
+            return si_bsr();
         case N5380_IDR:  return scsi3_bus_data();
         case N5380_RPI:
             /* Reading clears INTR/PERR/BERR latches. */
@@ -381,6 +442,10 @@ void sun3_si_write(uint32_t off, uint32_t value, int size)
             else if ((old_mr & 0x01) && !(s_mr & 0x01))
                 s_arb_state = 0;
             si_pump();
+            /* MR.DMA rising edge: latch phase-mismatch IRQ if the
+               target is already in a phase different from tcr. */
+            if (!(old_mr & 0x02) && (s_mr & 0x02))
+                si_eval_phase_irq_edge();
             break;
         }
         case N5380_TCR:  s_tcr = (uint8_t)value; si_pump(); break;
@@ -459,6 +524,9 @@ void sun3_si_write(uint32_t off, uint32_t value, int size)
             new_writable = (uint16_t)(value & mask);
         }
         s_csr = (s_csr & ~mask) | new_writable;
+        if (trace_scsi)
+            fprintf(stderr, "[si] CSR<- %04X (off=%X) old=%04X new=%04X\n",
+                    (unsigned)value, off, old_csr, s_csr);
 
         /* Falling edge of RESET_CTRL (bit 0): chip-reset asserted. */
         if ((old_csr & SI_CSR_RESET_CTRL) && !(s_csr & SI_CSR_RESET_CTRL)) {
