@@ -374,7 +374,17 @@ uint32_t sun3_si_read(uint32_t off, int size)
         case N5380_CSBS: return si_csbs();
         case N5380_BSR:  return si_bsr();
         case N5380_IDR:  return s_data & 0xFF;
-        case N5380_RPI:  s_bus_irq = 0; return 0;
+        case N5380_RPI:
+            /* Reset Parity / Interrupts: reading clears the NCR5380's
+               internal interrupt + parity-error latches.  On Sun-3
+               this also drops the SI board's INT_NCR5380 status bit
+               (and INT_DMA, since they share the IRQ line) so the
+               IPL 2 line de-asserts and the kernel's handler can
+               return without re-firing. */
+            s_bus_irq = 0;
+            s_csr &= ~(uint16_t)(SI_CSR_INT_NCR5380 | SI_CSR_INT_DMA);
+            si_irq_eval();
+            return 0;
         }
     }
 
