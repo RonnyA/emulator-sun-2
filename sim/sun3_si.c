@@ -232,6 +232,26 @@ static uint8_t si_bsr(void)
 
 extern unsigned char sun3_dvma_read_byte(uint32_t va);
 extern void          sun3_dvma_write_byte(uint32_t va, unsigned char v);
+extern void          int_controller_set(unsigned int level);
+extern void          int_controller_clear(unsigned int level);
+
+/* SI board sits at IPL 2.  Assert when INT_ENABLE is on AND any of
+   INT_DMA / INT_NCR5380 / DMA_BUS_ERROR is latched in CSR.  Called
+   from anywhere CSR or the INT_ENABLE bit changes. */
+static int s_irq_asserted;
+static void si_irq_eval(void)
+{
+    int want = ((s_csr & SI_CSR_INT_ENABLE) &&
+                (s_csr & (SI_CSR_INT_DMA | SI_CSR_INT_NCR5380 |
+                          SI_CSR_DMA_BUS_ERROR))) ? 1 : 0;
+    if (want && !s_irq_asserted) {
+        int_controller_set(2);
+        s_irq_asserted = 1;
+    } else if (!want && s_irq_asserted) {
+        int_controller_clear(2);
+        s_irq_asserted = 0;
+    }
+}
 
 extern int trace_scsi;
 
@@ -298,6 +318,7 @@ static void si_udc_run_chain(void)
     s_csr |= SI_CSR_INT_DMA | SI_CSR_INT_NCR5380 | SI_CSR_FIFO_EMPTY;
     s_csr &= ~(uint16_t)SI_CSR_DMA_BUS_ERROR;
     s_bus_irq = 1;
+    si_irq_eval();
 
     /* Pending buffer consumed. */
     s_pending_buf = NULL;
@@ -490,6 +511,7 @@ void sun3_si_write(uint32_t off, uint32_t value, int size)
         }
         /* RESET_CTRL / RESET_FIFO are momentary — clear after handling. */
         s_csr &= ~(uint16_t)(SI_CSR_RESET_CTRL | SI_CSR_RESET_FIFO);
+        si_irq_eval();
         return;
     }
 }

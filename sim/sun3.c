@@ -1089,7 +1089,9 @@ static void sun3_auto_abort_tick(void)
 static int sun3_irq_ack(int level)
 {
     if (level == 6) return scc_device_ack(1);   /* zs SCC at IPL 6 on Sun-3 */
-    /* Soft ints (IPL 1/2/3) and clock (IPL 5/7) use auto-vector. */
+    /* SI SCSI at IPL 2: auto-vectored on real hw -- the SunOS kernel
+       installs its handler at the auto-vector slot for IPL 2.  Soft
+       ints (IPL 1/3) and clock (IPL 5/7) likewise auto-vector. */
     return M68K_INT_ACK_AUTOVECTOR;
 }
 
