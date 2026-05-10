@@ -165,32 +165,65 @@ static int s_pmtch_last_mr_dma;
    Edge-triggered + armed-once per command.  Re-arm at bus free. */
 static int s_pmtch_armed;
 
+/* Edge-triggered evaluation of the SBC IRQ pin, modelled after
+ * RetroCore C# scsi_ctrl_changed (HCL.NCR5380SCSI.cs lines 1006-1052).
+ *
+ * Fires INT_NCR5380 (= SBC_IP) on the rising edge of any of:
+ *   - target REQ (the primary chip-level trigger), OR
+ *   - SI_CSR_INT_ENABLE  (kernel arms interrupts into existing state)
+ *
+ * AND
+ *   - bus phase != tcr.phase  (mismatch)
+ *   - either mr.DMA = 1   (DMA-mode mismatch)
+ *     or  mr.DMA = 0 AND SER != 0   (SER-armed non-DMA mismatch)
+ *
+ * Strict edge-trigger avoids the "unexpected DATA phase" reset loop
+ * caused by re-firing on every CSR/MR poll while target holds REQ. */
+static int s_prev_target_req;
+static int s_prev_int_enable;
+static int s_pmtch_last_mr_dma_save;
 static void si_eval_phase_irq_edge(void)
 {
-    int dma_now = (s_mr & 0x02) ? 1 : 0;
-    int p       = scsi3_phase();
-    int prev_p  = s_pmtch_last_phase;
+    int dma_now    = (s_mr & 0x02) ? 1 : 0;
+    int p          = scsi3_phase();
+    int req_now    = scsi3_target_req();
+    int prev_req   = s_prev_target_req;
+    int int_en_now = (s_csr & SI_CSR_INT_ENABLE) ? 1 : 0;
+    int prev_int_en = s_prev_int_enable;
 
-    s_pmtch_last_mr_dma = dma_now;
-    s_pmtch_last_phase  = p;
+    s_pmtch_last_mr_dma  = dma_now;
+    s_pmtch_last_phase   = p;
+    s_prev_target_req    = req_now;
+    s_prev_int_enable    = int_en_now;
 
-    /* Re-arm on bus free. */
-    if (p < 0) { s_pmtch_armed = 0; return; }
-    if (!dma_now) return;
-    if (s_pmtch_armed) return;
-    /* Skip when the kernel hasn't enabled SI-board interrupts.  In
-       polled mode (autoconf scsi_slave) the kernel keeps INT_ENABLE
-       off; spuriously latching INT_NCR5380 here corrupts the polled
-       SBC_IP polling logic. */
-    if (!(s_csr & SI_CSR_INT_ENABLE)) return;
-    if (p != 3 /* STATUS */ && p != 7 /* MSG_IN */) return;
-    if (p == prev_p) return;                      /* must be a transition */
+    if (p < 0)                        return;
+    if (!int_en_now)                  return;
+    if (!req_now)                     return;
+    if ((p & 7) == (s_tcr & 7))       return;     /* no mismatch */
+
+    /* Edge condition: any of the firing-condition inputs just rose
+       into a state where REQ is held + phase mismatched.  REQ rising
+       is the chip's primary trigger; INT_ENABLE / mr.DMA rising are
+       SI-board / chip-mode arming events that the kernel uses to
+       latch interrupts after target has already advanced phase. */
+    int prev_dma = s_pmtch_last_mr_dma_save;
+    s_pmtch_last_mr_dma_save = dma_now;
+    int trigger = (req_now && !prev_req)
+               || (int_en_now && !prev_int_en)
+               || (dma_now && !prev_dma);
+    if (!trigger)                     return;
+
+    int condition = 0;
+    if (dma_now)              condition = 1;
+    else if (s_ser != 0)      condition = 2;
+    if (!condition)           return;
 
     if (trace_scsi)
-        fprintf(stderr, "[si] phase->%X (status/msg-in) mr.DMA=1 INT_EN=1 -> IRQ\n", p);
+        fprintf(stderr, "[si] IRQ fire (mode=%d phase=%d tcr=%X dma=%d ser=%02X req=%d int_en=%d trig=%s)\n",
+                condition, p, s_tcr & 7, dma_now, s_ser, req_now, int_en_now,
+                (req_now && !prev_req) ? "REQ" : "INT_EN");
     s_csr |= SI_CSR_INT_NCR5380;
     s_bus_irq = 1;
-    s_pmtch_armed = 1;
     si_irq_eval();
 }
 
@@ -376,7 +409,12 @@ uint32_t sun3_si_read(uint32_t off, int size)
             return si_bsr();
         case N5380_IDR:  return scsi3_bus_data();
         case N5380_RPI:
-            /* Reading clears INTR/PERR/BERR latches. */
+            /* Reading clears INTR/PERR/BERR latches.  Do NOT clear
+               s_pmtch_armed here — that flag tracks "fired on this
+               REQ assertion" and must persist until REQ falls
+               (between bytes / phase change).  Otherwise a kernel
+               that re-arms by writing MR/etc. while still in the
+               same mismatched state will trigger an IRQ storm. */
             s_bus_irq    = 0;
             s_end_of_dma = 0;
             s_csr &= ~(uint16_t)(SI_CSR_INT_NCR5380 | SI_CSR_INT_DMA);
@@ -431,14 +469,19 @@ void sun3_si_write(uint32_t off, uint32_t value, int size)
         case N5380_ODR:
             s_odr = (uint8_t)value;
             si_pump();
+            si_eval_phase_irq_edge();
             break;
         case N5380_ICR:
             s_icr = (uint8_t)value;
             si_pump();
+            si_eval_phase_irq_edge();
             break;
         case N5380_MR: {
             uint8_t old_mr = s_mr;
             s_mr = (uint8_t)value;
+            if (trace_scsi)
+                fprintf(stderr, "[si] MR<- %02X (old=%02X dma=%d->%d)\n",
+                        s_mr, old_mr, (old_mr&2)?1:0, (s_mr&2)?1:0);
             if (!(old_mr & 0x01) && (s_mr & 0x01))
                 s_arb_state = 1;
             else if ((old_mr & 0x01) && !(s_mr & 0x01))
@@ -450,8 +493,8 @@ void sun3_si_write(uint32_t off, uint32_t value, int size)
                 si_eval_phase_irq_edge();
             break;
         }
-        case N5380_TCR:  s_tcr = (uint8_t)value; si_pump(); break;
-        case N5380_SER:  s_ser = (uint8_t)value; break;
+        case N5380_TCR:  s_tcr = (uint8_t)value; si_pump(); si_eval_phase_irq_edge(); break;
+        case N5380_SER:  s_ser = (uint8_t)value; si_eval_phase_irq_edge(); break;
         case N5380_SDS:
         case N5380_SDTR:
         case N5380_SDIR:
@@ -479,6 +522,8 @@ void sun3_si_write(uint32_t off, uint32_t value, int size)
         if (size >= 2) {
             uint8_t reg_idx = (uint8_t)(s_udc_addr & 0x3F);
             s_udc_regs[reg_idx] = s_udc_data;
+            if (trace_scsi)
+                fprintf(stderr, "[si] UDC reg[%02X] <- %04X\n", reg_idx, s_udc_data);
             if (reg_idx == 0x2E && (s_udc_data == 0x00A0 || (s_udc_data >> 8) == 0xA0))
                 si_udc_run_chain();
         }
@@ -543,6 +588,10 @@ void sun3_si_write(uint32_t off, uint32_t value, int size)
             scsi3_init();
             si_pump();
         }
+        si_irq_eval();
+        /* INT_ENABLE may have just risen into a pre-existing phase
+           mismatch; re-evaluate the SBC IRQ level. */
+        si_eval_phase_irq_edge();
         si_irq_eval();
         return;
     }
