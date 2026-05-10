@@ -934,6 +934,10 @@ INLINE void m68ki_stack_frame_0010(uint sr, uint vector);
 INLINE void m68ki_stack_frame_1000(uint pc, uint sr, uint vector, uint address, uint write, uint fc);
 INLINE void m68ki_stack_frame_1010(uint sr, uint vector, uint pc);
 INLINE void m68ki_stack_frame_1011(uint sr, uint vector, uint pc);
+INLINE void m68ki_stack_frame_1011_buserr(uint sr, uint vector, uint pc,
+                                          uint fault_addr, uint fault_size,
+                                          uint fault_write, uint fault_fc,
+                                          uint insn_reg);
 
 INLINE void m68ki_exception_trap(uint vector);
 INLINE void m68ki_exception_trapN(uint vector);
@@ -1702,75 +1706,119 @@ void m68ki_stack_frame_1010(uint sr, uint vector, uint pc)
 }
 
 /* Format B stack frame (long bus fault).
- * This is used only by 68020 for bus fault and address error
- * if the error happens during instruction execution.
- * PC stacked is address of instruction in progress.
+ * Used by 68020 for bus fault and address error during instruction
+ * execution.  PC stacked is the start of the faulting instruction so
+ * RTE can restart it after the kernel fixes the page table.
+ *
+ * Layout (TME m68020.c struct tme_m68k_fmtB, matches what SunOS 4
+ * sun3 trap.c reads — see RetroCore Nuget HCL.MC68K
+ * ExceptionHandling.cs lines 220-353 for the authoritative reference):
+ *
+ *   SP+$00: SR (word)                       — saved SR
+ *   SP+$02: PC (long)                       — return / restart PC
+ *   SP+$06: Format/Vector (word)            — 0xB000 | (vec*4)
+ *   SP+$08: Internal register (word)        — zero
+ *   SP+$0A: Special Status Word (word)      — fault flags + FC
+ *   SP+$0C: Instruction pipe stage C (word) — IR
+ *   SP+$0E: Instruction pipe stage B (word) — zero
+ *   SP+$10: Data Cycle Fault Address (long) — VA that faulted
+ *   SP+$14: Internal register (long)        — zero
+ *   SP+$18: Data Output Buffer (long)       — zero
+ *   SP+$1C: Internal register (long)        — zero
+ *   SP+$24: Stage B Address (long)          — instruction-fetch: addr+2
+ *                                             data fault: framePC+2
+ *   SP+$28..$5B: internal state (52 bytes, zeroed)
+ *
+ * SunOS sun3 trap.c reads:
+ *   - SSW.DF (bit 8) to know it's a data fault → calls pagefault()
+ *   - SSW.RW (bit 6) for read/write
+ *   - SSW.FC (bits 2:0) for the address space
+ *   - bei_dfault @ +$10 for the faulting VA
+ *   - bei_stageb @ +$24 for instruction-fetch faults
+ * If SSW reports no fault, kernel skips pagefault() and panics with
+ * "Bus error" — that was the bug producing PC 0xe08f8b6 panics on
+ * Sun-3/60 with our prior all-zero frame.
  */
-void m68ki_stack_frame_1011(uint sr, uint vector, uint pc)
+void m68ki_stack_frame_1011_buserr(uint sr, uint vector, uint pc,
+                                   uint fault_addr, uint fault_size,
+                                   uint fault_write, uint fault_fc,
+                                   uint insn_reg)
 {
-	/* INTERNAL REGISTERS (18 words) */
-	m68ki_push_32(0);
-	m68ki_push_32(0);
-	m68ki_push_32(0);
-	m68ki_push_32(0);
-	m68ki_push_32(0);
-	m68ki_push_32(0);
-	m68ki_push_32(0);
-	m68ki_push_32(0);
+	int is_data_fault = (fault_fc == 1 || fault_fc == 5);
+	int is_insn_fault = (fault_fc == 2 || fault_fc == 6);
+	uint ssw = (fault_fc & 0x07);
+	if (!fault_write)              ssw |= 0x0040;  /* RW: 1=read */
+	if (is_data_fault)             ssw |= 0x0100;  /* DF */
+	if (is_insn_fault)             ssw |= 0xA000;  /* FC + RC stage C */
+	/* Size code: 00=long, 01=byte, 10=word.  68020 SSW size bits 5:4. */
+	switch (fault_size) {
+	case 1: ssw |= 0x0010; break;     /* byte */
+	case 2: ssw |= 0x0020; break;     /* word */
+	default: break;                   /* long = 00 */
+	}
+
+	uint stage_b = is_insn_fault ? (fault_addr + 2) : (pc + 2);
+
+	/* Push high → low.  Lowest SP offset gets pushed last. */
+
+	/* +$30..$5B: state4 + version_info + state5 (44 bytes = 11 longs) */
+	m68ki_push_32(0); m68ki_push_32(0); m68ki_push_32(0);
+	m68ki_push_32(0); m68ki_push_32(0); m68ki_push_32(0);
+	m68ki_push_32(0); m68ki_push_32(0); m68ki_push_32(0);
+	m68ki_push_32(0); m68ki_push_32(0);
+
+	/* +$2C: Data Input Buffer (long) */
 	m68ki_push_32(0);
 
-	/* VERSION# (4 bits), INTERNAL INFORMATION */
+	/* +$28: state3 — internal regs (long) */
+	m68ki_push_32(0);
+
+	/* +$24: Stage B Address (long) */
+	m68ki_push_32(stage_b);
+
+	/* +$20: state2 continued (long) */
+	m68ki_push_32(0);
+
+	/* +$1C: state2 — internal reg (long) */
+	m68ki_push_32(0);
+
+	/* +$18: Data Output Buffer (long) */
+	m68ki_push_32(0);
+
+	/* +$14: state1 — internal reg (long) */
+	m68ki_push_32(0);
+
+	/* +$10: Data Cycle Fault Address (long) */
+	m68ki_push_32(fault_addr);
+
+	/* +$0E: Instruction Pipe Stage B (word) */
 	m68ki_push_16(0);
 
-	/* INTERNAL REGISTERS (3 words) */
-	m68ki_push_32(0);
+	/* +$0C: Instruction Pipe Stage C (word) — current IR */
+	m68ki_push_16(insn_reg);
+
+	/* +$0A: Special Status Word (word) */
+	m68ki_push_16(ssw);
+
+	/* +$08: Internal register (word) */
 	m68ki_push_16(0);
 
-	/* DATA INTPUT BUFFER (2 words) */
-	m68ki_push_32(0);
+	/* +$06: Format/Vector (word) — Format $B, vector*4 */
+	m68ki_push_16(0xB000 | (vector<<2));
 
-	/* INTERNAL REGISTERS (2 words) */
-	m68ki_push_32(0);
-
-	/* STAGE B ADDRESS (2 words) */
-	m68ki_push_32(0);
-
-	/* INTERNAL REGISTER (4 words) */
-	m68ki_push_32(0);
-	m68ki_push_32(0);
-
-	/* DATA OUTPUT BUFFER (2 words) */
-	m68ki_push_32(0);
-
-	/* INTERNAL REGISTER */
-	m68ki_push_16(0);
-
-	/* INTERNAL REGISTER */
-	m68ki_push_16(0);
-
-	/* DATA CYCLE FAULT ADDRESS (2 words) */
-	m68ki_push_32(0);
-
-	/* INSTRUCTION PIPE STAGE B */
-	m68ki_push_16(0);
-
-	/* INSTRUCTION PIPE STAGE C */
-	m68ki_push_16(0);
-
-	/* SPECIAL STATUS REGISTER */
-	m68ki_push_16(0);
-
-	/* INTERNAL REGISTER */
-	m68ki_push_16(0);
-
-	/* 1011, VECTOR OFFSET */
-	m68ki_push_16(0xb000 | (vector<<2));
-
-	/* PROGRAM COUNTER */
+	/* +$02: Program Counter (long) */
 	m68ki_push_32(pc);
 
-	/* STATUS REGISTER */
+	/* +$00: Status Register (word) */
 	m68ki_push_16(sr);
+}
+
+/* Compatibility shim for any caller that still uses the old 3-arg form
+ * (group-1 address error, etc.).  Produces a Format $B frame with all
+ * fault metadata zeroed. */
+void m68ki_stack_frame_1011(uint sr, uint vector, uint pc)
+{
+	m68ki_stack_frame_1011_buserr(sr, vector, pc, 0, 0, 0, 0, 0);
 }
 
 INLINE void m68ki_exception_buserr(void)
@@ -1805,12 +1853,14 @@ INLINE void m68ki_exception_buserr(void)
 	else if(CPU_TYPE_IS_010(CPU_TYPE))
 		m68ki_stack_frame_1000(pc/*REG_PPC*/, sr, vector, address, write, fc);
 	else
-		/* 68020/030: Format A (short bus fault) — error at instruction
-		 * boundary, pc = restart address.  Format 8 is 68010-specific
-		 * and the 68020 RTE rejects it with a Format Error trap.
-		 * RetroCore C# leaves this as TODO; we generate the proper
-		 * 16-word Format A frame here. */
-		m68ki_stack_frame_1010(sr, vector, pc);
+		/* 68020/030: Format $B (long bus fault — mid-instruction).
+		 * SunOS 4 sun3 trap.c expects the full SSW + fault address
+		 * fields populated; with a zero Format $A frame the kernel
+		 * panics with "Bus error" instead of calling pagefault().
+		 * Matches RetroCore C# (HCL.MC68K ExceptionHandling.cs). */
+		m68ki_stack_frame_1011_buserr(sr, vector, pc,
+		                              address, size, write, fc,
+		                              (uint)REG_IR);
 
 	m68ki_jump_vector(vector);
 
